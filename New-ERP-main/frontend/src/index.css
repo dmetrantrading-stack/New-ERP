@@ -1,0 +1,63 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+
+
+@layer base {
+  body {
+    @apply bg-gray-50 text-gray-900;
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  }
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+::-webkit-scrollbar-thumb {
+  background: #94a3b8;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
+}
+
+/* Table styles */
+.data-table {
+  @apply w-full border-collapse;
+}
+.data-table th {
+  @apply bg-gray-50 px-4 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider border-b border-gray-200;
+}
+.data-table td {
+  @apply px-4 py-3 text-sm text-gray-700 border-b border-gray-100;
+}
+.data-table tr:hover td {
+  @apply bg-blue-50/50;
+}
+
+/* Modal overlay */
+.modal-overlay {
+  @apply fixed inset-0 bg-black/50 z-50 flex items-center justify-center;
+}
+.modal-content {
+  @apply bg-white rounded-lg shadow-xl max-w-2xl w-full mx-4 max-h-[85vh] overflow-y-auto;
+}
+
+/* Card styles */
+.stat-card {
+  @apply bg-white rounded-lg border border-gray-200 p-5 transition-shadow hover:shadow-md;
+}
+
+/* POS */
+.pos-item {
+  @apply bg-white border border-gray-200 rounded-lg p-3 cursor-pointer transition-all hover:border-blue-400 hover:shadow-sm;
+}
+.pos-item-selected {
+  @apply border-blue-500 bg-blue-50 ring-2 ring-blue-200;
+}
