@@ -115,7 +115,7 @@ router.post('/invoices', authenticate, auditLog('Sales', 'Create Invoice'), asyn
     const discountAmount = parseFloat(discount || 0);
     const finalTotal = total - discountAmount;
     const netRevenue = totalVatableSales + totalVatExemptSales + totalZeroRatedSales;
-    const amountDue = finalTotal - totalLguTax - totalWht;
+    const amountDue = finalTotal - totalLguTax;
 
     await query(
       `INSERT INTO sales_invoices (id, invoice_number, customer_id, customer_name, customer_type, employee_id, price_mode, invoice_date,
@@ -179,7 +179,7 @@ router.post('/invoices', authenticate, auditLog('Sales', 'Create Invoice'), asyn
     const entryId = uuidv4();
     const entryNumber = await generateRefNumber('JE', 'journal_entries', 'entry_number');
     const totalCogs = invoiceItems.reduce((sum: number, i: any) => sum + (i.quantity * parseFloat(i.cost || 0)), 0);
-    const jeTotal = amountDue + totalWht + totalCogs;
+    const jeTotal = amountDue + totalCogs;
     await query(
       `INSERT INTO journal_entries (id, entry_number, entry_date, reference_type, reference_id, description, total_debit, total_credit, created_by)
        VALUES ($1, $2, CURRENT_DATE, 'Sales Invoice', $3, $4, $5, $5, $6)`,
@@ -220,13 +220,6 @@ router.post('/invoices', authenticate, auditLog('Sales', 'Create Invoice'), asyn
            `Partial payment for invoice ${invoice_number}`, req.user!.id]
         );
       }
-    }
-
-    // Debit WHT Receivable (for LGU)
-    if (totalWht > 0) {
-      await query(`INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
-        VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '1105'), $3, $4, 0, 'Sales Invoice', $5)`,
-        [uuidv4(), entryId, `WHT Receivable ${invoice_number}`, totalWht, id]);
     }
 
     // Credit Sales Revenue
@@ -659,15 +652,281 @@ router.patch('/invoices/:id/void', authenticate, auditLog('Sales', 'Void Invoice
   }
 });
 
+// Edit invoice
+router.patch('/invoices/:id', authenticate, auditLog('Sales', 'Edit Invoice'), async (req: AuthRequest, res: Response) => {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    const inv = await client.query('SELECT * FROM sales_invoices WHERE id = $1', [req.params.id]);
+    if (inv.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
+    const old = inv.rows[0];
+    if (!['Draft','Posted','Partial'].includes(old.status)) {
+      await client.query('ROLLBACK'); return res.status(400).json({ error: `Cannot edit invoice with status ${old.status}` });
+    }
+
+    const { customer_id, customer_name, customer_type, employee_id, price_mode, due_date,
+            payment_method, payment_terms, notes, invoice_tax_type, ewt_rate, items } = req.body;
+    if (!items || items.length === 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Items required' }); }
+
+    const ewtPercent = parseFloat(ewt_rate || '0');
+
+    // ---- Reverse old ----
+    const oldItems = await client.query('SELECT sii.*, i.location_id FROM sales_invoice_items sii JOIN inventory i ON sii.product_id = i.product_id WHERE sii.invoice_id = $1', [req.params.id]);
+    for (const oi of oldItems.rows) {
+      await client.query('UPDATE inventory SET quantity = quantity + $1 WHERE product_id = $2 AND location_id = $3', [oi.quantity, oi.product_id, oi.location_id || 1]);
+    }
+    const oldLgu = parseFloat(old.lgu_final_tax || 0);
+    const oldWht = parseFloat(old.withholding_tax || 0);
+    const oldReversal = parseFloat(old.total) - oldLgu - parseFloat(old.amount_paid);
+    if (old.customer_type === 'Employee' && old.employee_id) {
+      await client.query('UPDATE employees SET grocery_credit_balance = grocery_credit_balance - $1 WHERE id = $2', [oldReversal, old.employee_id]);
+    } else if (old.customer_id) {
+      await client.query('UPDATE customers SET balance = balance - $1 WHERE id = $2', [oldReversal, old.customer_id]);
+    }
+    await client.query("UPDATE journal_entries SET status = 'Void' WHERE reference_type = 'Sales Invoice' AND reference_id = $1 AND status = 'Posted'", [req.params.id]);
+    await client.query('DELETE FROM sales_invoice_items WHERE invoice_id = $1', [req.params.id]);
+
+    // ---- Compute new ----
+    const invoiceItems = (items || []).map((item: any) => {
+      const qty = parseFloat(item.quantity || '0');
+      const price = parseFloat(item.unit_price || '0');
+      const disc = parseFloat(item.discount || '0');
+      const gross = qty * price;
+      const discountAmt = gross * (disc / 100);
+      const netAfterDisc = gross - discountAmt;
+      const taxType = item.tax_type || invoice_tax_type || 'VAT';
+      let lineTax = 0, itemVatable = 0, itemVat = 0, itemLgu = 0, itemWht = 0, lineFinal = 0;
+      if (taxType === 'VAT' || taxType === 'VATable') {
+        itemVatable = netAfterDisc / 1.12; lineTax = netAfterDisc - itemVatable;
+        if (ewtPercent > 0) itemWht = itemVatable * (ewtPercent / 100);
+        lineFinal = netAfterDisc;
+      } else if (taxType === 'VAT Exempt') {
+        itemVatable = netAfterDisc; lineFinal = netAfterDisc;
+        if (ewtPercent > 0) itemWht = netAfterDisc * (ewtPercent / 100);
+      } else if (taxType === 'LGU' || taxType === 'LGU 5% Final VAT') {
+        const nv = netAfterDisc / 1.12; lineTax = netAfterDisc - nv;
+        itemLgu = nv * 0.05; itemWht = nv * 0.01; itemVatable = nv; lineFinal = netAfterDisc;
+      }
+      return { ...item, quantity: qty, unit_price: price, discount: disc, tax_type: taxType, tax_amount: lineTax,
+        total: lineFinal, vatable: itemVatable, vat: lineTax - itemLgu, lgu: itemLgu, wht: itemWht, gross, discountAmt, netAfterDisc };
+    });
+
+    let totalSubtotal = 0, totalDisc = 0, totalVatable = 0, totalVat = 0, totalLgu = 0, totalWht = 0, totalCogs = 0;
+    for (const item of invoiceItems) {
+      totalSubtotal += item.gross; totalDisc += item.discountAmt; totalVatable += item.vatable;
+      totalVat += item.vat; totalLgu += item.lgu; totalWht += item.wht;
+      const locId = item.location_id || 1;
+      const invRow = await client.query('SELECT * FROM inventory WHERE product_id = $1 AND location_id = $2', [item.product_id, locId]);
+      const cost = invRow.rows[0] ? parseFloat(invRow.rows[0].unit_cost) : 0;
+      const avQty = invRow.rows[0] ? parseFloat(invRow.rows[0].quantity) : 0;
+      item.cost = cost;
+      if (item.quantity > avQty) {
+        const setting = await client.query("SELECT setting_value FROM system_settings WHERE setting_key = 'enable_negative_inventory'");
+        if (setting.rows[0]?.setting_value !== 'true') { await client.query('ROLLBACK'); return res.status(400).json({ error: `Insufficient stock for ${item.description || item.product_id}` }); }
+      }
+      await client.query('UPDATE inventory SET quantity = quantity - $1 WHERE product_id = $2 AND location_id = $3', [item.quantity, item.product_id, locId]);
+      const newQty = avQty - item.quantity;
+      await client.query(`INSERT INTO inventory_ledger (id, product_id, location_id, reference_type, reference_id, transaction_type, quantity, running_quantity, unit_cost, total_cost, created_by)
+        VALUES ($1,$2,$3,'Sales Invoice Edit',$4,'OUT',$5,$6,$7,$8,$9)`, [uuidv4(), item.product_id, locId, req.params.id, item.quantity, newQty, cost, item.quantity * cost, req.user!.id]);
+      totalCogs += item.quantity * cost;
+
+      await client.query(`INSERT INTO sales_invoice_items (id, invoice_id, product_id, variant_id, description, quantity, unit_price, discount, tax, total, cost, location_id, tax_type, vat_amount, selected_variant)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+        [uuidv4(), req.params.id, item.product_id, item.variant_id, item.description, item.quantity, item.unit_price,
+         item.discount || 0, item.tax_amount || 0, item.total, cost, locId, item.tax_type || 'VAT', item.tax_amount || 0, item.selected_variant || null]);
+    }
+
+    const finalTotal = totalSubtotal - totalDisc;
+    const amountDue = finalTotal - totalLgu;
+
+    await client.query(`UPDATE sales_invoices SET customer_id=$1, customer_name=$2, customer_type=$3, employee_id=$4, price_mode=$5,
+      due_date=$6, payment_method=$7, payment_terms=$8, notes=$9, subtotal=$10, discount=$11, tax=$12, tax_type=$13, total=$14,
+      vatable_sales=$15, vat_amount=$16, lgu_final_tax=$17, withholding_tax=$18, balance=$19, updated_at=CURRENT_TIMESTAMP WHERE id=$20`,
+      [customer_type === 'Employee' ? null : customer_id, customer_name, customer_type || 'Customer', customer_type === 'Employee' ? employee_id : null,
+       price_mode || 'Retail', due_date, payment_method, payment_terms, notes, totalSubtotal, totalDisc, totalVat, invoice_tax_type || 'VAT',
+       finalTotal, totalVatable, totalVat, totalLgu, totalWht, finalTotal - parseFloat(old.amount_paid), req.params.id]);
+
+    if (customer_type === 'Employee' && employee_id) {
+      await client.query('UPDATE employees SET grocery_credit_balance = grocery_credit_balance + $1 WHERE id = $2', [amountDue, employee_id]);
+    } else if (customer_id) {
+      await client.query('UPDATE customers SET balance = balance + $1 WHERE id = $2', [amountDue, customer_id]);
+    }
+
+    // New journal entry
+    const entryId = uuidv4();
+    const entryNumber = await generateRefNumber('JE', 'journal_entries', 'entry_number');
+    const netRevenue = totalVatable + (items.filter((i:any) => i.tax_type === 'VAT Exempt').reduce((s:number,i:any)=>s+(parseFloat(i.quantity)*parseFloat(i.unit_price)),0));
+    const glCogs = totalCogs / 1.12;
+    const jeTotal = amountDue + glCogs;
+    await client.query(`INSERT INTO journal_entries (id, entry_number, entry_date, reference_type, reference_id, description, total_debit, total_credit, created_by)
+      VALUES ($1,$2,CURRENT_DATE,'Sales Invoice',$3,$4,$5,$5,$6)`, [entryId, entryNumber, req.params.id, `Sales Invoice ${old.invoice_number} (edited)`, jeTotal, req.user!.id]);
+    if (customer_type === 'Employee') {
+      await client.query(`INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
+        VALUES ($1,$2,(SELECT id FROM chart_of_accounts WHERE account_code='1120'),$3,$4,0,'Sales Invoice',$5)`, [uuidv4(), entryId, `Employee Credit ${old.invoice_number}`, amountDue, req.params.id]);
+    } else {
+      await client.query(`INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
+        VALUES ($1,$2,(SELECT id FROM chart_of_accounts WHERE account_code='1100'),$3,$4,0,'Sales Invoice',$5)`, [uuidv4(), entryId, `AR ${old.invoice_number}`, amountDue, req.params.id]);
+    }
+    await client.query(`INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
+      VALUES ($1,$2,(SELECT id FROM chart_of_accounts WHERE account_code='4000'),$3,0,$4,'Sales Invoice',$5)`, [uuidv4(), entryId, `Revenue ${old.invoice_number}`, netRevenue, req.params.id]);
+    if (totalVat > 0) {
+      await client.query(`INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
+        VALUES ($1,$2,(SELECT id FROM chart_of_accounts WHERE account_code='2100'),$3,0,$4,'Sales Invoice',$5)`, [uuidv4(), entryId, `VAT ${old.invoice_number}`, totalVat, req.params.id]);
+    }
+    if (totalLgu > 0) {
+      await client.query(`INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
+        VALUES ($1,$2,(SELECT id FROM chart_of_accounts WHERE account_code='2110'),$3,0,$4,'Sales Invoice',$5)`, [uuidv4(), entryId, `LGU Final VAT ${old.invoice_number}`, totalLgu, req.params.id]);
+    }
+    if (totalCogs > 0) {
+      await client.query(`INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
+        VALUES ($1,$2,(SELECT id FROM chart_of_accounts WHERE account_code='5000'),$3,$4,0,'Sales Invoice',$5),
+               ($6,$2,(SELECT id FROM chart_of_accounts WHERE account_code='1200'),$7,0,$4,'Sales Invoice',$5)`,
+        [uuidv4(), entryId, `COGS ${old.invoice_number}`, glCogs, req.params.id, uuidv4(), `Inventory ${old.invoice_number}`]);
+    }
+    await client.query('COMMIT');
+    res.json({ id: req.params.id, invoice_number: old.invoice_number });
+  } catch (error: any) { await client.query('ROLLBACK'); res.status(500).json({ error: error.message }); } finally { client.release(); }
+});
+
 // ==================== COLLECTION RECEIPTS ====================
 router.post('/collections', authenticate, auditLog('Sales', 'Create Collection'), async (req: AuthRequest, res: Response) => {
   try {
-    const { customer_id, invoice_id, payment_method, reference_number, amount, notes, bank_account_id, collection_date, ewt_amount, lgu_amount } = req.body;
+    const { customer_id, invoice_id, payment_method, reference_number, amount, notes, bank_account_id, collection_date, ewt_amount, lgu_amount, allocations, check_date, check_bank } = req.body;
+
+    const payDate = collection_date || new Date().toISOString().split('T')[0];
+
+    // Multi-invoice batch payment via allocations array
+    if (allocations && Array.isArray(allocations) && allocations.length > 0) {
+      let totalApplied = 0;
+      let totalCash = 0;
+      let totalEwt = 0;
+      let totalLgu = 0;
+
+      if (!customer_id) return res.status(400).json({ error: 'Customer is required for batch payments' });
+      if (!payment_method) return res.status(400).json({ error: 'Payment method is required' });
+
+      // Validate each allocation
+      for (const alloc of allocations) {
+        const aa = parseFloat(alloc.applied_amount || '0');
+        const ewt = parseFloat(alloc.ewt_amount || '0');
+        const lgu = parseFloat(alloc.lgu_amount || '0');
+        const cash = aa - ewt - lgu;
+        if (aa <= 0) return res.status(400).json({ error: 'Each allocation amount must be > 0' });
+        if (cash < 0) return res.status(400).json({ error: 'Cash collected cannot be negative per allocation' });
+
+        const inv = await query('SELECT * FROM sales_invoices WHERE id = $1', [alloc.invoice_id]);
+        if (inv.rows.length === 0) return res.status(404).json({ error: `Invoice ${alloc.invoice_id} not found` });
+        if (inv.rows[0].status === 'Void' || inv.rows[0].status === 'Cancelled') {
+          return res.status(400).json({ error: `Invoice ${inv.rows[0].invoice_number} is void/cancelled` });
+        }
+        const rem = parseFloat(inv.rows[0].total) - parseFloat(inv.rows[0].amount_paid);
+        if (aa > rem) return res.status(400).json({ error: `Amount ${aa.toFixed(2)} exceeds invoice ${inv.rows[0].invoice_number} balance ${rem.toFixed(2)}` });
+
+        totalApplied += aa;
+        totalCash += cash;
+        totalEwt += ewt;
+        totalLgu += lgu;
+      }
+
+      const receipt_number = await generateRefNumber('CR', 'collection_receipts', 'receipt_number');
+      const receiptId = uuidv4();
+
+      // One master receipt
+      await query(
+        `INSERT INTO collection_receipts (id, receipt_number, customer_id, payment_date, payment_method, reference_number, bank_account_id, amount, notes, check_date, check_bank, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+        [receiptId, receipt_number, customer_id, payDate, payment_method, reference_number, bank_account_id || null, totalApplied, notes, check_date || null, check_bank || null, req.user!.id]
+      );
+
+      // Insert allocation rows + update each invoice
+      for (const alloc of allocations) {
+        const aa = parseFloat(alloc.applied_amount || '0');
+        const ewt = parseFloat(alloc.ewt_amount || '0');
+        const lgu = parseFloat(alloc.lgu_amount || '0');
+        await query(
+          `INSERT INTO collection_receipt_allocations (id, receipt_id, invoice_id, applied_amount, ewt_amount, lgu_amount)
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          [uuidv4(), receiptId, alloc.invoice_id, aa, ewt, lgu]
+        );
+        const inv = await query('SELECT * FROM sales_invoices WHERE id = $1', [alloc.invoice_id]);
+        const newPaid = parseFloat(inv.rows[0].amount_paid) + aa;
+        const newBalance = parseFloat(inv.rows[0].total) - newPaid;
+        const newStatus = newBalance <= 0 ? 'Paid' : 'Partial';
+        await query('UPDATE sales_invoices SET amount_paid=$1, balance=$2, status=$3 WHERE id=$4', [newPaid, newBalance, newStatus, alloc.invoice_id]);
+      }
+
+      // Update customer balance
+      await query('UPDATE customers SET balance = balance - $1 WHERE id = $2', [totalApplied, customer_id]);
+
+      // Accounting entries
+      const isBank = payment_method === 'Check' || payment_method === 'Bank Transfer';
+      const isCash = payment_method === 'Cash' || payment_method === 'GCash' || payment_method === 'Maya';
+      const depositTo = req.body.deposit_to || (isBank ? 'bank' : 'cash');
+      let debitAccount = '1000';
+      if (depositTo === 'checks_on_hand') debitAccount = '1015';
+      else if (depositTo === 'bank') debitAccount = '1010';
+      const entryId = uuidv4();
+      const entryNumber = await generateRefNumber('JE', 'journal_entries', 'entry_number');
+
+      await query(
+        `INSERT INTO journal_entries (id, entry_number, entry_date, reference_type, reference_id, description, total_debit, total_credit, created_by)
+         VALUES ($1,$2,CURRENT_DATE,'Collection',$3,$4,$5,$5,$6)`,
+        [entryId, entryNumber, receiptId, `Collection ${receipt_number}`, totalApplied, req.user!.id]
+      );
+      if (totalCash > 0) {
+        await query(
+          `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
+           VALUES ($1,$2,(SELECT id FROM chart_of_accounts WHERE account_code=$3),$4,$5,0,'Collection',$6)`,
+          [uuidv4(), entryId, debitAccount, `Collection ${receipt_number}`, totalCash, receiptId]
+        );
+      }
+      if (totalLgu > 0) {
+        await query(
+          `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
+           VALUES ($1,$2,(SELECT id FROM chart_of_accounts WHERE account_code='2110'),$3,$4,0,'Collection',$5)`,
+          [uuidv4(), entryId, `LGU Final VAT ${receipt_number}`, totalLgu, receiptId]
+        );
+      }
+      const arCode = '1100';
+      await query(
+        `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
+         VALUES ($1,$2,(SELECT id FROM chart_of_accounts WHERE account_code=$3),$4,0,$5,'Collection',$6)`,
+        [uuidv4(), entryId, arCode, `AR ${receipt_number}`, totalApplied, receiptId]
+      );
+      if (totalEwt > 0) {
+        await query(
+          `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
+           VALUES ($1,$2,(SELECT id FROM chart_of_accounts WHERE account_code='1105'),$3,$4,0,'Collection',$5)`,
+          [uuidv4(), entryId, `WHT ${receipt_number}`, totalEwt, receiptId]
+        );
+      }
+      if (isCash && totalCash > 0) {
+        await query(
+          `INSERT INTO cash_transactions (id, transaction_number, transaction_type, amount, reference_type, reference_id, notes, created_by)
+           VALUES ($1,$2,'Collection',$3,'Collection',$4,$5,$6)`,
+          [uuidv4(), await generateRefNumber('CT', 'cash_transactions', 'transaction_number'), totalCash, receiptId, notes, req.user!.id]
+        );
+      }
+      if (isBank && bank_account_id && totalCash > 0) {
+        await query(
+          `INSERT INTO bank_transactions (id, bank_account_id, transaction_type, amount, transaction_date, notes, created_by)
+           VALUES ($1,$2,'Deposit',$3,CURRENT_DATE,$4,$5)`,
+          [uuidv4(), bank_account_id, totalCash, `Collection ${receipt_number}`, req.user!.id]
+        );
+        await query('UPDATE bank_accounts SET balance = balance + $1 WHERE id = $2', [totalCash, bank_account_id]);
+      }
+
+      return res.status(201).json({
+        id: receiptId, receipt_number, allocation_count: allocations.length,
+        total_applied: totalApplied, total_cash: totalCash, total_ewt: totalEwt, total_lgu: totalLgu,
+      });
+    }
+
+    // ---- Single-invoice (backward compatible) ----
     const appliedAmount = parseFloat(amount || '0');
     const ewtAmt = parseFloat(ewt_amount || '0');
     const lguAmt = parseFloat(lgu_amount || '0');
 
-    // Check if invoice is employee-type (customer_id may be null)
     const invCheck = await query('SELECT customer_type, employee_id FROM sales_invoices WHERE id = $1', [invoice_id]);
     const isEmployeeInvoice = invCheck.rows[0]?.customer_type === 'Employee';
     const empId = invCheck.rows[0]?.employee_id;
@@ -679,7 +938,6 @@ router.post('/collections', authenticate, auditLog('Sales', 'Create Collection')
     if (ewtAmt < 0) return res.status(400).json({ error: 'EWT amount cannot be negative' });
     if (lguAmt < 0) return res.status(400).json({ error: 'Final VAT amount cannot be negative' });
 
-    // Validate invoice
     const inv = await query('SELECT * FROM sales_invoices WHERE id = $1', [invoice_id]);
     if (inv.rows.length === 0) return res.status(404).json({ error: 'Invoice not found' });
     if (inv.rows[0].status === 'Void' || inv.rows[0].status === 'Cancelled') {
@@ -691,11 +949,9 @@ router.post('/collections', authenticate, auditLog('Sales', 'Create Collection')
       return res.status(400).json({ error: `Amount exceeds remaining balance of ${remainingBalance.toFixed(2)}` });
     }
 
-    // Cash collected = applied amount - EWT - LGU Tax
     const cashCollected = appliedAmount - ewtAmt - lguAmt;
     if (cashCollected < 0) return res.status(400).json({ error: 'Cash collected cannot be negative. Check EWT/Final VAT amounts.' });
 
-    // Validate: cash + EWT + LGU must equal applied amount
     if (Math.abs(cashCollected + ewtAmt + lguAmt - appliedAmount) > 0.01) {
       return res.status(400).json({ error: 'Cash + EWT + Final VAT must equal the applied amount' });
     }
@@ -704,12 +960,11 @@ router.post('/collections', authenticate, auditLog('Sales', 'Create Collection')
     const id = uuidv4();
 
     await query(
-      `INSERT INTO collection_receipts (id, receipt_number, customer_id, invoice_id, payment_date, payment_method, reference_number, bank_account_id, amount, notes, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-      [id, receipt_number, customer_id, invoice_id, collection_date || new Date(), payment_method, reference_number, bank_account_id || null, appliedAmount, notes, req.user!.id]
+      `INSERT INTO collection_receipts (id, receipt_number, customer_id, invoice_id, payment_date, payment_method, reference_number, bank_account_id, amount, notes, check_date, check_bank, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      [id, receipt_number, customer_id, invoice_id, payDate, payment_method, reference_number, bank_account_id || null, appliedAmount, notes, check_date || null, check_bank || null, req.user!.id]
     );
 
-    // Update invoice - applied amount (cash + EWT + LGU) goes against the balance
     const newPaid = parseFloat(inv.rows[0].amount_paid) + appliedAmount;
     const newBalance = parseFloat(inv.rows[0].total) - newPaid;
     const newStatus = newBalance <= 0 ? 'Paid' : 'Partial';
@@ -718,19 +973,19 @@ router.post('/collections', authenticate, auditLog('Sales', 'Create Collection')
       [newPaid, newBalance, newStatus, invoice_id]
     );
 
-    // Update customer/employee balance
     if (customer_id) {
       await query('UPDATE customers SET balance = balance - $1 WHERE id = $2', [appliedAmount, customer_id]);
     } else if (isEmployeeInvoice && empId) {
       await query('UPDATE employees SET grocery_credit_balance = grocery_credit_balance - $1 WHERE id = $2', [appliedAmount, empId]);
     }
 
-    // Determine payment destination
     const isBankPayment = payment_method === 'Check' || payment_method === 'Bank Transfer';
     const isCash = payment_method === 'Cash' || payment_method === 'GCash' || payment_method === 'Maya';
-    const debitAccount = isBankPayment ? '1010' : '1000';
+    const depositTo = req.body.deposit_to || (isBankPayment ? 'bank' : 'cash');
+    let debitAccount = '1000';
+    if (depositTo === 'checks_on_hand') debitAccount = '1015';
+    else if (depositTo === 'bank') debitAccount = '1010';
 
-    // Accounting entries â€” JE total = applied amount
     const entryId = uuidv4();
     const entryNumber = await generateRefNumber('JE', 'journal_entries', 'entry_number');
 
@@ -740,7 +995,6 @@ router.post('/collections', authenticate, auditLog('Sales', 'Create Collection')
       [entryId, entryNumber, id, `Collection ${receipt_number}`, appliedAmount, req.user!.id]
     );
 
-    // 1. Debit Cash/Bank (cash collected only)
     if (cashCollected > 0) {
       await query(
         `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
@@ -749,8 +1003,6 @@ router.post('/collections', authenticate, auditLog('Sales', 'Create Collection')
       );
     }
 
-    // 2. EWT (1105) was already debited during invoice creation â€” included in invoice's AR net amount
-    // 3. Debit LGU Final VAT (2110) to reduce payable if buyer withholds LGU tax
     if (lguAmt > 0) {
       await query(
         `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
@@ -759,15 +1011,21 @@ router.post('/collections', authenticate, auditLog('Sales', 'Create Collection')
       );
     }
 
-    // 4. Credit AR (1100 for customer, 1120 for employee)
     const arAccountCode = isEmployeeInvoice ? '1120' : '1100';
     await query(
       `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
        VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '${arAccountCode}'), $3, 0, $4, 'Collection', $5)`,
-      [uuidv4(), entryId, `AR ${receipt_number}`, cashCollected, id]
+      [uuidv4(), entryId, `AR ${receipt_number}`, appliedAmount, id]
     );
 
-    // Cash transaction for cash collected
+    if (ewtAmt > 0) {
+      await query(
+        `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
+         VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '1105'), $3, $4, 0, 'Collection', $5)`,
+        [uuidv4(), entryId, `WHT ${receipt_number}`, ewtAmt, id]
+      );
+    }
+
     if (isCash && cashCollected > 0) {
       await query(
         `INSERT INTO cash_transactions (id, transaction_number, transaction_type, amount, reference_type, reference_id, notes, created_by)
@@ -776,7 +1034,6 @@ router.post('/collections', authenticate, auditLog('Sales', 'Create Collection')
       );
     }
 
-    // Bank transaction for bank payments
     if (isBankPayment && bank_account_id && cashCollected > 0) {
       await query(
         `INSERT INTO bank_transactions (id, bank_account_id, transaction_type, amount, transaction_date, notes, created_by)
@@ -839,6 +1096,211 @@ router.get('/collections', authenticate, async (req: AuthRequest, res: Response)
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
+});
+
+// Customer Statements — unpaid invoices grouped by customer
+router.get('/customer-statements', authenticate, async (req: AuthRequest, res: Response) => {
+  try {
+    const search = req.query.search as string || '';
+    const from = req.query.from as string || '2020-01-01';
+    const to = req.query.to as string || '2099-12-31';
+    const result = await query(
+      `SELECT c.id as customer_id, c.customer_code, c.customer_name,
+              MIN(si.invoice_date) as oldest_invoice_date,
+              COUNT(si.id) as unpaid_count,
+              SUM(si.balance) as total_outstanding
+       FROM sales_invoices si
+       JOIN customers c ON si.customer_id = c.id
+       WHERE si.status IN ('Posted','Partial','Overdue')
+         AND si.balance > 0
+         AND si.invoice_date >= $2 AND si.invoice_date <= $3
+         AND c.customer_name ILIKE $1
+       GROUP BY c.id, c.customer_code, c.customer_name
+       ORDER BY total_outstanding DESC`,
+      [`%${search}%`, from, to]
+    );
+    res.json(result.rows);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Customer Statement Detail — invoices + payment history for one customer
+router.get('/customer-statement/:customerId', authenticate, async (req: AuthRequest, res: Response) => {
+  try {
+    const cust = await query('SELECT * FROM customers WHERE id = $1', [req.params.customerId]);
+    if (cust.rows.length === 0) return res.status(404).json({ error: 'Customer not found' });
+
+    const invoices = await query(
+      `SELECT si.*, CURRENT_DATE - si.invoice_date::date as days_outstanding,
+              CURRENT_DATE - si.due_date::date as days_past_due
+       FROM sales_invoices si
+       WHERE si.customer_id = $1 AND si.status IN ('Posted','Partial','Overdue') AND si.balance > 0
+       ORDER BY si.invoice_date ASC`,
+      [req.params.customerId]
+    );
+
+    const payments = await query(
+      `SELECT cr.*, 
+              COALESCE((SELECT jsonb_agg(jsonb_build_object('invoice_id', cra.invoice_id, 'invoice_number', si2.invoice_number, 'amount', cra.applied_amount))
+                        FROM collection_receipt_allocations cra
+                        LEFT JOIN sales_invoices si2 ON cra.invoice_id = si2.id
+                        WHERE cra.receipt_id = cr.id), '[]'::jsonb) as applied_invoices
+       FROM collection_receipts cr
+       WHERE cr.customer_id = $1 AND cr.status = 'Posted'
+       ORDER BY cr.payment_date DESC`,
+      [req.params.customerId]
+    );
+
+    const aging = { current: 0, d30: 0, d60: 0, d90: 0, over90: 0, total: 0 };
+    for (const inv of invoices.rows) {
+      const due = parseInt(inv.days_past_due) || 0;
+      const bal = parseFloat(inv.balance);
+      aging.total += bal;
+      if (due <= 0) aging.current += bal;
+      else if (due <= 30) aging.d30 += bal;
+      else if (due <= 60) aging.d60 += bal;
+      else if (due <= 90) aging.d90 += bal;
+      else aging.over90 += bal;
+    }
+
+    res.json({ customer: cust.rows[0], invoices: invoices.rows, payments: payments.rows, aging });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Customer Statement Print — dot-matrix
+router.get('/customer-statement/:customerId/print', async (req: AuthRequest, res: Response) => {
+  try {
+    const token = req.query.token as string || (req.headers.authorization || '').replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'Auth required' });
+    try { jwt.verify(token, config.jwtSecret); } catch { return res.status(401).json({ error: 'Invalid token' }); }
+
+    const cust = await query('SELECT * FROM customers WHERE id = $1', [req.params.customerId]);
+    if (cust.rows.length === 0) return res.status(404).send('Not found');
+    const c = cust.rows[0];
+
+    const invoices = await query(
+      `SELECT * FROM sales_invoices WHERE customer_id = $1 AND status IN ('Posted','Partial','Overdue') AND balance > 0 ORDER BY invoice_date ASC`,
+      [req.params.customerId]
+    );
+
+    const biz = await query('SELECT * FROM business_details WHERE id = 1');
+    const b = biz.rows[0] || {};
+    const bizName = 'D METRAN TRADING';
+    const bizProp = 'Donnel M. Metran - Prop.';
+    const bizVat = 'VAT REG TIN: 418 944 134 000';
+    const bizAddress = 'New Public Market, Sta. Cruz, Zambales 2213';
+
+    const totalOutstanding = invoices.rows.reduce((s: number, i: any) => s + parseFloat(i.balance), 0);
+    const fmtCurrency = (n: number) => '₱' + n.toLocaleString('en-PH', { minimumFractionDigits: 2 });
+    const fmtDate = (d: string) => d ? new Date(d).toLocaleDateString('en-PH', { year: 'numeric', month: 'short', day: 'numeric' }) : '—';
+
+    const aged = { current: 0, d30: 0, d60: 0, d90: 0, over90: 0 };
+    for (const inv of invoices.rows) {
+      const due = Math.floor((new Date().getTime() - new Date(inv.due_date || inv.invoice_date).getTime()) / 86400000);
+      const bal = parseFloat(inv.balance);
+      if (due <= 0) aged.current += bal;
+      else if (due <= 30) aged.d30 += bal;
+      else if (due <= 60) aged.d60 += bal;
+      else if (due <= 90) aged.d90 += bal;
+      else aged.over90 += bal;
+    }
+
+    const rows = invoices.rows.map((i: any) => {
+      const days = Math.floor((new Date().getTime() - new Date(i.invoice_date).getTime()) / 86400000);
+      const daysDue = Math.floor((new Date().getTime() - new Date(i.due_date || i.invoice_date).getTime()) / 86400000);
+      return `<tr><td>${fmtDate(i.invoice_date)}</td><td>${i.invoice_number}</td><td>${i.notes || ''}</td><td class="right">${fmtCurrency(parseFloat(i.total))}</td><td class="right">${Math.max(0, daysDue)}</td><td class="right">${fmtCurrency(parseFloat(i.balance))}</td></tr>`;
+    }).join('');
+
+    const style = `*{margin:0;padding:0;box-sizing:border-box}body{font-family:"Courier New",monospace;font-size:10px;color:#111;padding:8mm 10mm;max-width:210mm;margin:0 auto}.header{display:flex;justify-content:space-between;margin-bottom:10px}.header-left h2{font-size:16px;font-weight:bold;margin:0}.header-left p{font-size:9px;margin:2px 0}.header-right{text-align:right;font-size:9px}.header-right p{margin:2px 0}.doc-title{text-align:center;border:1px dotted #444;padding:6px 0;margin:10px 0}.doc-title h2{font-size:14px;font-weight:bold;letter-spacing:6px;margin:0}table{width:100%;border-collapse:collapse;margin:8px 0}th{background:#f8f8f8;border:1px dotted #444;padding:5px 6px;font-size:9px;text-align:left;font-weight:bold}td{border:1px dotted #444;padding:4px 6px;font-size:9px}td.right{text-align:right}.aging{display:flex;gap:6px;margin:8px 0}.aging-box{flex:1;border:1px dotted #444;padding:5px;text-align:center}.aging-box .amt{font-size:11px;font-weight:bold}.aging-box .lbl{font-size:7px;text-transform:uppercase;color:#555}.total-row{text-align:right;font-size:14px;font-weight:bold;border-top:2px dotted #000;padding-top:4px;margin-top:8px}.footer{text-align:center;font-size:7px;color:#666;margin-top:12px;border-top:1px dotted #999;padding-top:4px}@media print{body{padding:4mm 6mm}}`;
+
+    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Statement - ${c.customer_name}</title><style>${style}</style></head><body>
+<div class="header">
+  <div class="header-left"><h2>Statement</h2><p>${c.customer_name || ''}</p><p>${c.address || ''}</p><p>${c.contact_person || ''}</p></div>
+  <div class="header-right"><p>${bizName}</p><p>${bizProp}</p><p>${bizVat}</p><p>${bizAddress}</p></div>
+</div>
+<div class="doc-title"><h2>STATEMENT OF ACCOUNT</h2></div>
+<p style="font-size:9px;margin-bottom:6px"><strong>Date:</strong> ${new Date().toLocaleDateString('en-PH',{year:'numeric',month:'long',day:'numeric'})}</p>
+<table>
+<thead><tr><th>Date</th><th>Invoice No.</th><th>Description</th><th style="text-align:right">Total</th><th style="text-align:right">Overdue Days</th><th style="text-align:right">Balance Due</th></tr></thead>
+<tbody>${rows || '<tr><td colspan="6" style="text-align:center">No unpaid invoices</td></tr>'}</tbody>
+</table>
+<div class="aging">
+<div class="aging-box"><div class="amt">${fmtCurrency(aged.current)}</div><div class="lbl">Current</div></div>
+<div class="aging-box"><div class="amt">${fmtCurrency(aged.d30)}</div><div class="lbl">1-30 Days</div></div>
+<div class="aging-box"><div class="amt">${fmtCurrency(aged.d60)}</div><div class="lbl">31-60 Days</div></div>
+<div class="aging-box"><div class="amt">${fmtCurrency(aged.d90)}</div><div class="lbl">61-90 Days</div></div>
+<div class="aging-box"><div class="amt">${fmtCurrency(aged.over90)}</div><div class="lbl">90+ Days</div></div>
+</div>
+<div class="total-row">Total Outstanding: ${fmtCurrency(totalOutstanding)}</div>
+<div class="footer">Printed: ${new Date().toLocaleString('en-PH')} | Statement of Account</div>
+</body></html>`;
+    res.send(html);
+  } catch (error: any) { res.status(500).send('<p>Error: ' + error.message + '</p>'); }
+});
+
+// Collection Receipt Print — dot-matrix
+router.get('/collection-receipt/:id/print', async (req: AuthRequest, res: Response) => {
+  try {
+    const token = req.query.token as string || (req.headers.authorization || '').replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'Auth required' });
+    try { jwt.verify(token, config.jwtSecret); } catch { return res.status(401).json({ error: 'Invalid token' }); }
+
+    const r = await query(
+      `SELECT cr.*, c.customer_name, c.customer_code, c.address as customer_address,
+              ba.bank_name, ba.account_name
+       FROM collection_receipts cr
+       LEFT JOIN customers c ON cr.customer_id = c.id
+       LEFT JOIN bank_accounts ba ON cr.bank_account_id = ba.id
+       WHERE cr.id = $1`,
+      [req.params.id]
+    );
+    if (r.rows.length === 0) return res.status(404).send('Not found');
+    const d = r.rows[0];
+
+    const allocations = await query(
+      `SELECT cra.*, si.invoice_number, si.invoice_date, si.total as invoice_total, si.balance as invoice_balance
+       FROM collection_receipt_allocations cra
+       JOIN sales_invoices si ON cra.invoice_id = si.id
+       WHERE cra.receipt_id = $1 ORDER BY si.invoice_date`,
+      [req.params.id]
+    );
+
+    const bizName = 'D METRAN TRADING';
+    const fmtCurrency = (n: number) => '₱' + n.toLocaleString('en-PH', { minimumFractionDigits: 2 });
+    const fmtDate = (d: string) => d ? new Date(d).toLocaleDateString('en-PH', { year: 'numeric', month: 'short', day: 'numeric' }) : '—';
+    const total = parseFloat(d.amount) || 0;
+
+    const allocRows = allocations.rows.map((a: any) =>
+      `<tr><td>${a.invoice_number}</td><td>${fmtDate(a.invoice_date)}</td><td class="right">${fmtCurrency(parseFloat(a.invoice_total))}</td><td class="right">${fmtCurrency(parseFloat(a.applied_amount))}</td></tr>`
+    ).join('');
+
+    const style = `*{margin:0;padding:0;box-sizing:border-box}body{font-family:"Courier New",monospace;font-size:10px;color:#111;padding:8mm 10mm;max-width:210mm;margin:0 auto}.header{text-align:center;margin-bottom:8px}.header h1{font-size:16px;font-weight:bold;letter-spacing:3px;margin:0}.header p{font-size:9px;margin:2px 0}.dot-divider{text-align:center;font-size:10px;font-weight:bold;margin:4px 0}.doc-title{text-align:center;border:1px dotted #444;padding:5px 0;margin:8px 0}.doc-title h2{font-size:13px;font-weight:bold;letter-spacing:5px;margin:0}.info{display:flex;gap:15px;margin:8px 0}.info-box{flex:1;border:1px dotted #444;padding:6px 8px}.info-box .lbl{font-size:8px;font-weight:bold;text-transform:uppercase;margin-bottom:4px}.info-box p{font-size:9px;margin:1px 0}table{width:100%;border-collapse:collapse;margin:8px 0}th{background:#f8f8f8;border:1px dotted #444;padding:4px 5px;font-size:8px;text-align:left;font-weight:bold}td{border:1px dotted #444;padding:3px 5px;font-size:8px}td.right{text-align:right}.total{text-align:right;font-size:13px;font-weight:bold;border-top:2px dotted #000;padding-top:4px;margin-top:8px}.signatures{display:flex;justify-content:space-between;margin-top:20px;gap:10px}.sig-block{text-align:center;flex:1}.sig-block .sig-line{border-bottom:1px dotted #444;height:25px;margin-bottom:3px}.sig-block .sig-label{font-size:8px;text-transform:uppercase}.footer{text-align:center;font-size:7px;color:#666;margin-top:10px;border-top:1px dotted #999;padding-top:4px}@media print{body{padding:4mm 6mm}}`;
+
+    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>CR ${d.receipt_number}</title><style>${style}</style></head><body>
+<div class="header"><h1>${bizName}</h1><p>Donnel M. Metran - Prop. | VAT REG TIN: 418 944 134 000</p><p>New Public Market, Sta. Cruz, Zambales 2213</p></div>
+<div class="dot-divider">. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .</div>
+<div class="doc-title"><h2>COLLECTION RECEIPT</h2></div>
+<div class="info">
+<div class="info-box"><div class="lbl">Receipt Details</div><p><strong>CR #:</strong> ${d.receipt_number}</p><p><strong>Date:</strong> ${fmtDate(d.payment_date)}</p><p><strong>Method:</strong> ${d.payment_method || '—'}</p>${d.reference_number ? '<p><strong>Ref:</strong> ' + d.reference_number + '</p>' : ''}${d.check_date ? '<p><strong>Check Date:</strong> ' + fmtDate(d.check_date) + '</p>' : ''}${d.check_bank ? '<p><strong>Bank:</strong> ' + d.check_bank + '</p>' : ''}</div>
+<div class="info-box"><div class="lbl">Customer</div><p><strong>Name:</strong> ${d.customer_name || '—'}</p><p><strong>Code:</strong> ${d.customer_code || '—'}</p><p><strong>Address:</strong> ${d.customer_address || '—'}</p></div>
+</div>
+<table>
+<thead><tr><th>Invoice #</th><th>Date</th><th style="text-align:right">Invoice Total</th><th style="text-align:right">Applied</th></tr></thead>
+<tbody>${allocRows || '<tr><td colspan="4" style="text-align:center">No allocations</td></tr>'}</tbody>
+</table>
+<div class="total">Total Received: ${fmtCurrency(total)}</div>
+${d.notes ? '<div style="border:1px dotted #444;padding:5px 8px;margin:6px 0;font-size:9px"><strong>Notes:</strong> ' + d.notes + '</div>' : ''}
+<div class="signatures">
+<div class="sig-block"><div class="sig-line"></div><div class="sig-label">Prepared by</div></div>
+<div class="sig-block"><div class="sig-line"></div><div class="sig-label">Received by</div></div>
+</div>
+<div class="footer">Printed: ${new Date().toLocaleString('en-PH')} | Collection Receipt</div>
+</body></html>`;
+    res.send(html);
+  } catch (error: any) { res.status(500).send('<p>Error: ' + error.message + '</p>'); }
 });
 
 export default router;

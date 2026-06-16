@@ -9,6 +9,8 @@ import toast from 'react-hot-toast';
 
 const employeeName = (e: any) => `${e.last_name}, ${e.first_name}${e.middle_name ? ' ' + e.middle_name.charAt(0) + '.' : ''}`;
 
+const toLocalDate = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
 const statusBadge = (s: string) => {
   const map: Record<string, string> = {
     Active: 'bg-green-100 text-green-700', 'Fully Paid': 'bg-green-100 text-green-700',
@@ -18,6 +20,7 @@ const statusBadge = (s: string) => {
     Present: 'bg-green-100 text-green-700', Late: 'bg-yellow-100 text-yellow-700',
     Absent: 'bg-red-100 text-red-700', 'Half-day': 'bg-orange-100 text-orange-700',
     Leave: 'bg-blue-100 text-blue-700',
+    'Rest Day': 'bg-gray-200 text-gray-600',
   };
   return `px-2 py-1 text-xs rounded-full ${map[s] || 'bg-gray-100 text-gray-600'}`;
 };
@@ -48,6 +51,15 @@ export default function HrPage() {
   const [showPaymentModal, setShowPaymentModal] = useState(false);
   const [selectedPayrollId, setSelectedPayrollId] = useState<string | null>(null);
 
+  // Attendance Sheet state
+  const [sheetData, setSheetData] = useState<any>(null);
+  const today = new Date();
+  const [sheetFrom, setSheetFrom] = useState(toLocalDate(new Date(today.getFullYear(), today.getMonth(), 1)));
+  const [sheetTo, setSheetTo] = useState(toLocalDate(new Date(today.getFullYear(), today.getMonth(), 15)));
+  const [sheetEmployeeId, setSheetEmployeeId] = useState('');
+  const [sheetSaving, setSheetSaving] = useState(false);
+  const [sheetChanges, setSheetChanges] = useState<Record<string, string>>({});
+
   const [editEmployee, setEditEmployee] = useState<any>(null);
   const [loading, setLoading] = useState(false);
 
@@ -72,7 +84,67 @@ export default function HrPage() {
     if (tab === 'grocery') { api.get('/hr/grocery-credits').then((r) => setGroceryCredits(r.data)).catch(() => {}); }
     if (tab === 'attendance') { api.get('/hr/attendance').then((r) => setAttendance(r.data)).catch(() => {}); }
     if (tab === 'sss') { api.get('/hr/sss-contributions').then((r) => setSssContributions(r.data)).catch(() => {}); }
+    if (tab === 'attendance-sheet') { loadSheet(); }
   }, [activeTab]);
+
+  const loadSheet = () => {
+    setSheetChanges({});
+    const from = new Date(sheetFrom);
+    const endDate = new Date(from.getFullYear(), from.getMonth() + 1, 0);
+    if (new Date(sheetTo) > endDate) setSheetTo(toLocalDate(endDate));
+    const params = `from=${sheetFrom}&to=${sheetTo}${sheetEmployeeId ? '&employee_id=' + sheetEmployeeId : ''}`;
+    api.get('/hr/attendance/sheet?' + params).then(r => setSheetData(r.data)).catch(() => {});
+  };
+
+  const toggleSheetStatus = (empId: string, date: string, current: string | null) => {
+    const cycle = !current ? 'Present' : current === 'Present' ? 'Absent' : current === 'Absent' ? 'Late' : current === 'Late' ? 'Half-day' : current === 'Half-day' ? 'Leave' : current === 'Leave' ? 'Rest Day' : null;
+    const key = `${empId}_${date}`;
+    setSheetChanges(prev => ({ ...prev, [key]: cycle || '' }));
+    setSheetData((prev: any) => {
+      if (!prev) return prev;
+      const updated = { ...prev, employees: prev.employees.map((e: any) => {
+        if (String(e.id) !== String(empId)) return e;
+        const newDays = { ...e.days, [date]: { ...e.days[date], status: cycle } };
+        const summary: Record<string, number> = { present: 0, absent: 0, late: 0, half_day: 0, leave: 0, rest_day: 0, worked: 0 };
+        for (const dt of prev.dates) {
+          const rec = newDays[dt];
+          if (rec?.status) {
+            const s = rec.status.toLowerCase();
+            if (s === 'present') { summary.present++; summary.worked++; }
+            else if (s === 'absent') summary.absent++;
+            else if (s === 'late') { summary.late++; summary.worked++; }
+            else if (s === 'half-day') { summary.half_day++; summary.worked += 0.5; }
+            else if (s === 'leave') summary.leave++;
+            else if (s === 'rest day') summary.rest_day++;
+          }
+        }
+        return { ...e, days: newDays, summary };
+      }) };
+      return updated;
+    });
+  };
+
+  const saveSheet = async () => {
+    const entries: any[] = [];
+    if (!sheetData) return;
+    for (const e of sheetData.employees) {
+      for (const dt of sheetData.dates) {
+        const key = `${e.id}_${dt}`;
+        if (sheetChanges[key] !== undefined) {
+          entries.push({ employee_id: e.id, date: dt, status: sheetChanges[key] || null });
+        }
+      }
+    }
+    if (entries.length === 0) { toast.error('No changes to save'); return; }
+    setSheetSaving(true);
+    try {
+      await api.post('/hr/attendance/sheet', { entries });
+      toast.success(`${entries.length} entries saved`);
+      setSheetChanges({});
+      loadSheet();
+    } catch (err: any) { toast.error(err.response?.data?.error || 'Error'); }
+    finally { setSheetSaving(false); }
+  };
 
   const refreshAll = () => {
     api.get('/hr/employees').then((res) => setEmployees(res.data)).catch(() => {});
@@ -260,6 +332,7 @@ export default function HrPage() {
     { key: 'cash-advances', label: 'Cash Advances', icon: Wallet },
     { key: 'grocery', label: 'Grocery Credits', icon: ShoppingCart },
     { key: 'attendance', label: 'Attendance', icon: Clock },
+    { key: 'attendance-sheet', label: 'Attendance Sheet', icon: FileText },
     { key: 'payroll', label: 'Payroll', icon: DollarSign },
 
     { key: 'sss', label: 'SSS', icon: Shield },
@@ -878,6 +951,116 @@ export default function HrPage() {
               <div className="flex justify-between font-bold mt-3 text-sm"><span>Total</span><span>{formatCurrency(gcDetail.total)}</span></div>
             </div>
           </div>
+        </div>
+      )}
+      {/* ========== ATTENDANCE SHEET TAB ========== */}
+      {activeTab === 'attendance-sheet' && (
+        <div className="space-y-4">
+          <div className="flex items-center gap-3 flex-wrap">
+            <div>
+              <label className="block text-xs font-medium mb-1">From</label>
+              <input type="date" value={sheetFrom} onChange={e => { setSheetFrom(e.target.value); }} className="px-3 py-2 border rounded-lg text-sm" />
+            </div>
+            <div>
+              <label className="block text-xs font-medium mb-1">To</label>
+              <input type="date" value={sheetTo} onChange={e => { setSheetTo(e.target.value); }} className="px-3 py-2 border rounded-lg text-sm" />
+            </div>
+            <div>
+              <label className="block text-xs font-medium mb-1">Employee</label>
+              <select value={sheetEmployeeId} onChange={e => { setSheetEmployeeId(e.target.value); }} className="px-3 py-2 border rounded-lg text-sm">
+                <option value="">All Active</option>
+                {employees.map(e => <option key={e.id} value={e.id}>{employeeName(e)}</option>)}
+              </select>
+            </div>
+            <div className="flex items-end gap-2">
+              <button onClick={loadSheet} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700">Load</button>
+              <button onClick={saveSheet} disabled={sheetSaving || Object.keys(sheetChanges).length === 0} className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm hover:bg-green-700 disabled:opacity-50">{sheetSaving ? 'Saving...' : `Save (${Object.keys(sheetChanges).length})`}</button>
+              <button onClick={() => { const t = localStorage.getItem('token'); window.open(`/api/hr/attendance/sheet/print?from=${sheetFrom}&to=${sheetTo}&employee_id=${sheetEmployeeId}&token=${t}`, '_blank'); }} className="px-4 py-2 bg-gray-600 text-white rounded-lg text-sm hover:bg-gray-700">Print</button>
+            </div>
+          </div>
+
+          {sheetData && (
+            <div className="bg-white rounded-lg border border-gray-200 overflow-x-auto">
+              <table className="text-xs border-collapse w-max min-w-full">
+                <thead>
+                  <tr className="bg-gray-100">
+                    <th className="sticky left-0 bg-gray-100 px-3 py-2 text-left font-semibold border-r z-10" style={{minWidth:180}}>Employee</th>
+                    {sheetData.dates.map((dt: string) => {
+                      const d = new Date(dt);
+                      return <th key={dt} className="px-2 py-2 text-center font-semibold border-r" style={{minWidth:55}}>
+                        <div className="text-[10px] text-gray-500">{['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()]}</div>
+                        <div>{d.getDate()}</div>
+                      </th>;
+                    })}
+                    <th className="px-2 py-2 text-center bg-blue-50 border-l-2">P</th>
+                    <th className="px-2 py-2 text-center">A</th>
+                    <th className="px-2 py-2 text-center">L</th>
+                    <th className="px-2 py-2 text-center">H</th>
+                    <th className="px-2 py-2 text-center">Leave</th>
+                    <th className="px-2 py-2 text-center">RD</th>
+                    <th className="px-2 py-2 text-center font-bold bg-green-50">W</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sheetData.employees.map((e: any) => (
+                    <tr key={e.id} className="border-t hover:bg-gray-50">
+                      <td className="sticky left-0 bg-white px-3 py-1.5 border-r z-10">
+                        <div className="font-medium text-gray-900">{e.name}</div>
+                        <div className="text-[10px] text-gray-400">{e.code}</div>
+                      </td>
+                      {sheetData.dates.map((dt: string) => {
+                        const key = `${e.id}_${dt}`;
+                        const changed = sheetChanges[key];
+                        const rec = e.days[dt];
+                        const status = changed !== undefined ? (changed || null) : rec?.status;
+                        const bg = !status ? '' : status === 'Present' ? 'bg-green-100 text-green-700' : status === 'Absent' ? 'bg-red-100 text-red-700' : status === 'Late' ? 'bg-yellow-100 text-yellow-700' : status === 'Half-day' ? 'bg-orange-100 text-orange-700' : status === 'Leave' ? 'bg-blue-100 text-blue-700' : 'bg-gray-200 text-gray-600';
+                        return (
+                          <td key={dt} className="px-1 py-1 text-center border-r cursor-pointer hover:ring-2 hover:ring-blue-400"
+                            onClick={() => toggleSheetStatus(e.id, dt, status)}>
+                            <span className={`inline-block w-7 h-5 rounded text-[10px] font-bold leading-5 ${bg} ${changed !== undefined ? 'ring-2 ring-blue-500' : ''}`}>
+                              {status === 'Present' ? 'P' : status === 'Absent' ? 'A' : status === 'Late' ? 'L' : status === 'Half-day' ? 'H' : status === 'Leave' ? 'LV' : status === 'Rest Day' ? 'RD' : ''}
+                            </span>
+                          </td>
+                        );
+                      })}
+                      <td className="px-2 py-1 text-center font-bold text-green-700 bg-blue-50 border-l-2">{e.summary.present}</td>
+                      <td className="px-2 py-1 text-center font-bold text-red-700">{e.summary.absent}</td>
+                      <td className="px-2 py-1 text-center font-bold text-yellow-700">{e.summary.late}</td>
+                      <td className="px-2 py-1 text-center font-bold text-orange-700">{e.summary.half_day}</td>
+                      <td className="px-2 py-1 text-center font-bold text-blue-700">{e.summary.leave}</td>
+                      <td className="px-2 py-1 text-center font-bold text-gray-500">{e.summary.rest_day}</td>
+                      <td className="px-2 py-1 text-center font-bold bg-green-50">{e.summary.worked}</td>
+                    </tr>
+                  ))}
+                  <tr className="border-t-2 border-gray-300 bg-gray-50 font-bold">
+                    <td className="sticky left-0 bg-gray-50 px-3 py-1.5 border-r z-10">TOTALS</td>
+                    {sheetData.dates.map((dt: string) => {
+                      let count = 0; let has = false;
+                      for (const e of sheetData.employees) {
+                        const key = `${e.id}_${dt}`;
+                        const changed = sheetChanges[key];
+                        const rec = e.days[dt];
+                        const status = changed !== undefined ? (changed || null) : rec?.status;
+                        if (status && status !== 'Absent' && status !== 'Leave') { count += status === 'Half-day' ? 0.5 : 1; has = true; }
+                      }
+                      return <td key={dt} className="px-2 py-1 text-center border-r text-gray-600">{has ? count : ''}</td>;
+                    })}
+                    <td className="px-2 py-1 text-center border-l-2"></td><td></td><td></td><td></td><td></td><td></td><td></td>
+                  </tr>
+                </tbody>
+              </table>
+              <div className="px-4 py-2 border-t bg-gray-50 text-[10px] text-gray-500 flex gap-4">
+                <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-green-200 inline-block"></span> Present</span>
+                <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-red-200 inline-block"></span> Absent</span>
+                <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-yellow-200 inline-block"></span> Late</span>
+                <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-orange-200 inline-block"></span> Half-day</span>
+                <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-blue-200 inline-block"></span> Leave</span>
+                <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-gray-300 inline-block"></span> Rest Day</span>
+                <span className="ml-4 text-gray-400">Click cell to cycle status | Blue outline = unsaved</span>
+              </div>
+            </div>
+          )}
+          {!sheetData && <div className="text-center py-12 text-gray-400">Click "Load" to generate the attendance sheet</div>}
         </div>
       )}
     </div>

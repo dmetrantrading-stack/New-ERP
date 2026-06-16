@@ -840,6 +840,8 @@ const migrate = async () => {
 
     await client.query(`ALTER TABLE payment_vouchers ADD COLUMN IF NOT EXISTS apv_id UUID REFERENCES ap_vouchers(id)`);
     await client.query(`ALTER TABLE payment_vouchers ADD COLUMN IF NOT EXISTS bank_account_id INTEGER`);
+    await client.query(`ALTER TABLE payment_vouchers ADD COLUMN IF NOT EXISTS check_date DATE`);
+    await client.query(`ALTER TABLE payment_vouchers ADD COLUMN IF NOT EXISTS check_bank VARCHAR(100)`);
 
     // ==================== SYSTEM SETTINGS ====================
     await client.query(`
@@ -992,11 +994,13 @@ const migrate = async () => {
         date DATE NOT NULL DEFAULT CURRENT_DATE,
         time_in TIMESTAMP,
         time_out TIMESTAMP,
-        status VARCHAR(50) DEFAULT 'Present' CHECK (status IN ('Present', 'Absent', 'Late', 'Half-day', 'Leave')),
+        status VARCHAR(50) DEFAULT 'Present' CHECK (status IN ('Present', 'Absent', 'Late', 'Half-day', 'Leave', 'Rest Day')),
         notes TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
+    await client.query(`ALTER TABLE attendance DROP CONSTRAINT IF EXISTS attendance_employee_date_unique`);
+    await client.query(`ALTER TABLE attendance ADD CONSTRAINT attendance_employee_date_unique UNIQUE (employee_id, date)`);
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS payroll (
@@ -1165,6 +1169,19 @@ const migrate = async () => {
     await client.query(`ALTER TABLE pos_transaction_items ADD COLUMN IF NOT EXISTS selected_variant VARCHAR(50)`);
     await client.query(`ALTER TABLE pos_transaction_items ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`);
     await client.query(`ALTER TABLE collection_receipts ADD COLUMN IF NOT EXISTS bank_account_id INTEGER REFERENCES bank_accounts(id)`);
+    await client.query(`ALTER TABLE collection_receipts ADD COLUMN IF NOT EXISTS check_date DATE`);
+    await client.query(`ALTER TABLE collection_receipts ADD COLUMN IF NOT EXISTS check_bank VARCHAR(100)`);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS collection_receipt_allocations (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        receipt_id UUID REFERENCES collection_receipts(id) ON DELETE CASCADE,
+        invoice_id UUID REFERENCES sales_invoices(id),
+        applied_amount DECIMAL(15,2) NOT NULL,
+        ewt_amount DECIMAL(15,2) DEFAULT 0,
+        lgu_amount DECIMAL(15,2) DEFAULT 0
+      )
+    `);
     await client.query(`ALTER TABLE purchase_order_items ADD COLUMN IF NOT EXISTS discount_type VARCHAR(10) DEFAULT '%'`);
     await client.query(`ALTER TABLE purchase_order_items ADD COLUMN IF NOT EXISTS discount_value DECIMAL(15,2) DEFAULT 0`);
     await client.query(`ALTER TABLE purchase_order_items ADD COLUMN IF NOT EXISTS discount_amount DECIMAL(15,2) DEFAULT 0`);
@@ -1241,6 +1258,13 @@ const migrate = async () => {
     await client.query(`UPDATE bank_accounts SET gl_account_code = '1012' WHERE pos_payment_method = 'Maya' AND (gl_account_code IS NULL OR gl_account_code = '1010')`);
     await client.query(`UPDATE bank_accounts SET gl_account_code = '1013' WHERE pos_payment_method = 'Credit Card' AND (gl_account_code IS NULL OR gl_account_code = '1010')`);
     await client.query(`UPDATE bank_accounts SET gl_account_code = '1014' WHERE pos_payment_method = 'Bank Transfer' AND (gl_account_code IS NULL OR gl_account_code = '1010')`);
+
+    await client.query(
+      "INSERT INTO chart_of_accounts (account_code, account_name, account_type) VALUES ('1015','Checks on Hand / Undeposited','Asset') ON CONFLICT (account_code) DO NOTHING"
+    );
+    await client.query(
+      "INSERT INTO chart_of_accounts (account_code, account_name, account_type) VALUES ('1106','Input VAT','Asset') ON CONFLICT (account_code) DO NOTHING"
+    );
 
     // ==================== SUPPLIER PRICE HISTORY ====================
     await client.query(`

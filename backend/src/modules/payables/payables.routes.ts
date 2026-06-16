@@ -54,7 +54,7 @@ router.get('/po-items/:poId', authenticate, async (req: AuthRequest, res: Respon
 router.get('/gr-items/:grId', authenticate, async (req: AuthRequest, res: Response) => {
   try {
     const r = await query(
-      `SELECT gri.*, p.name as product_name, p.sku, p.unit_of_measure FROM goods_receipt_items gri JOIN products p ON gri.product_id = p.id WHERE gri.gr_id = $1`,
+      `SELECT gri.*, p.name as product_name, p.sku, p.unit_of_measure FROM goods_receipt_items gri LEFT JOIN products p ON gri.product_id = p.id WHERE gri.gr_id = $1`,
       [req.params.grId]
     ); res.json(r.rows);
   } catch (error: any) { res.status(500).json({ error: error.message }); }
@@ -149,135 +149,121 @@ router.get('/vouchers/:id/print', async (req: AuthRequest, res: Response) => {
 
     const styles = `
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:Arial,Helvetica,sans-serif;font-size:10px;color:#1a1a1a;padding:6mm 8mm;max-width:210mm;margin:0 auto}
-.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;padding-bottom:8px;border-bottom:2px solid #1e3a5f}
-.header-left{display:flex;align-items:center;gap:10px}
-.header-logo{width:50px;height:50px;border:1px solid #ccc;border-radius:6px;display:flex;align-items:center;justify-content:center;font-weight:bold;font-size:18px;color:#1e3a5f;background:#f0f4f8}
-.header-title h1{font-size:16px;color:#1e3a5f;margin:0;font-weight:700}
-.header-title .sub{font-size:7px;color:#666}
-.header-right{text-align:right}
-.header-right .doc-num{font-size:13px;font-weight:bold;color:#1e3a5f}
-.header-right .doc-date{font-size:8px;color:#666}
-.status-badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:7px;font-weight:bold;margin-top:2px}
-.status-Posted{background:#e6f4ea;color:#137333}
-.status-Draft{background:#f1f3f4;color:#5f6368}
-.status-Void{background:#fce8e6;color:#c5221f}
-.info-section{display:flex;gap:12px;margin:8px 0}
-.info-left{flex:1.2;border:1px solid #dde1e6;border-radius:6px;padding:8px 10px;background:#f8f9fa}
-.info-right{flex:0.8;border:1px solid #dde1e6;border-radius:6px;padding:8px 10px;background:#fff}
-.info-section .section-title{font-size:7px;font-weight:700;text-transform:uppercase;color:#5f6368;letter-spacing:.5px;margin-bottom:6px;border-bottom:1px solid #e8eaed;padding-bottom:3px}
-.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:3px 8px}
-.info-grid .lbl{font-size:7px;color:#5f6368;text-transform:uppercase}
-.info-grid .val{font-size:8px;color:#1a1a1a;font-weight:600}
-.full-row{grid-column:1/-1}
-.payee-card{border:1px solid #dde1e6;border-radius:6px;padding:8px 10px;margin:8px 0;background:#fff}
-.payee-card .section-title{font-size:7px;font-weight:700;text-transform:uppercase;color:#5f6368;letter-spacing:.5px;margin-bottom:6px;border-bottom:1px solid #e8eaed;padding-bottom:3px}
-.payee-grid{display:grid;grid-template-columns:1fr 1fr;gap:3px 12px}
-.payee-grid .lbl{font-size:7px;color:#5f6368;text-transform:uppercase}
-.payee-grid .val{font-size:9px;color:#1a1a1a;font-weight:600}
-.items-table{width:100%;border-collapse:collapse;margin:8px 0;font-size:8px}
-.items-table th{background:#1e3a5f;color:#fff;padding:5px 8px;text-align:left;font-weight:600;font-size:7px;text-transform:uppercase;letter-spacing:.3px}
-.items-table th:last-child{text-align:right}
-.items-table td{padding:5px 8px;border-bottom:1px solid #e8eaed;color:#333;font-size:8px}
-.items-table td:last-child{text-align:right;font-weight:600}
-.ewt-section{border:1px solid #fce8e6;border-radius:6px;padding:8px 10px;margin:8px 0;background:#fef7f6}
-.ewt-section .section-title{font-size:7px;font-weight:700;text-transform:uppercase;color:#c5221f;margin-bottom:4px}
-.ewt-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px 12px;font-size:8px}
-.ewt-grid .lbl{color:#5f6368}
-.ewt-grid .val{font-weight:600}
-.summary{display:flex;justify-content:flex-end;margin:8px 0}
-.summary-table{border-collapse:collapse;font-size:9px;width:260px}
-.summary-table td{padding:3px 8px}
-.summary-table td:last-child{text-align:right;font-weight:600}
-.summary-table .grand{border-top:2px solid #1e3a5f;font-size:13px;font-weight:bold;color:#1e3a5f}
-.remarks{border:1px solid #dde1e6;border-radius:6px;padding:8px 10px;margin:8px 0;font-size:8px;color:#5f6368;min-height:40px}
-.remarks .section-title{font-size:7px;font-weight:700;text-transform:uppercase;color:#5f6368;letter-spacing:.5px;margin-bottom:4px}
-.signatures{display:flex;justify-content:space-between;margin-top:20px;gap:10px}
+body{font-family:"Courier New",monospace;font-size:10px;color:#111;padding:8mm 10mm;max-width:210mm;margin:0 auto;letter-spacing:.2px}
+.company-header{text-align:center;margin-bottom:8px}
+.company-header h1{font-size:18px;font-weight:bold;letter-spacing:4px;margin:0}
+.company-header .tagline{font-size:9px;color:#111;margin:3px 0}
+.dot-divider{text-align:center;font-size:11px;font-weight:bold;margin:4px 0;letter-spacing:1px}
+.dot-divider-thin{text-align:center;font-size:10px;color:#444;margin:2px 0}
+.doc-title{text-align:center;border:1px dotted #444;padding:6px 0;margin:8px 0}
+.doc-title h2{font-size:14px;font-weight:bold;letter-spacing:6px;margin:0}
+.details{display:flex;gap:20px;margin:10px 0}
+.details-left{flex:1;border:1px dotted #444;padding:8px 10px}
+.details-right{flex:1;border:1px dotted #444;padding:8px 10px}
+.details-label{font-size:9px;font-weight:bold;text-transform:uppercase;margin-bottom:5px}
+.details p{font-size:9px;margin:2px 0}
+.items-table{width:100%;border-collapse:collapse;margin:10px 0}
+.items-table th{background:#f8f8f8;border:1px dotted #444;padding:5px 6px;font-size:9px;text-align:left;font-weight:bold}
+.items-table td{border:1px dotted #444;padding:4px 6px;font-size:9px}
+.items-table td.right{text-align:right}
+.computation{display:flex;justify-content:flex-end;margin:10px 0}
+.comp-table{width:260px;border-collapse:collapse}
+.comp-table td{padding:3px 8px;font-size:9px}
+.comp-table td:last-child{text-align:right}
+.comp-table .total-row{border-top:2px dotted #000;font-size:12px;font-weight:bold}
+.section-title{font-size:9px;font-weight:bold;text-transform:uppercase;margin:12px 0 4px}
+.signatures{display:flex;justify-content:space-between;margin-top:18px;gap:4px}
 .sig-block{text-align:center;flex:1}
-.sig-block .sig-line{border-bottom:1px solid #1e3a5f;height:30px;margin-bottom:3px}
-.sig-block .sig-label{font-size:7px;color:#5f6368;font-weight:600}
-.footer{text-align:center;font-size:6px;color:#999;margin-top:12px;border-top:1px solid #e8eaed;padding-top:6px}
+.sig-block .sig-line{border-bottom:1px dotted #444;height:28px;margin-bottom:4px}
+.sig-block .sig-label{font-size:8px;color:#333;font-weight:bold;text-transform:uppercase}
+.footer{text-align:center;font-size:8px;color:#555;margin-top:12px;border-top:1px dotted #999;padding-top:6px}
 @media print{body{padding:4mm 6mm}}
 `;
 
-    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>PV ${d.voucher_number}</title><style>${styles}</style></head><body>
-<div class="header">
-<div class="header-left">
-<div class="header-logo">DM</div>
-<div class="header-title"><h1>${bizName}</h1><div class="sub">${bizTag} | ${bizAddr} | TIN: ${bizTin}</div></div>
-</div>
-<div class="header-right">
-<div class="doc-num">${d.voucher_number}</div>
-<div class="doc-date">${new Date(d.payment_date).toLocaleDateString('en-PH',{year:'numeric',month:'long',day:'numeric'})}</div>
-<span class="status-badge status-${d.status}">${d.status}</span>
-</div>
+    const fmtCurrency = (n: number) => '₱' + n.toLocaleString('en-PH', { minimumFractionDigits: 2 });
+    const fmtDate = (d: string) => d ? new Date(d).toLocaleDateString('en-PH', { year: 'numeric', month: 'short', day: 'numeric' }) : '—';
+    const refLabel = d.payment_method === 'Check' ? 'Check No.' : 'Reference #';
+    const checkInfo = d.payment_method === 'Check'
+      ? `<p><strong>Check Date:</strong> ${fmtDate(d.check_date)}</p><p><strong>Check Bank:</strong> ${d.check_bank || '—'}</p>`
+      : '';
+
+    const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>PV ${d.voucher_number}</title><style>${styles}</style></head><body>
+
+<div class="company-header">
+  <h1>${bizName}</h1>
+  <div class="tagline">${bizTag}</div>
+  <div class="tagline">${bizAddr}</div>
+  <div class="tagline">TIN: ${bizTin}</div>
 </div>
 
-<div class="info-section">
-<div class="info-left">
-<div class="section-title">Payment Information</div>
-<div class="info-grid">
-<div><span class="lbl">Payment Date</span><br><span class="val">${new Date(d.payment_date).toLocaleDateString('en-PH',{year:'numeric',month:'long',day:'numeric'})}</span></div>
-<div><span class="lbl">Payment Method</span><br><span class="val">${d.payment_method || 'N/A'}</span></div>
-<div><span class="lbl">Payee</span><br><span class="val">${d.supplier_name || 'N/A'}</span></div>
-<div><span class="lbl">Bank Account</span><br><span class="val">${d.bank_name ? d.bank_name + ' - ' + d.account_name : 'N/A'}</span></div>
-<div><span class="lbl">Reference Type</span><br><span class="val">${d.apv_number ? 'AP Voucher' : d.po_number ? 'Purchase Order' : 'Direct'}</span></div>
-<div><span class="lbl">Check/Ref #</span><br><span class="val">${refNum || '—'}</span></div>
-<div class="full-row"><span class="lbl">Prepared By</span><br><span class="val">${d.created_by_name || 'System'}</span></div>
-</div>
-</div>
-<div class="info-right">
-<div class="section-title">Document Reference</div>
-<div class="info-grid">
-<div class="full-row"><span class="lbl">APV / PO</span><br><span class="val">${docRef}</span></div>
-<div class="full-row"><span class="lbl">Supplier Code</span><br><span class="val">${d.supplier_code || '—'}</span></div>
-</div>
-</div>
+<div class="dot-divider">. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .</div>
+
+<div class="doc-title">
+  <h2>PAYMENT VOUCHER</h2>
 </div>
 
-<div class="payee-card">
-<div class="section-title">Payee Information</div>
-<div class="payee-grid">
-<div><span class="lbl">Name</span><br><span class="val">${d.supplier_name || 'N/A'}</span></div>
-<div><span class="lbl">TIN</span><br><span class="val">${d.supplier_tin || '—'}</span></div>
-<div class="full-row"><span class="lbl">Address</span><br><span class="val">${d.supplier_address || '—'}</span></div>
-</div>
+<div class="details">
+  <div class="details-left">
+    <div class="details-label">Voucher Details</div>
+    <p><strong>Voucher #:</strong> ${d.voucher_number}</p>
+    <p><strong>Date:</strong> ${fmtDate(d.payment_date)}</p>
+    <p><strong>Status:</strong> ${d.status}</p>
+  </div>
+  <div class="details-right">
+    <div class="details-label">Payee</div>
+    <p><strong>Name:</strong> ${d.supplier_name || '—'}</p>
+    <p><strong>Code:</strong> ${d.supplier_code || '—'}</p>
+    <p><strong>TIN:</strong> ${d.supplier_tin || '—'}</p>
+    <p><strong>Address:</strong> ${d.supplier_address || '—'}</p>
+  </div>
 </div>
 
+<div class="details">
+  <div class="details-left">
+    <div class="details-label">Payment Information</div>
+    <p><strong>Method:</strong> ${d.payment_method || '—'}</p>
+    <p><strong>${refLabel}:</strong> ${refNum || '—'}</p>
+    ${checkInfo}
+    <p><strong>Bank Account:</strong> ${d.bank_name ? d.bank_name + ' - ' + d.account_name : '—'}</p>
+    ${d.apv_number ? '<p><strong>APV:</strong> ' + d.apv_number + '</p>' : ''}
+    ${d.po_number ? '<p><strong>PO:</strong> ' + d.po_number + '</p>' : ''}
+  </div>
+  <div class="details-right">
+    <div class="details-label">Amount</div>
+    <p><strong>Gross Amount:</strong> ${fmtCurrency(amount)}</p>
+    <p style="font-size:14px;font-weight:bold;margin-top:6px">${fmtCurrency(amount)}</p>
+    <p style="margin-top:10px"><strong>Prepared by:</strong> ${d.created_by_name || 'System'}</p>
+  </div>
+</div>
+
+<div class="section-title">Accounting Entry</div>
 <table class="items-table">
-<thead><tr><th>Account Code</th><th>Account Name</th><th>Description</th><th style="text-align:right">Amount</th></tr></thead>
-<tbody>
-<tr><td>2000</td><td>Accounts Payable</td><td>Payment to ${d.supplier_name || 'Supplier'} - ${docRef}</td><td>₱${amount.toLocaleString('en-PH',{minimumFractionDigits:2})}</td></tr>
-</tbody>
+  <thead><tr><th>Account Code</th><th>Account Name</th><th>Description</th><th style="text-align:right">Debit</th><th style="text-align:right">Credit</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>2000</td>
+      <td>Accounts Payable</td>
+      <td>Payment to ${d.supplier_name || 'Supplier'}</td>
+      <td class="right">${fmtCurrency(amount)}</td>
+      <td class="right"></td>
+    </tr>
+    <tr>
+      <td>${d.payment_method === 'Cash' ? '1000' : '1010'}</td>
+      <td>${d.payment_method === 'Cash' ? 'Cash on Hand' : 'Cash in Bank'}</td>
+      <td>${d.payment_method === 'Check' ? 'Check #' + (refNum || '—') : d.payment_method + ' Payment'}</td>
+      <td class="right"></td>
+      <td class="right">${fmtCurrency(amount)}</td>
+    </tr>
+  </tbody>
 </table>
 
-${(d.payment_method === 'Check' || d.payment_method === 'Bank Transfer') ? `
-<div class="ewt-section">
-<div class="section-title">Withholding Tax &amp; Bank Details</div>
-<div class="ewt-grid">
-<div><span class="lbl">Gross Amount</span><br><span class="val">₱${amount.toLocaleString('en-PH',{minimumFractionDigits:2})}</span></div>
-<div><span class="lbl">EWT Applied</span><br><span class="val">None</span></div>
-<div><span class="lbl">Net Payment</span><br><span class="val" style="color:#1e3a5f">₱${amount.toLocaleString('en-PH',{minimumFractionDigits:2})}</span></div>
-<div class="full-row"><span class="lbl">Bank</span><br><span class="val">${d.bank_name ? d.bank_name + ' — Acct: ' + d.account_name : '—'}</span></div>
-</div>
-</div>
-` : ''}
-
-<div class="summary">
-<table class="summary-table">
-<tr><td>Gross Amount:</td><td>₱${amount.toLocaleString('en-PH',{minimumFractionDigits:2})}</td></tr>
-${false ? '<tr><td>Less EWT:</td><td>₱0.00</td></tr>' : ''}
-<tr class="grand"><td>Net Payment:</td><td>₱${amount.toLocaleString('en-PH',{minimumFractionDigits:2})}</td></tr>
-</table>
-</div>
-
-${d.notes ? '<div class="remarks"><div class="section-title">Remarks / Payment Description</div>' + d.notes + '</div>' : ''}
+${d.notes ? '<div style="border:1px dotted #444;padding:6px 10px;margin:8px 0"><div class="details-label">Remarks</div><p style="font-size:9px">' + d.notes + '</p></div>' : ''}
 
 <div class="signatures">
-<div class="sig-block"><div class="sig-line"></div><div class="sig-label">Prepared by</div></div>
-<div class="sig-block"><div class="sig-line"></div><div class="sig-label">Checked by</div></div>
-<div class="sig-block"><div class="sig-line"></div><div class="sig-label">Approved by</div></div>
-<div class="sig-block"><div class="sig-line"></div><div class="sig-label">Received by</div></div>
+  <div class="sig-block"><div class="sig-line"></div><div class="sig-label">Prepared by</div></div>
+  <div class="sig-block"><div class="sig-line"></div><div class="sig-label">Checked by</div></div>
+  <div class="sig-block"><div class="sig-line"></div><div class="sig-label">Approved by</div></div>
+  <div class="sig-block"><div class="sig-line"></div><div class="sig-label">Received by</div></div>
 </div>
 
 <div class="footer">Printed: ${new Date().toLocaleString('en-PH')} | Payment Voucher | Computer-generated document</div>
@@ -291,7 +277,8 @@ router.post('/vouchers', authenticate, auditLog('Payables', 'Create Voucher'), a
   const client = await getClient();
   try {
     await client.query('BEGIN');
-    const { supplier_id, payment_method, reference_number, notes, bank_account_id, allocations } = req.body;
+    const { supplier_id, payment_method, reference_number, notes, bank_account_id, allocations, payment_date, check_date, check_bank } = req.body;
+    const payDate = payment_date || new Date().toISOString().split('T')[0];
 
     if (!supplier_id) return res.status(400).json({ error: 'Supplier is required' });
     if (!payment_method) return res.status(400).json({ error: 'Payment method is required' });
@@ -321,9 +308,9 @@ router.post('/vouchers', authenticate, auditLog('Payables', 'Create Voucher'), a
       const id = uuidv4();
 
       await query(
-        `INSERT INTO payment_vouchers (id, voucher_number, supplier_id, payment_date, payment_method, reference_number, amount, status, notes, bank_account_id, created_by)
-         VALUES ($1, $2, $3, CURRENT_DATE, $4, $5, $6, 'Posted', $7, $8, $9)`,
-        [id, voucher_number, supplier_id, payment_method, reference_number, totalAmount, notes, bank_account_id || null, req.user!.id]
+        `INSERT INTO payment_vouchers (id, voucher_number, supplier_id, payment_date, payment_method, reference_number, amount, status, notes, bank_account_id, check_date, check_bank, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'Posted', $8, $9, $10, $11, $12)`,
+        [id, voucher_number, supplier_id, payDate, payment_method, reference_number, totalAmount, notes, bank_account_id || null, check_date || null, check_bank || null, req.user!.id]
       );
 
       await query('UPDATE suppliers SET balance = balance - $1 WHERE id = $2', [totalAmount, supplier_id]);
@@ -388,9 +375,9 @@ router.post('/vouchers', authenticate, auditLog('Payables', 'Create Voucher'), a
       voucherIds.push(id);
 
       await query(
-        `INSERT INTO payment_vouchers (id, voucher_number, supplier_id, po_id, apv_id, payment_date, payment_method, reference_number, amount, status, notes, bank_account_id, created_by)
-         VALUES ($1, $2, $3, $4, $5, CURRENT_DATE, $6, $7, $8, 'Posted', $9, $10, $11)`,
-        [id, voucher_number, supplier_id, alloc.po_id || null, alloc.apv_id || null, payment_method, reference_number, alloc.amount, notes, bank_account_id || null, req.user!.id]
+        `INSERT INTO payment_vouchers (id, voucher_number, supplier_id, po_id, apv_id, payment_date, payment_method, reference_number, amount, status, notes, bank_account_id, check_date, check_bank, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'Posted', $10, $11, $12, $13, $14)`,
+        [id, voucher_number, supplier_id, alloc.po_id || null, alloc.apv_id || null, payDate, payment_method, reference_number, alloc.amount, notes, bank_account_id || null, check_date || null, check_bank || null, req.user!.id]
       );
 
       if (alloc.apv_id) {

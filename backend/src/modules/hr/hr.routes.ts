@@ -277,6 +277,177 @@ router.get('/attendance/worked-days', authenticate, async (req: AuthRequest, res
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
+// Attendance Sheet — pivoted grid: employees × dates
+router.get('/attendance/sheet', authenticate, async (req: AuthRequest, res: Response) => {
+  try {
+    const from = req.query.from as string || new Date().toISOString().slice(0, 7) + '-01';
+    const to = req.query.to as string || new Date().toISOString().slice(0, 7) + '-15';
+    const employeeId = req.query.employee_id as string;
+
+    // Generate date list
+    const dates: string[] = [];
+    const d = new Date(from);
+    const end = new Date(to);
+    while (d <= end) { dates.push(d.toISOString().split('T')[0]); d.setDate(d.getDate() + 1); }
+
+    // Fetch employees
+    let empQuery = "SELECT id, first_name, last_name, employee_code, department, daily_rate FROM employees WHERE is_active = true";
+    const empParams: any[] = [];
+    if (employeeId) { empQuery += " AND id = $1"; empParams.push(employeeId); }
+    empQuery += " ORDER BY last_name, first_name";
+    const emps = await query(empQuery, empParams);
+
+    // Fetch attendance for all employees in date range
+    const att = await query(
+      `SELECT a.* FROM attendance a
+       WHERE a.date >= $1 AND a.date <= $2
+       ${employeeId ? 'AND a.employee_id = $3' : ''}
+       ORDER BY a.date`,
+      employeeId ? [from, to, employeeId] : [from, to]
+    );
+
+    // Pivot: employee_id -> date -> { status, time_in, time_out, id }
+    const attMap: Record<string, Record<string, any>> = {};
+    for (const row of att.rows) {
+      if (!attMap[row.employee_id]) attMap[row.employee_id] = {};
+      const dstr = `${row.date.getFullYear()}-${String(row.date.getMonth()+1).padStart(2,'0')}-${String(row.date.getDate()).padStart(2,'0')}`;
+      attMap[row.employee_id][dstr] = {
+        id: row.id,
+        status: row.status,
+        time_in: row.time_in ? new Date(row.time_in).toTimeString().slice(0, 5) : null,
+        time_out: row.time_out ? new Date(row.time_out).toTimeString().slice(0, 5) : null,
+      };
+    }
+
+    const employees = emps.rows.map((e: any) => {
+      const days: Record<string, any> = {};
+      const summary: Record<string, number> = { present: 0, absent: 0, late: 0, half_day: 0, leave: 0, rest_day: 0, worked: 0 };
+      for (const dt of dates) {
+        const rec = attMap[e.id]?.[dt];
+        days[dt] = rec || { status: null, time_in: null, time_out: null, id: null };
+        if (rec) {
+          const s = (rec.status || '').toLowerCase();
+          if (s === 'present') { summary.present++; summary.worked++; }
+          else if (s === 'absent') summary.absent++;
+          else if (s === 'late') { summary.late++; summary.worked++; }
+          else if (s === 'half-day') { summary.half_day++; summary.worked += 0.5; }
+          else if (s === 'leave') summary.leave++;
+          else if (s === 'rest day') summary.rest_day++;
+        }
+      }
+      return { id: e.id, name: `${e.last_name}, ${e.first_name}`, code: e.employee_code, department: e.department, daily_rate: e.daily_rate, days, summary };
+    });
+
+    res.json({ from, to, dates, employees });
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+// Batch upsert attendance sheet entries
+router.post('/attendance/sheet', authenticate, async (req: AuthRequest, res: Response) => {
+  try {
+    const { entries } = req.body;
+    if (!entries || !Array.isArray(entries) || entries.length === 0) {
+      return res.status(400).json({ error: 'entries array required' });
+    }
+    let upserted = 0;
+    for (const e of entries) {
+      if (!e.employee_id || !e.date) continue;
+      await query(
+        `INSERT INTO attendance (employee_id, date, status, time_in, time_out)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (employee_id, date) DO UPDATE SET status = $3, time_in = COALESCE($4, attendance.time_in), time_out = COALESCE($5, attendance.time_out)`,
+        [e.employee_id, e.date, e.status || 'Present', e.time_in || null, e.time_out || null]
+      );
+      upserted++;
+    }
+    res.json({ upserted });
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+// Attendance Sheet Print — dot-matrix HTML
+router.get('/attendance/sheet/print', async (req: AuthRequest, res: Response) => {
+  try {
+    const token = req.query.token as string || (req.headers.authorization || '').replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'Auth required' });
+    try { jwt.verify(token, config.jwtSecret); } catch { return res.status(401).json({ error: 'Invalid token' }); }
+
+    const from = req.query.from as string || new Date().toISOString().slice(0, 7) + '-01';
+    const to = req.query.to as string || new Date().toISOString().slice(0, 7) + '-15';
+    const employeeId = req.query.employee_id as string;
+
+    const dates: string[] = [];
+    const d = new Date(from);
+    const end = new Date(to);
+    while (d <= end) { dates.push(d.toISOString().split('T')[0]); d.setDate(d.getDate() + 1); }
+
+    let empQuery = "SELECT id, first_name, last_name, employee_code, department FROM employees WHERE is_active = true";
+    const empParams: any[] = [];
+    if (employeeId) { empQuery += " AND id = $1"; empParams.push(employeeId); }
+    empQuery += " ORDER BY last_name, first_name";
+    const emps = await query(empQuery, empParams);
+
+    const att = await query(
+      `SELECT a.* FROM attendance a WHERE a.date >= $1 AND a.date <= $2 ${employeeId ? 'AND a.employee_id = $3' : ''} ORDER BY a.date`,
+      employeeId ? [from, to, employeeId] : [from, to]
+    );
+    const attMap: Record<string, Record<string, any>> = {};
+    for (const row of att.rows) {
+      if (!attMap[row.employee_id]) attMap[row.employee_id] = {};
+      attMap[row.employee_id][`${row.date.getFullYear()}-${String(row.date.getMonth()+1).padStart(2,'0')}-${String(row.date.getDate()).padStart(2,'0')}`] = row;
+    }
+
+    const fmtDate = (dt: string) => new Date(dt).toLocaleDateString('en-PH', { month: 'short', day: 'numeric' });
+    const statusLabel = (s: string) => s === 'Present' ? 'P' : s === 'Absent' ? 'A' : s === 'Late' ? 'L' : s === 'Half-day' ? 'H' : s === 'Leave' ? 'LV' : s === 'Rest Day' ? 'RD' : '';
+
+    let rows = '';
+    for (const e of emps.rows) {
+      let cells = `<td style="font-size:9px;padding:3px 4px;text-align:left">${e.last_name}, ${e.first_name}</td>`;
+      let p = 0, a = 0, l = 0, h = 0, lv = 0, rd = 0;
+      for (const dt of dates) {
+        const rec = attMap[e.id]?.[dt];
+        if (!rec) { cells += '<td></td>'; continue; }
+        const s = rec.status;
+        cells += `<td style="text-align:center;font-size:9px">${statusLabel(s)}</td>`;
+        if (s === 'Present') p++; else if (s === 'Absent') a++; else if (s === 'Late') l++;
+        else if (s === 'Half-day') h++; else if (s === 'Leave') lv++; else if (s === 'Rest Day') rd++;
+      }
+      cells += `<td style="text-align:center;font-weight:bold">${p}</td><td style="text-align:center">${a}</td><td style="text-align:center">${l}</td><td style="text-align:center">${h}</td><td style="text-align:center">${lv}</td><td style="text-align:center">${rd}</td><td style="text-align:center;font-weight:bold">${p + l + h*0.5}</td>`;
+      rows += `<tr>${cells}</tr>`;
+    }
+
+    const biz = await query('SELECT * FROM business_details WHERE id = 1');
+    const b = biz.rows[0] || {};
+    const bizName = b.business_name || 'D METRAN TRADING';
+
+    const style = `
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:"Courier New",monospace;font-size:10px;color:#111;padding:6mm 8mm;max-width:297mm;margin:0 auto}
+.header{text-align:center;margin-bottom:8px}
+.header h1{font-size:16px;font-weight:bold;letter-spacing:3px;margin:0}
+.header p{font-size:9px;margin:2px 0}
+.doc-title{text-align:center;border:1px dotted #444;padding:5px 0;margin:8px 0}
+.doc-title h2{font-size:13px;font-weight:bold;letter-spacing:4px;margin:0}
+.info{font-size:9px;margin:6px 0;display:flex;gap:20px}
+table{width:100%;border-collapse:collapse;margin:6px 0}
+th{background:#f8f8f8;border:1px dotted #444;padding:3px 4px;font-size:8px;text-align:center;font-weight:bold}
+td{border:1px dotted #444;padding:2px 4px;font-size:8px}
+.legend{font-size:8px;margin-top:6px}
+.footer{text-align:center;font-size:7px;color:#666;margin-top:10px;border-top:1px dotted #999;padding-top:4px}
+@media print{body{padding:4mm 6mm}}
+`.trim();
+
+    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Attendance Sheet ${from} to ${to}</title><style>${style}</style></head><body>
+<div class="header"><h1>${bizName}</h1><p>Attendance Sheet</p></div>
+<div class="doc-title"><h2>ATTENDANCE SHEET</h2></div>
+<div class="info"><span><strong>Period:</strong> ${fmtDate(from)} — ${fmtDate(to)}</span><span><strong>Employees:</strong> ${emps.rows.length}</span></div>
+<table><thead><tr><th style="text-align:left">Employee</th>${dates.map(dt => `<th>${new Date(dt).getDate()}</th>`).join('')}<th>P</th><th>A</th><th>L</th><th>H</th><th>LV</th><th>RD</th><th>W</th></tr></thead><tbody>${rows}</tbody></table>
+<div class="legend"><strong>Legend:</strong> P=Present A=Absent L=Late H=Half-day LV=Leave RD=Rest Day W=Worked Days</div>
+<div class="footer">Printed: ${new Date().toLocaleString('en-PH')} | Attendance Sheet | ${bizName}</div>
+</body></html>`;
+    res.send(html);
+  } catch (error: any) { res.status(500).send('<p>Error: ' + error.message + '</p>'); }
+});
+
 // ==================== CASH ADVANCES ====================
 router.get('/cash-advances', authenticate, async (req: AuthRequest, res: Response) => {
   try {

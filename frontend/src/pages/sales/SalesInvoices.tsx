@@ -1,8 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { useNavigate } from 'react-router-dom';
 import api from '../../lib/api';
 import { formatCurrency, formatDate, PAYMENT_METHODS, PRICE_MODES } from '../../lib/utils';
-import { Plus, Eye, XCircle, Printer, Search, ArrowLeft, DollarSign, X } from 'lucide-react';
+import { Plus, Eye, XCircle, Printer, Search, ArrowLeft, X, Edit2 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import ProductAutocomplete from '../../components/ProductAutocomplete';
 import AttachmentPanel from '../../components/AttachmentPanel';
@@ -13,7 +12,6 @@ const TAX_TYPES = ['VATable', 'VAT Exempt', 'Zero Rated', 'LGU 5% Final VAT'];
 import Pagination from '../../components/Pagination';
 
 export default function SalesInvoices() {
-  const navigate = useNavigate();
   const [invoices, setInvoices] = useState<any[]>([]);
   const [customers, setCustomers] = useState<any[]>([]);
   const [employees, setEmployees] = useState<any[]>([]);
@@ -21,6 +19,7 @@ export default function SalesInvoices() {
   const [loading, setLoading] = useState(true);
   const [showInvoice, setShowInvoice] = useState<any>(null);
   const [creating, setCreating] = useState(false);
+  const [editingInvoiceId, setEditingInvoiceId] = useState<string | null>(null);
   const [currentInvoiceId, setCurrentInvoiceId] = useState<string | null>(null);
   const [invoiceAttachments, setInvoiceAttachments] = useState<any[]>([]);
   const [showAttachModal, setShowAttachModal] = useState(false);
@@ -188,9 +187,17 @@ export default function SalesInvoices() {
         due_date: form.due_date || undefined, notes: form.notes,
         ewt_rate: ewtRate,
       };
-      const res = await api.post('/sales/invoices', payload);
-      toast.success(`Invoice ${res.data.invoice_number} | Total: ${formatCurrency(res.data.total)} | Profit: ${formatCurrency(res.data.gross_profit)} (${res.data.margin_pct}%)`);
-      setCurrentInvoiceId(res.data.id);
+      if (editingInvoiceId) {
+        await api.patch('/sales/invoices/' + editingInvoiceId, payload);
+        toast.success('Invoice updated');
+      } else {
+        const res = await api.post('/sales/invoices', payload);
+        toast.success(`Invoice ${res.data.invoice_number} | Total: ${formatCurrency(res.data.total)} | Profit: ${formatCurrency(res.data.gross_profit)} (${res.data.margin_pct}%)`);
+      }
+      setCreating(false);
+      setEditingInvoiceId(null);
+      resetForm();
+      loadInvoices();
     } catch (err: any) { toast.error(err.response?.data?.error || 'Error creating invoice'); }
   };
 
@@ -205,6 +212,38 @@ export default function SalesInvoices() {
   const resetForm = () => {
     setForm({ customer_id: '', employee_id: '', customer_name: '', items: [], payment_method: 'Cash', amount_tendered: 0, due_date: '', notes: '', payment_terms: '' });
     setSelectedCustomer(null); setSelectedEmployee(null); setCustomerType('Customer'); setProductSearch(''); setInvoiceTaxType('VATable'); setPriceMode('Retail'); setEwtRate('0'); setInvoiceDate(new Date().toISOString().split('T')[0]);
+    setEditingInvoiceId(null);
+  };
+
+  const editInvoice = async (invoiceId: string) => {
+    try {
+      const res = await api.get(`/sales/invoices/${invoiceId}`);
+      const inv = res.data;
+      setEditingInvoiceId(invoiceId);
+      setCustomerType(inv.customer_type || 'Customer');
+      if (inv.customer_type === 'Employee') {
+        setSelectedEmployee({ id: inv.employee_id, first_name: inv.emp_first_name, last_name: inv.emp_last_name });
+      } else if (inv.customer_id) {
+        setSelectedCustomer({ id: inv.customer_id, customer_name: inv.customer_name, customer_code: '' });
+      }
+      setPriceMode(inv.price_mode || 'Retail');
+      setInvoiceTaxType(inv.tax_type || 'VATable');
+      setEwtRate(inv.withholding_tax > 0 ? String(Math.round((parseFloat(inv.withholding_tax) / parseFloat(inv.total)) * 100)) : '0');
+      setInvoiceDate(inv.invoice_date || new Date().toISOString().split('T')[0]);
+      setForm({
+        customer_id: inv.customer_id || '', employee_id: inv.employee_id || '',
+        customer_name: inv.customer_name || '',
+        items: (inv.items || []).map((i: any) => ({
+          product_id: i.product_id, variant_id: i.variant_id || undefined,
+          description: i.description || '', quantity: i.quantity, unit_price: i.unit_price,
+          discount: i.discount || 0, total: i.total, location_id: i.location_id,
+          tax_type: i.tax_type || inv.tax_type || 'VATable',
+        })),
+        payment_method: inv.payment_method || 'Cash', amount_tendered: 0,
+        due_date: inv.due_date || '', notes: inv.notes || '', payment_terms: inv.payment_terms || '',
+      });
+      setCreating(true);
+    } catch { toast.error('Failed to load invoice'); }
   };
 
   const viewInvoice = async (id: string) => {
@@ -247,7 +286,7 @@ export default function SalesInvoices() {
         <div className="flex-shrink-0 bg-white border-b border-gray-200 px-6 py-3 flex items-center justify-between">
           <div className="flex items-center gap-4">
             <button onClick={() => { setCreating(false); resetForm(); }} className="p-2 hover:bg-gray-100 rounded-lg"><ArrowLeft size={20} /></button>
-            <h1 className="text-lg font-bold text-gray-900">New Sales Invoice</h1>
+            <h1 className="text-lg font-bold text-gray-900">{editingInvoiceId ? 'Edit Sales Invoice' : 'New Sales Invoice'}</h1>
             <span className="font-mono text-base font-bold text-blue-700 bg-blue-50 px-3 py-1 rounded">SI-{new Date().getFullYear()}-######</span>
           </div>
           <div className="flex items-center gap-3 text-xs text-gray-500">
@@ -384,7 +423,7 @@ export default function SalesInvoices() {
                           <ProductAutocomplete
                             products={products}
                             value={item.product_id}
-                            selectedName={product ? product.name : ''}
+                            selectedName={product?.name || item.description || ''}
                             placeholder="Search product..."
                             getPrice={(p) => priceMode === 'Retail' ? p.retail_price : priceMode === 'Wholesale' ? p.wholesale_price : p.distributor_price}
                             searchFn={searchProducts}
@@ -441,13 +480,13 @@ export default function SalesInvoices() {
             <div className="bg-white border border-gray-200 rounded-lg p-4 w-80">
             <div className="space-y-2 text-sm">
               <div className="flex justify-between"><span className="text-gray-500">Subtotal</span><span className="font-medium">{formatCurrency(totals.subtotal)}</span></div>
-              <div className="flex justify-between"><span className="text-gray-500">Discount</span><span className="font-medium text-red-600">{formatCurrency(totals.discount)}</span></div>
+              {totals.discount > 0 && <div className="flex justify-between"><span className="text-gray-500">Discount</span><span className="font-medium text-red-600">-{formatCurrency(totals.discount)}</span></div>}
+              <div className="flex justify-between border-t border-gray-200 pt-2"><span className="font-bold text-gray-700">Invoice Amount</span><span className="font-bold text-gray-900">{formatCurrency(totals.subtotal - totals.discount)}</span></div>
               <div className="flex justify-between"><span className="text-gray-500">VATable Sales</span><span className="font-medium">{formatCurrency(totals.vatableSales)}</span></div>
               <div className="flex justify-between"><span className="text-gray-500">VAT (12%)</span><span className="font-medium">{formatCurrency(totals.vatAmount)}</span></div>
-              {totals.lguTax > 0 && <div className="flex justify-between"><span className="text-gray-500">LGU Final VAT 5%</span><span className="font-medium text-orange-600">{formatCurrency(totals.lguTax)}</span></div>}
-              {totals.whtAmount > 0 && <div className="flex justify-between"><span className="text-gray-500">EWT {ewtRate !== '0' ? `${ewtRate}%` : '(1%)'}</span><span className="font-medium text-orange-600">-{formatCurrency(totals.whtAmount)}</span></div>}
-              {totals.whtAmount > 0 && <div className="flex justify-between border-t border-gray-200 pt-2"><span className="font-bold text-gray-700">Amount Due (Net of EWT)</span><span className="font-bold text-lg text-gray-900">{formatCurrency(amountDue)}</span></div>}
-              {totals.whtAmount <= 0 && <div className="flex justify-between border-t border-gray-200 pt-2"><span className="font-bold text-gray-700">Amount Due</span><span className="font-bold text-lg text-gray-900">{formatCurrency(amountDue)}</span></div>}
+              {totals.lguTax > 0 && <div className="flex justify-between"><span className="text-gray-500">LGU Final VAT 5%</span><span className="font-medium text-orange-600">-{formatCurrency(totals.lguTax)}</span></div>}
+              <div className="flex justify-between"><span className="text-gray-500">{totals.whtAmount > 0 ? `Withholding Tax (${ewtRate !== '0' ? ewtRate + '%' : '1%'})` : 'Withholding Tax'}</span><span className={`font-medium ${totals.whtAmount > 0 ? 'text-orange-600' : 'text-gray-400'}`}>{totals.whtAmount > 0 ? `-${formatCurrency(totals.whtAmount)}` : '—'}</span></div>
+              <div className="flex justify-between border-t border-gray-200 pt-2"><span className="font-bold text-gray-700">Balance / Amount Due</span><span className="font-bold text-lg text-blue-700">{formatCurrency(amountDue)}</span></div>
             </div>
           </div>
           </div>
@@ -471,7 +510,7 @@ export default function SalesInvoices() {
               </div>
             )}
             <button onClick={() => { setCreating(false); resetForm(); }} className="px-6 py-2.5 border border-gray-300 rounded-lg text-sm font-medium hover:bg-gray-100">Cancel</button>
-            <button onClick={createInvoice} disabled={form.items.length === 0} className="px-6 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50">Post Invoice (F8)</button>
+            <button onClick={createInvoice} disabled={form.items.length === 0} className="px-6 py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50">{editingInvoiceId ? 'Update Invoice (F8)' : 'Post Invoice (F8)'}</button>
           </div>
         </div>
       </div>
@@ -496,9 +535,11 @@ export default function SalesInvoices() {
 
       <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
         <table className="data-table">
-          <thead><tr><th>Invoice #</th><th>Customer</th><th>Date</th><th>Due</th><th>Total</th><th>Paid</th><th>Balance</th><th>Status</th><th>Actions</th></tr></thead>
+          <thead><tr><th>Invoice #</th><th>Customer</th><th>Date</th><th>Due</th><th>Description</th><th>Invoice Amt</th><th>WHT</th><th>Paid</th><th>Balance</th><th>Status</th><th>Actions</th></tr></thead>
           <tbody>
-            {invoices.map((inv) => (
+            {invoices.map((inv) => {
+              const wht = parseFloat(inv.withholding_tax || '0');
+              return (
               <tr key={inv.id}>
                 <td className="font-mono text-xs">
                   {inv.invoice_number}
@@ -513,21 +554,23 @@ export default function SalesInvoices() {
                 </td>
                 <td className="text-xs">{formatDate(inv.invoice_date)}</td>
                 <td className="text-xs">{inv.due_date ? formatDate(inv.due_date) : '—'}</td>
-                <td>{formatCurrency(inv.total)}</td><td>{formatCurrency(inv.amount_paid)}</td>
-                <td className={inv.balance > 0 ? 'text-red-600 font-medium' : ''}>{formatCurrency(inv.balance)}</td>
+                <td className="text-xs max-w-[120px] truncate text-gray-500" title={inv.notes || ''}>{inv.notes || '—'}</td>
+                <td>{formatCurrency(inv.total)}</td>
+                <td className="text-orange-600 text-xs">{wht > 0 ? `(${formatCurrency(wht)})` : '—'}</td>
+                <td>{formatCurrency(inv.amount_paid)}</td>
+                <td className={parseFloat(inv.balance) > 0 ? 'text-red-600 font-medium' : ''}>{formatCurrency(inv.balance)}</td>
                 <td><span className={`px-2 py-1 text-xs rounded-full ${inv.status === 'Paid' ? 'bg-green-100 text-green-700' : inv.status === 'Posted' ? 'bg-blue-100 text-blue-700' : inv.status === 'Overdue' ? 'bg-red-100 text-red-700' : inv.status === 'Partial' ? 'bg-yellow-100 text-yellow-700' : inv.status === 'Deducted' ? 'bg-purple-100 text-purple-700' : inv.status === 'Void' ? 'bg-gray-200 text-gray-500' : 'bg-gray-100 text-gray-700'}`}>{inv.status}</span></td>
                 <td>
                   <div className="flex gap-1">
-                    {inv.status !== 'Void' && inv.status !== 'Paid' && inv.status !== 'Deducted' && inv.customer_type !== 'Employee' && inv.balance > 0 && (
-                      <button onClick={() => navigate(`/collections?invoice=${inv.id}`)} className="p-1.5 hover:bg-green-50 rounded text-green-600" title="Collect Payment"><DollarSign size={15} /></button>
-                    )}
+                    <button onClick={() => editInvoice(inv.id)} className="p-1.5 hover:bg-yellow-50 rounded text-yellow-600" title="Edit"><Edit2 size={15} /></button>
                     <button onClick={() => viewInvoice(inv.id)} className="p-1.5 hover:bg-blue-50 rounded text-blue-600" title="Preview"><Eye size={15} /></button>
                     <button onClick={() => { const token = localStorage.getItem('token'); window.open(`/api/sales/invoices/${inv.id}/print?token=${token}`, '_blank'); }} className="p-1.5 hover:bg-green-50 rounded text-green-600" title="Print"><Printer size={15} /></button>
                     {inv.status !== 'Void' && inv.status !== 'Deducted' && <button onClick={() => voidInvoice(inv.id)} className="p-1.5 hover:bg-red-50 rounded text-red-600" title="Void"><XCircle size={15} /></button>}
                   </div>
                 </td>
               </tr>
-            ))}
+            );
+            })}
           </tbody>
         </table>
         <Pagination page={page} totalPages={Math.ceil(total / limit)} total={total} onPageChange={setPage} />

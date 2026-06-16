@@ -4,6 +4,7 @@ import { useAuth } from './store/auth';
 import Layout from './components/layout/Layout';
 import LoginPage from './pages/auth/LoginPage';
 import DashboardPage from './pages/dashboard/DashboardPage';
+import ExecutiveDashboard from './pages/dashboard/ExecutiveDashboard';
 import ProductsPage from './pages/products/ProductsPage';
 import CategoryList from './pages/categories/CategoryList';
 import BrandList from './pages/brands/BrandList';
@@ -11,6 +12,7 @@ import InventoryPage from './pages/inventory/InventoryPage';
 import PurchaseOrders from './pages/purchases/PurchaseOrders';
 import SalesInvoices from './pages/sales/SalesInvoices';
 import CollectionsPage from './pages/sales/CollectionsPage';
+import CustomerStatementDetail from './pages/sales/CustomerStatementDetail';
 import POSPage from './pages/pos/POSPage';
 import CustomerList from './pages/customers/CustomerList';
 import SupplierList from './pages/suppliers/SupplierList';
@@ -39,7 +41,7 @@ export default function App() {
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />
-      <Route path="/" element={<ProtectedRoute><DashboardPage /></ProtectedRoute>} />
+      <Route path="/" element={<ProtectedRoute><ExecutiveDashboard /></ProtectedRoute>} />
       <Route path="/products" element={<ProtectedRoute><ProductsPage /></ProtectedRoute>} />
       <Route path="/categories" element={<ProtectedRoute><CategoryList /></ProtectedRoute>} />
       <Route path="/brands" element={<ProtectedRoute><BrandList /></ProtectedRoute>} />
@@ -62,6 +64,7 @@ export default function App() {
       <Route path="/payables" element={<ProtectedRoute><PayablesPage /></ProtectedRoute>} />
       <Route path="/production" element={<ProtectedRoute><ProductionOrders /></ProtectedRoute>} />
       <Route path="/collections" element={<ProtectedRoute><CollectionsPage /></ProtectedRoute>} />
+      <Route path="/customer-statement/:customerId" element={<ProtectedRoute><CustomerStatementDetail /></ProtectedRoute>} />
       <Route path="/settings" element={<ProtectedRoute><SettingsPage /></ProtectedRoute>} />
       <Route path="*" element={<Navigate to="/" />} />
     </Routes>

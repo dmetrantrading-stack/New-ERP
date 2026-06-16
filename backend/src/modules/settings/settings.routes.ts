@@ -1,4 +1,7 @@
 import { Router, Response } from 'express';
+import multer from 'multer';
+import path from 'path';
+import fs from 'fs';
 import { query, getClient } from '../../config/database';
 import { authenticate, AuthRequest } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
@@ -92,6 +95,63 @@ router.post('/reset-products', authenticate, auditLog('Settings', 'Reset Product
   } finally {
     client.release();
   }
+});
+
+// Public business info (no auth — used by login page for logo)
+router.get('/public', async (req, res: Response) => {
+  try {
+    const r = await query('SELECT logo_url, business_name FROM business_details WHERE id = 1');
+    res.json(r.rows[0] || { logo_url: null, business_name: 'D METRAN TRADING' });
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+// Logo upload
+const logoStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const dir = path.join('uploads', 'logos');
+    fs.mkdirSync(dir, { recursive: true });
+    cb(null, dir);
+  },
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname);
+    cb(null, 'logo' + ext);
+  },
+});
+
+const logoUpload = multer({
+  storage: logoStorage,
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (['image/png', 'image/jpeg', 'image/gif'].includes(file.mimetype)) cb(null, true);
+    else cb(new Error('Only PNG, JPG, GIF images allowed') as any);
+  },
+});
+
+router.post('/upload-logo', authenticate, logoUpload.single('logo'), async (req: AuthRequest, res: Response) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const logoUrl = '/api/settings/logo';
+    await query('UPDATE business_details SET logo_url = $1, updated_at = CURRENT_TIMESTAMP WHERE id = 1', [logoUrl]);
+    res.json({ logo_url: logoUrl });
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+// Serve logo image (via /api proxy)
+router.get('/logo', async (req, res: Response) => {
+  try {
+    const r = await query('SELECT logo_url FROM business_details WHERE id = 1');
+    const url = r.rows[0]?.logo_url;
+    if (!url) return res.status(404).end();
+    // Extract filename from stored URL path or use default
+    const dir = path.join(__dirname, '..', '..', '..', 'uploads', 'logos');
+    const files = fs.readdirSync(dir);
+    if (files.length === 0) return res.status(404).end();
+    const logoFile = path.join(dir, files[0]);
+    const ext = path.extname(files[0]).toLowerCase();
+    const mime = ext === '.png' ? 'image/png' : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : 'image/gif';
+    res.setHeader('Content-Type', mime);
+    res.sendFile(logoFile);
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
 export default router;

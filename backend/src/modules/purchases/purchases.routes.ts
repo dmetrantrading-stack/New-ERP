@@ -488,7 +488,7 @@ router.post('/receipts', authenticate, auditLog('Purchases', 'Goods Receipt'), a
       // Debit Input VAT
       await client.query(
         `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
-         VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '1105'), $3, $4, 0, 'Goods Receipt', $5)`,
+         VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '1106'), $3, $4, 0, 'Goods Receipt', $5)`,
         [uuidv4(), apEntryId, `Input VAT ${gr_number}`, inputVatAmt, id]
       );
     } else {

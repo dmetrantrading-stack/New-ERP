@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import api from '../../lib/api';
 import { formatCurrency, formatDate } from '../../lib/utils';
-import { Search, Eye, Plus, Printer, CheckCircle, X } from 'lucide-react';
+import { Search, Eye, Plus, Printer, CheckCircle, X, CheckSquare, Square } from 'lucide-react';
 import Pagination from '../../components/Pagination';
 import ProductAutocomplete from '../../components/ProductAutocomplete';
 import toast from 'react-hot-toast';
@@ -37,7 +37,8 @@ export default function PayablesPage() {
 
   const [form, setForm] = useState<any>({
     supplier_id: '', payment_method: 'Cash', reference_number: '',
-    notes: '', bank_account_id: '',
+    notes: '', bank_account_id: '', payment_date: new Date().toISOString().split('T')[0],
+    check_date: '', check_bank: '',
   });
 
   useEffect(() => {
@@ -90,8 +91,8 @@ export default function PayablesPage() {
         resetAPVForm();
       } else {
         const res = await api.post('/payables/apv', payload);
-        setEditingAPV({ id: res.data.id });
         toast.success('APV ' + res.data.apv_number + ' created');
+        resetAPVForm();
       }
       loadAPVs();
     } catch (err: any) { toast.error(err.response?.data?.error || 'Error'); }
@@ -162,7 +163,10 @@ export default function PayablesPage() {
       const payload = {
         supplier_id: parseInt(form.supplier_id),
         payment_method: form.payment_method,
+        payment_date: form.payment_date,
         reference_number: form.reference_number,
+        check_date: form.check_date || undefined,
+        check_bank: form.check_bank || undefined,
         notes: form.notes,
         bank_account_id: isBank ? form.bank_account_id : undefined,
         allocations: selectedInvoices.map((inv: any) => ({
@@ -282,7 +286,7 @@ export default function PayablesPage() {
                 return (
                   <tr key={i} className="border-t">
                     <td className="p-1.5">
-                      <ProductAutocomplete products={products} value={it.product_id} selectedName={product?.name || ''}
+                      <ProductAutocomplete products={products} value={it.product_id} selectedName={product?.name || it.description || ''}
                         getPrice={p => p.cost || 0} placeholder="Search product..."
                         onSelect={p => { const items = [...apvForm.items]; items[i] = { ...items[i], product_id: p.id, description: p.name, unit_cost: p.cost || 0, uom: p.unit_of_measure || 'pcs' }; setApvForm({ ...apvForm, items }); }} />
                     </td>
@@ -442,22 +446,61 @@ export default function PayablesPage() {
                   </select>
                 </div>
                 <div>
+                  <label className="block text-sm font-medium mb-1">Payment Date</label>
+                  <input type="date" value={form.payment_date} onChange={e => setForm({ ...form, payment_date: e.target.value })} className="w-full px-3 py-2 border rounded-lg text-sm" />
+                </div>
+                <div>
                   <label className="block text-sm font-medium mb-1">Payment Method</label>
                   <select value={form.payment_method} onChange={e => setForm({ ...form, payment_method: e.target.value })} className="w-full px-3 py-2 border rounded-lg text-sm">
                     <option>Cash</option><option>Check</option><option>Bank Transfer</option><option>GCash</option><option>Maya</option>
                   </select>
                 </div>
-                {(form.payment_method === 'Check' || form.payment_method === 'Bank Transfer') && (
-                  <div className="col-span-2">
-                    <label className="block text-sm font-medium mb-1">Bank Account</label>
-                    <select value={form.bank_account_id} onChange={e => setForm({ ...form, bank_account_id: e.target.value })} className="w-full px-3 py-2 border rounded-lg text-sm">
-                      <option value="">Select Bank Account</option>
-                      {bankAccounts.map((ba: any) => <option key={ba.id} value={ba.id}>{ba.bank_name} - {ba.account_name}</option>)}
-                    </select>
+                {form.payment_method === 'Check' ? (
+                  <>
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Check Number</label>
+                      <input type="text" value={form.reference_number} onChange={e => setForm({ ...form, reference_number: e.target.value })} placeholder="e.g. 001234" className="w-full px-3 py-2 border rounded-lg text-sm" />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Check Date</label>
+                      <input type="date" value={form.check_date} onChange={e => setForm({ ...form, check_date: e.target.value })} className="w-full px-3 py-2 border rounded-lg text-sm" />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Bank / Branch</label>
+                      <input type="text" value={form.check_bank} onChange={e => setForm({ ...form, check_bank: e.target.value })} placeholder="e.g. BPI Cagayan de Oro" className="w-full px-3 py-2 border rounded-lg text-sm" />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Deposit to Account</label>
+                      <select value={form.bank_account_id} onChange={e => setForm({ ...form, bank_account_id: e.target.value })} className="w-full px-3 py-2 border rounded-lg text-sm">
+                        <option value="">Select Bank Account</option>
+                        {bankAccounts.map((ba: any) => <option key={ba.id} value={ba.id}>{ba.bank_name} - {ba.account_name}</option>)}
+                      </select>
+                    </div>
+                  </>
+                ) : form.payment_method === 'Bank Transfer' ? (
+                  <>
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Reference #</label>
+                      <input type="text" value={form.reference_number} onChange={e => setForm({ ...form, reference_number: e.target.value })} className="w-full px-3 py-2 border rounded-lg text-sm" />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Bank Account</label>
+                      <select value={form.bank_account_id} onChange={e => setForm({ ...form, bank_account_id: e.target.value })} className="w-full px-3 py-2 border rounded-lg text-sm">
+                        <option value="">Select Bank Account</option>
+                        {bankAccounts.map((ba: any) => <option key={ba.id} value={ba.id}>{ba.bank_name} - {ba.account_name}</option>)}
+                      </select>
+                    </div>
+                  </>
+                ) : form.payment_method === 'GCash' || form.payment_method === 'Maya' ? (
+                  <div>
+                    <label className="block text-sm font-medium mb-1">Reference #</label>
+                    <input type="text" value={form.reference_number} onChange={e => setForm({ ...form, reference_number: e.target.value })} className="w-full px-3 py-2 border rounded-lg text-sm" />
                   </div>
-                )}
-                <div><label className="block text-sm font-medium mb-1">Reference #</label><input type="text" value={form.reference_number} onChange={e => setForm({ ...form, reference_number: e.target.value })} className="w-full px-3 py-2 border rounded-lg text-sm" /></div>
-                <div><label className="block text-sm font-medium mb-1">Notes</label><input type="text" value={form.notes} onChange={e => setForm({ ...form, notes: e.target.value })} className="w-full px-3 py-2 border rounded-lg text-sm" /></div>
+                ) : null}
+                <div>
+                  <label className="block text-sm font-medium mb-1">Notes</label>
+                  <input type="text" value={form.notes} onChange={e => setForm({ ...form, notes: e.target.value })} className="w-full px-3 py-2 border rounded-lg text-sm" />
+                </div>
               </div>
               {loading && <p className="text-center py-4 text-gray-400">Loading...</p>}
               {supplierInvoices.length > 0 && (

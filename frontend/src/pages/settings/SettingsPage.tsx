@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import api from '../../lib/api';
-import { Trash2, AlertTriangle, Save, Search, Wifi, WifiOff } from 'lucide-react';
+import { Trash2, AlertTriangle, Save, Search, Wifi, WifiOff, Upload } from 'lucide-react';
 import toast from 'react-hot-toast';
 
 export default function SettingsPage() {
@@ -12,6 +12,7 @@ export default function SettingsPage() {
   const [scanningPorts, setScanningPorts] = useState(false);
   const [comPorts, setComPorts] = useState<any[]>([]);
   const [printerStatus, setPrinterStatus] = useState<string>('');
+  const [logoUploading, setLogoUploading] = useState(false);
 
   const [biz, setBiz] = useState<any>({
     business_name: '', trade_name: '', address: '', barangay: '', city: '', province: '', zip_code: '',
@@ -68,6 +69,22 @@ export default function SettingsPage() {
 
   const update = (field: string, value: any) => setBiz({ ...biz, [field]: value });
 
+  const handleLogoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setLogoUploading(true);
+    try {
+      const formData = new FormData();
+      formData.append('logo', file);
+      const res = await api.post('/settings/upload-logo', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      setBiz({ ...biz, logo_url: res.data.logo_url });
+      toast.success('Logo uploaded');
+    } catch (err: any) { toast.error(err.response?.data?.error || 'Upload failed'); }
+    finally { setLogoUploading(false); }
+  };
+
   const handleReset = async () => {
     setResetting(true);
     try { await api.post('/settings/reset-transactions'); toast.success('All transactions reset'); setConfirming(false); }
@@ -90,6 +107,28 @@ export default function SettingsPage() {
       <div className="bg-white rounded-lg border border-gray-200 p-6">
         <h2 className="text-lg font-semibold text-gray-900 mb-4">Basic Business Details</h2>
         <div className="space-y-6">
+          {/* Logo Upload */}
+          <div className="flex items-start gap-6 pb-6 border-b border-gray-100">
+            <div className="w-24 h-24 rounded-xl border-2 border-dashed border-gray-300 flex items-center justify-center overflow-hidden bg-gray-50 flex-shrink-0">
+              {biz.logo_url ? (
+                <img src={biz.logo_url} alt="Logo" className="w-full h-full object-contain" />
+              ) : (
+                <div className="flex flex-col items-center text-gray-400">
+                  <Upload size={20} />
+                  <span className="text-[9px] mt-1">No logo</span>
+                </div>
+              )}
+            </div>
+            <div className="flex-1">
+              <p className="text-sm font-medium text-gray-700 mb-1">Company Logo</p>
+              <p className="text-xs text-gray-500 mb-3">Upload a PNG, JPG, or GIF image (max 5MB). This appears on the login page and printed documents.</p>
+              <label className={`inline-flex items-center gap-2 px-4 py-2 bg-white border border-gray-300 rounded-lg text-sm cursor-pointer hover:bg-gray-50 transition ${logoUploading ? 'opacity-50 pointer-events-none' : ''}`}>
+                <Upload size={14} />
+                {logoUploading ? 'Uploading...' : biz.logo_url ? 'Change Logo' : 'Upload Logo'}
+                <input type="file" accept="image/png,image/jpeg,image/gif" onChange={handleLogoUpload} className="hidden" />
+              </label>
+            </div>
+          </div>
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="block text-sm font-medium mb-1">Business Name <span className="text-red-500">*</span></label>
