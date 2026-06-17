@@ -8,7 +8,7 @@ const seed = async () => {
     await client.query('BEGIN');
 
     // Seed Roles
-    const roles = ['Admin', 'Owner', 'Cashier', 'Accountant', 'AR Officer', 'AP Officer', 'Purchaser', 'Warehouse Staff', 'Inventory Manager', 'Auditor'];
+    const roles = ['Admin', 'Owner', 'Cashier', 'Accountant', 'AR Officer', 'AP Officer', 'Purchaser', 'Warehouse Staff', 'Inventory Manager', 'Auditor', 'Petty Cash Custodian'];
     for (const role of roles) {
       await client.query('INSERT INTO roles (name) VALUES ($1) ON CONFLICT (name) DO NOTHING', [role]);
     }
@@ -83,9 +83,7 @@ const seed = async () => {
 
     // Seed Expense Categories
     const expenseCategories: [string, string][] = [
-      ['Fuel', '6010'], ['Transportation', '6020'], ['Food Allowance', '6080'],
-      ['Pantry Supplies', '6030'], ['Salaries', '6000'], ['Utilities', '6040'],
-      ['Repairs', '6070'], ['Office Supplies', '6060'], ['Miscellaneous', '6080'],
+      ['Salaries', '6000'], ['Utilities', '6040'], ['Repairs', '6070'], ['Miscellaneous', '6080'],
     ];
     for (const [name, accountCode] of expenseCategories) {
       const exists = await client.query('SELECT id FROM expense_categories WHERE name = $1', [name]);

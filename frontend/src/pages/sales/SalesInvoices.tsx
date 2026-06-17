@@ -558,7 +558,7 @@ export default function SalesInvoices() {
                 <td>{formatCurrency(inv.total)}</td>
                 <td className="text-orange-600 text-xs">{wht > 0 ? `(${formatCurrency(wht)})` : '—'}</td>
                 <td>{formatCurrency(inv.amount_paid)}</td>
-                <td className={parseFloat(inv.balance) > 0 ? 'text-red-600 font-medium' : ''}>{formatCurrency(inv.balance)}</td>
+                <td className={(parseFloat(inv.total) - parseFloat(inv.amount_paid) - parseFloat(inv.withholding_tax || '0')) > 0 ? 'text-red-600 font-medium' : ''}>{formatCurrency(Math.max(0, parseFloat(inv.total) - parseFloat(inv.amount_paid) - parseFloat(inv.withholding_tax || '0')))}</td>
                 <td><span className={`px-2 py-1 text-xs rounded-full ${inv.status === 'Paid' ? 'bg-green-100 text-green-700' : inv.status === 'Posted' ? 'bg-blue-100 text-blue-700' : inv.status === 'Overdue' ? 'bg-red-100 text-red-700' : inv.status === 'Partial' ? 'bg-yellow-100 text-yellow-700' : inv.status === 'Deducted' ? 'bg-purple-100 text-purple-700' : inv.status === 'Void' ? 'bg-gray-200 text-gray-500' : 'bg-gray-100 text-gray-700'}`}>{inv.status}</span></td>
                 <td>
                   <div className="flex gap-1">

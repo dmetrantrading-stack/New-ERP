@@ -45,7 +45,7 @@ export function generateBarcode(sku: string): string {
 
 export const API_URL = '/api';
 
-export const PAYMENT_METHODS = ['Cash', 'GCash', 'Maya', 'Bank Transfer', 'Credit Card', 'Charge'];
+export const PAYMENT_METHODS = ['Cash', 'Check'];
 export const CUSTOMER_TYPES = ['Retail', 'Wholesale', 'LGU', 'Corporate', 'Mining', 'Resort', 'Distributor'];
 export const TAX_TYPES = ['VAT', 'VAT Exempt', 'Zero Rated', 'LGU 5% Final VAT'];
 export const PRICE_MODES = ['Retail', 'Wholesale', 'Distributor'];

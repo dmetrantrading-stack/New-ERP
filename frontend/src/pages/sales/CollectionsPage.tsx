@@ -5,7 +5,7 @@ import { formatCurrency, formatDate } from '../../lib/utils';
 import { Search } from 'lucide-react';
 import toast from 'react-hot-toast';
 
-const PAYMENT_METHODS = ['Cash', 'Check', 'Bank Transfer', 'GCash', 'Maya'];
+const PAYMENT_METHODS = ['Cash', 'Check'];
 
 export default function CollectionsPage() {
   const [searchParams] = useSearchParams();
@@ -35,7 +35,7 @@ export default function CollectionsPage() {
 
   useEffect(() => {
     loadData();
-    api.get('/bank-management/accounts').then(r => setBankAccounts(r.data?.value || r.data || [])).catch(() => {});
+    api.get('/bank-management/accounts').then(r => setBankAccounts(r.data || [])).catch(() => {});
   }, []);
 
   useEffect(() => {

@@ -5,7 +5,7 @@ import {
   LayoutDashboard, Package, ShoppingCart, Users, UserPlus, FileSpreadsheet,
   BarChart3, Settings, LogOut, Menu, X, ChevronDown, Bell, Search,
   Warehouse, Truck, DollarSign, Building2, Receipt, Database, Shield,
-  Briefcase, Clock
+  Briefcase, Clock, CreditCard, ScrollText, Wallet, Banknote
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 
@@ -19,21 +19,56 @@ interface MenuItem {
 const menuItems: MenuItem[] = [
   { label: 'Dashboard', icon: LayoutDashboard, path: '/' },
   { label: 'Products', icon: Package, path: '/products' },
-  { label: 'Inventory', icon: Warehouse, path: '/inventory' },
-  { label: 'Production', icon: Warehouse, path: '/production' },
-  { label: 'Inventory Counts', icon: Database, path: '/inventory-count' },
-  { label: 'Stock Transfers', icon: Truck, path: '/stock-transfers' },
-  { label: 'Purchases', icon: ShoppingCart, path: '/purchases' },
-  { label: 'Sales', icon: Receipt, path: '/sales' },
-  { label: 'POS', icon: BarChart3, path: '/pos' },
+  {
+    label: 'Inventory',
+    icon: Warehouse,
+    children: [
+      { label: 'Inventory', path: '/inventory' },
+      { label: 'Production', path: '/production' },
+      { label: 'Inventory Counts', path: '/inventory-count' },
+      { label: 'Stock Transfers', path: '/stock-transfers' },
+    ],
+  },
+  {
+    label: 'Purchases',
+    icon: ShoppingCart,
+    children: [
+      { label: 'Purchase Orders', path: '/purchases' },
+      { label: 'Accounts Payable', path: '/payables' },
+    ],
+  },
+  {
+    label: 'Sales',
+    icon: Receipt,
+    children: [
+      { label: 'POS', path: '/pos' },
+      { label: 'Sales Invoices', path: '/sales' },
+      { label: 'Collections & AR', path: '/collections' },
+    ],
+  },
   { label: 'Customers', icon: Users, path: '/customers' },
   { label: 'Suppliers', icon: UserPlus, path: '/suppliers' },
-  { label: 'Users', icon: Shield, path: '/users' },
-  { label: 'Finance', icon: DollarSign, path: '/finance' },
+  {
+    label: 'Finance',
+    icon: DollarSign,
+    children: [
+      { label: 'Accounting', path: '/accounting' },
+      { label: 'Bank & Cash', path: '/bank-cash' },
+      { label: 'Expenses', path: '/expenses' },
+      { label: 'Petty Cash', path: '/petty-cash' },
+    ],
+  },
   { label: 'HR & Payroll', icon: Briefcase, path: '/hr' },
   { label: 'Reports', icon: FileSpreadsheet, path: '/reports' },
-  { label: 'Audit Trail', icon: Clock, path: '/audit' },
-  { label: 'Settings', icon: Settings, path: '/settings' },
+  {
+    label: 'System',
+    icon: Settings,
+    children: [
+      { label: 'Users', path: '/users' },
+      { label: 'Audit Trail', path: '/audit' },
+      { label: 'Settings', path: '/settings' },
+    ],
+  },
 ];
 
 export default function Layout({ children }: { children: React.ReactNode }) {
@@ -42,6 +77,46 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
+
+  const hasPerm = (key: string) => {
+    if (!user) return true;
+    if (user.role_name === 'Admin' || user.role_name === 'Owner') return true;
+    return user.permissions?.includes(key) || false;
+  };
+
+  const menuKeyToPerm: Record<string, string> = {
+    '/': 'dashboard.view',
+    '/products': 'sales.sales-invoice.view',
+    '/inventory': 'inventory.inventory.view',
+    '/production': 'inventory.production.view',
+    '/inventory-count': 'inventory.counts.view',
+    '/stock-transfers': 'inventory.stock-transfer.view',
+    '/purchases': 'purchases.purchase-order.view',
+    '/payables': 'purchases.apv.view',
+    '/pos': 'sales.collection-receipt.view',
+    '/sales': 'sales.sales-invoice.view',
+    '/collections': 'sales.collections.view',
+    '/customers': 'sales.sales-invoice.view',
+    '/suppliers': 'purchases.purchase-order.view',
+    '/accounting': 'finance.accounting.view',
+    '/bank-cash': 'finance.bank-cash.view',
+    '/expenses': 'finance.expenses.view',
+    '/petty-cash': 'finance.petty-cash.view',
+    '/hr': 'hr.employees.view',
+    '/reports': 'reports.view',
+    '/users': 'system.users.view',
+    '/audit': 'system.users.view',
+    '/settings': 'system.settings.view',
+  };
+
+  const filteredMenu = menuItems.filter(item => {
+    if (item.path) return hasPerm(menuKeyToPerm[item.path] || '');
+    if (item.children) {
+      const visibleChildren = item.children.filter(c => hasPerm(menuKeyToPerm[c.path] || ''));
+      return visibleChildren.length > 0;
+    }
+    return true;
+  });
 
   const toggleMenu = (label: string) => {
     setExpandedMenus((prev) =>
@@ -73,7 +148,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
         </div>
 
         <nav className="flex-1 overflow-y-auto py-2 px-2 space-y-1">
-          {menuItems.map((item) => {
+          {filteredMenu.map((item) => {
             const Icon = item.icon;
             const active = isActive(item.path) || isChildActive(item.children);
 

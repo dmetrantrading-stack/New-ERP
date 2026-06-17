@@ -4,7 +4,7 @@ import api from '../../lib/api';
 import { formatCurrency, formatDate } from '../../lib/utils';
 import toast from 'react-hot-toast';
 
-const PAYMENT_METHODS = ['Cash', 'Check', 'Bank Transfer', 'GCash', 'Maya'];
+const PAYMENT_METHODS = ['Cash', 'Check'];
 const DEPOSIT_OPTIONS = [
   { value: 'cash', label: 'Cash on Hand' },
   { value: 'checks_on_hand', label: 'Checks on Hand / Undeposited' },
@@ -211,7 +211,7 @@ export default function CustomerStatementDetail() {
                 <td className="text-xs">{formatDate(inv.due_date)}</td>
                 <td className="text-xs max-w-[150px] truncate text-gray-500" title={inv.notes || ''}>{inv.notes || '—'}</td>
                 <td style={{textAlign:'right'}}>{formatCurrency(inv.total)}</td>
-                <td style={{textAlign:'right'}} className="font-bold text-red-600">{formatCurrency(inv.balance)}</td>
+                <td style={{textAlign:'right'}} className="font-bold text-red-600">{formatCurrency(Math.max(0, parseFloat(inv.total) - parseFloat(inv.amount_paid) - parseFloat(inv.withholding_tax || '0')))}</td>
                 <td style={{textAlign:'right'}}>{formatCurrency(inv.amount_paid)}</td>
                 <td className="text-center">
                   <span className={`px-2 py-0.5 text-xs rounded-full ${parseInt(inv.days_past_due) > 60 ? 'bg-red-100 text-red-700' : parseInt(inv.days_past_due) > 0 ? 'bg-yellow-100 text-yellow-700' : 'bg-green-100 text-green-700'}`}>

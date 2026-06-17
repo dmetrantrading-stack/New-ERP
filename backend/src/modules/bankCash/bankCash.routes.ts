@@ -1,6 +1,6 @@
 import { Router, Response } from 'express';
 import { query } from '../../config/database';
-import { authenticate, AuthRequest } from '../../middleware/auth';
+import { authenticate, AuthRequest, hasUserPerm } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -119,7 +119,8 @@ router.get('/accounts', authenticate, async (req: AuthRequest, res: Response) =>
         COALESCE((SELECT SUM(amount) FROM bank_transactions WHERE bank_account_id = ba.id AND transaction_type = 'Deposit'), 0) as total_deposits,
         COALESCE((SELECT SUM(amount) FROM bank_transactions WHERE bank_account_id = ba.id AND transaction_type = 'Withdrawal'), 0) as total_withdrawals,
         COALESCE((SELECT SUM(amount) FROM cash_transactions WHERE transaction_type = 'Cash In' AND (status IS NULL OR status != 'Void')), 0) as cash_in_total,
-        COALESCE((SELECT SUM(amount) FROM cash_transactions WHERE transaction_type IN ('Cash Out','Petty Cash') AND (status IS NULL OR status != 'Void')), 0) as cash_out_total
+        COALESCE((SELECT SUM(amount) FROM cash_transactions WHERE transaction_type IN ('Cash Out','Petty Cash') AND (status IS NULL OR status != 'Void')), 0) as cash_out_total,
+        COALESCE((SELECT SUM(jel.debit - jel.credit) FROM journal_entry_lines jel JOIN journal_entries je ON jel.entry_id = je.id AND je.status = 'Posted' JOIN chart_of_accounts coa ON jel.account_id = coa.id WHERE coa.account_code = '1015'), 0) as checks_gl_balance
       FROM bank_accounts ba
       WHERE ba.is_active = true
       ORDER BY ba.account_type = 'Cash on Hand' DESC, ba.bank_name
@@ -128,6 +129,8 @@ router.get('/accounts', authenticate, async (req: AuthRequest, res: Response) =>
       ...r,
       computed_balance: r.account_type === 'Cash on Hand'
         ? parseFloat(r.cash_in_total) - parseFloat(r.cash_out_total)
+        : r.account_type === 'Checks on Hand'
+        ? parseFloat(r.checks_gl_balance)
         : parseFloat(r.total_deposits) - parseFloat(r.total_withdrawals),
     }));
     res.json(rows);
@@ -216,7 +219,7 @@ router.put('/accounts/:id', authenticate, auditLog('Bank & Cash', 'Update Accoun
 });
 
 // ==================== BANK TRANSACTIONS ====================
-router.post('/transactions', authenticate, auditLog('Bank & Cash', 'Create Transaction'), async (req: AuthRequest, res: Response) => {
+router.post('/transactions', authenticate, hasUserPerm('bank-cash.write'), auditLog('Bank & Cash', 'Create Transaction'), async (req: AuthRequest, res: Response) => {
   try {
     const { bank_account_id, transaction_type, amount, notes } = req.body;
     if (!bank_account_id || !transaction_type || !amount || amount <= 0) return res.status(400).json({ error: 'Account, type, and valid amount are required' });
@@ -287,6 +290,8 @@ router.post('/transfers', authenticate, auditLog('Bank & Cash', 'Transfer'), asy
 
     const isFromCashHand = fromAcct.rows[0].account_type === 'Cash on Hand';
     const isToCashHand = toAcct.rows[0].account_type === 'Cash on Hand';
+    const isFromChecksOnHand = fromAcct.rows[0].account_type === 'Checks on Hand';
+    const isToChecksOnHand = toAcct.rows[0].account_type === 'Checks on Hand';
 
     // Compute effective balance for source account
     let fromBalance: number;
@@ -295,6 +300,13 @@ router.post('/transfers', authenticate, auditLog('Bank & Cash', 'Transfer'), asy
         COALESCE(SUM(CASE WHEN transaction_type = 'Cash In' THEN amount ELSE 0 END), 0) -
         COALESCE(SUM(CASE WHEN transaction_type IN ('Cash Out','Petty Cash') THEN amount ELSE 0 END), 0) as bal
         FROM cash_transactions WHERE (status IS NULL OR status != 'Void')`);
+      fromBalance = parseFloat(r.rows[0].bal);
+    } else if (isFromChecksOnHand) {
+      const r = await query(`SELECT COALESCE(SUM(jel.debit - jel.credit), 0) as bal
+        FROM journal_entry_lines jel
+        JOIN journal_entries je ON jel.entry_id = je.id AND je.status = 'Posted'
+        JOIN chart_of_accounts coa ON jel.account_id = coa.id
+        WHERE coa.account_code = '1015'`);
       fromBalance = parseFloat(r.rows[0].bal);
     } else {
       const r = await query(`SELECT
@@ -323,6 +335,21 @@ router.post('/transfers', authenticate, auditLog('Bank & Cash', 'Transfer'), asy
       await query(`INSERT INTO bank_transactions (id, bank_account_id, transaction_type, amount, transaction_date, reference_type, reference_id, notes, created_by) VALUES ($1,$2,'Deposit',$3,CURRENT_DATE,'Bank Transfer',$4,$5,$6)`, [uuidv4(), to_account_id, amount, transferId, notes || '', req.user!.id]);
     }
 
+    // Mark selected checks as deposited (Option B: integrated into transfer)
+    if (isFromChecksOnHand && req.body.receipt_ids && Array.isArray(req.body.receipt_ids)) {
+      let depositedTotal = 0;
+      for (const rid of req.body.receipt_ids) {
+        const cr = await query('SELECT * FROM collection_receipts WHERE id = $1', [rid]);
+        if (cr.rows.length > 0 && !cr.rows[0].deposited) {
+          depositedTotal += parseFloat(cr.rows[0].amount);
+          await query('UPDATE collection_receipts SET deposited = true, updated_at = CURRENT_TIMESTAMP WHERE id = $1', [rid]);
+        }
+      }
+      if (depositedTotal > 0 && Math.abs(depositedTotal - amount) > 0.01) {
+        // Warn but don't block — the transfer amount might differ from the sum of selected checks
+      }
+    }
+
     // Journal entry using each account's gl_account_code
     const fromGl = fromAcct.rows[0].gl_account_code || '1010';
     const toGl = toAcct.rows[0].gl_account_code || '1010';
@@ -332,6 +359,31 @@ router.post('/transfers', authenticate, auditLog('Bank & Cash', 'Transfer'), asy
     await query(`INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id) VALUES ($1,$2,(SELECT id FROM chart_of_accounts WHERE account_code=$3),$4,$5,0,'Bank Transfer',$6),($7,$2,(SELECT id FROM chart_of_accounts WHERE account_code=$8),$9,0,$5,'Bank Transfer',$6)`, [uuidv4(), entryId, toGl, `Transfer to ${toAcct.rows[0].account_name}`, amount, transferId, uuidv4(), fromGl, `Transfer from ${fromAcct.rows[0].account_name}`]);
 
     res.json({ message: 'Transfer complete' });
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+// Undeposited checks — list collection receipts debited to Checks on Hand (1015)
+router.get('/checks-on-hand', authenticate, async (req: AuthRequest, res: Response) => {
+  try {
+    const r = await query(
+      `SELECT cr.id, cr.receipt_number, cr.payment_date, cr.reference_number as check_number,
+              cr.check_date, cr.check_bank, cr.amount, cr.customer_id,
+              c.customer_name, c.customer_code
+       FROM collection_receipts cr
+       LEFT JOIN customers c ON cr.customer_id = c.id
+       WHERE cr.status = 'Posted'
+         AND (cr.deposited IS NOT TRUE)
+         AND EXISTS (
+           SELECT 1 FROM journal_entry_lines jel
+           JOIN journal_entries je ON jel.entry_id = je.id AND je.status = 'Posted'
+           JOIN chart_of_accounts coa ON jel.account_id = coa.id
+           WHERE jel.reference_type = 'Collection'
+             AND jel.reference_id = cr.id::uuid
+             AND coa.account_code = '1015' AND jel.debit > 0
+         )
+       ORDER BY cr.payment_date`
+    );
+    res.json(r.rows);
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 

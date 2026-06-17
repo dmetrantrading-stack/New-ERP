@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import api from '../../lib/api';
 import { formatCurrency, formatDate } from '../../lib/utils';
-import { Search, Eye, Plus, Printer, CheckCircle, X, CheckSquare, Square } from 'lucide-react';
+import { Search, Plus, CheckSquare, Square } from 'lucide-react';
 import Pagination from '../../components/Pagination';
 import ProductAutocomplete from '../../components/ProductAutocomplete';
 import toast from 'react-hot-toast';
@@ -452,7 +452,7 @@ export default function PayablesPage() {
                 <div>
                   <label className="block text-sm font-medium mb-1">Payment Method</label>
                   <select value={form.payment_method} onChange={e => setForm({ ...form, payment_method: e.target.value })} className="w-full px-3 py-2 border rounded-lg text-sm">
-                    <option>Cash</option><option>Check</option><option>Bank Transfer</option><option>GCash</option><option>Maya</option>
+                    <option>Cash</option><option>Check</option>
                   </select>
                 </div>
                 {form.payment_method === 'Check' ? (

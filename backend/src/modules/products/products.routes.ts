@@ -2,7 +2,7 @@ import { Router, Response } from 'express';
 import multer from 'multer';
 import XLSX from 'xlsx';
 import { query } from '../../config/database';
-import { authenticate, AuthRequest, authorize } from '../../middleware/auth';
+import { authenticate, AuthRequest } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
 import { AppError } from '../../middleware/errorHandler';
 import { v4 as uuidv4 } from 'uuid';
@@ -699,7 +699,7 @@ router.delete('/:id/variants/:variantId', authenticate, auditLog('Products', 'De
 });
 
 // Delete product
-router.delete('/:id', authenticate, authorize('Admin'), auditLog('Products', 'Delete'), async (req: AuthRequest, res: Response) => {
+router.delete('/:id', authenticate, auditLog('Products', 'Delete'), async (req: AuthRequest, res: Response) => {
   try {
     const existing = await query('SELECT * FROM products WHERE id = $1', [req.params.id]);
     if (existing.rows.length === 0) {

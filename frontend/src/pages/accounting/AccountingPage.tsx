@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import api from '../../lib/api';
 import { formatCurrency } from '../../lib/utils';
+import { Edit2 } from 'lucide-react';
 import Pagination from '../../components/Pagination';
 import toast from 'react-hot-toast';
 import DrillDownModal from '../../components/reports/DrillDownModal';
@@ -21,6 +22,8 @@ export default function AccountingPage() {
   const [cfDateFrom, setCfDateFrom] = useState('');
   const [cfDateTo, setCfDateTo] = useState('');
   const [showCreateAccount, setShowCreateAccount] = useState(false);
+  const [showEditAccount, setShowEditAccount] = useState(false);
+  const [editAccount, setEditAccount] = useState<any>(null);
   const [drillDownAccount, setDrillDownAccount] = useState<any>(null);
   const [newAccount, setNewAccount] = useState({ account_code: '', account_name: '', account_type: 'Asset', parent_id: '' });
   const [jePage, setJePage] = useState(1);
@@ -77,6 +80,25 @@ export default function AccountingPage() {
     }
   };
 
+  const openEditAccount = (account: any) => {
+    setEditAccount({ ...account });
+    setShowEditAccount(true);
+  };
+
+  const saveEditAccount = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editAccount) return;
+    try {
+      await api.put(`/accounting/chart-of-accounts/${editAccount.id}`, editAccount);
+      toast.success('Account updated');
+      setShowEditAccount(false);
+      setEditAccount(null);
+      api.get('/accounting/chart-of-accounts').then((r) => setAccounts(r.data));
+    } catch (err: any) {
+      toast.error(err.response?.data?.error || 'Failed to update account');
+    }
+  };
+
   const viewEntry = async (id: string) => {
     try { const res = await api.get(`/accounting/journal-entries/${id}`); setSelectedEntry(res.data); } catch (err) { toast.error(err.response?.data?.error || 'Failed to load data'); }
   };
@@ -106,7 +128,7 @@ export default function AccountingPage() {
           </div>
           <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
             <table className="data-table">
-              <thead><tr><th>Code</th><th>Account Name</th><th>Type</th><th>Balance</th></tr></thead>
+              <thead><tr><th>Code</th><th>Account Name</th><th>Type</th><th>Balance</th><th style={{width:40}}></th></tr></thead>
               <tbody>
                 {accounts.map((a) => (
                   <tr key={a.id}>
@@ -114,6 +136,7 @@ export default function AccountingPage() {
                     <td className="font-medium">{a.account_name}</td>
                     <td><span className="px-2 py-0.5 text-xs rounded bg-gray-100">{a.account_type}</span></td>
                     <td className={a.balance < 0 ? 'text-red-600' : ''}>{formatCurrency(a.balance || 0)}</td>
+                    <td><button onClick={() => openEditAccount(a)} className="p-1 hover:bg-blue-50 rounded text-blue-600"><Edit2 size={14} /></button></td>
                   </tr>
                 ))}
               </tbody>
@@ -406,8 +429,53 @@ export default function AccountingPage() {
           )}
           {!cashFlow && <p className="text-gray-400 text-center py-8">Apply a filter to load cash flow data</p>}
         </div>
-      )}
-    </div>
+          )}
+          {showEditAccount && editAccount && (
+            <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={() => setShowEditAccount(false)}>
+              <div className="bg-white rounded-xl p-6 w-full max-w-lg mx-4 shadow-xl" onClick={(e) => e.stopPropagation()}>
+                <h2 className="text-lg font-semibold mb-4">Edit Account</h2>
+                <form onSubmit={saveEditAccount} className="space-y-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Account Code</label>
+                    <input type="text" required value={editAccount.account_code} onChange={(e) => setEditAccount({ ...editAccount, account_code: e.target.value })}
+                      className="input-field" />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Account Name</label>
+                    <input type="text" required value={editAccount.account_name} onChange={(e) => setEditAccount({ ...editAccount, account_name: e.target.value })}
+                      className="input-field" />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Account Type</label>
+                    <select value={editAccount.account_type} onChange={(e) => setEditAccount({ ...editAccount, account_type: e.target.value })}
+                      className="input-field">
+                      <option value="Asset">Asset</option><option value="Liability">Liability</option><option value="Equity">Equity</option><option value="Income">Income</option><option value="Expense">Expense</option><option value="Cost of Goods Sold">Cost of Goods Sold</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Parent Account</label>
+                    <select value={editAccount.parent_id || ''} onChange={(e) => setEditAccount({ ...editAccount, parent_id: e.target.value || null })}
+                      className="input-field">
+                      <option value="">None</option>
+                      {accounts.filter((a) => a.id !== editAccount.id && a.account_type === editAccount.account_type).map((a) => (
+                        <option key={a.id} value={a.id}>{a.account_code} - {a.account_name}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input type="checkbox" checked={editAccount.is_active} onChange={(e) => setEditAccount({ ...editAccount, is_active: e.target.checked })}
+                      className="w-4 h-4 rounded border-gray-300 text-blue-600" />
+                    <label className="text-sm text-gray-700">Active</label>
+                  </div>
+                  <div className="flex justify-end gap-3 pt-2">
+                    <button type="button" onClick={() => setShowEditAccount(false)} className="px-4 py-2 border rounded-lg text-sm">Cancel</button>
+                    <button type="submit" className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700">Save</button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+        </div>
     {drillDownAccount && <DrillDownModal account={drillDownAccount} onClose={() => setDrillDownAccount(null)} />}
     </>
   );

@@ -21,6 +21,7 @@ import AccountingPage from './pages/accounting/AccountingPage';
 import StockTransferPage from './pages/stockTransfer/StockTransferPage';
 import BankCashPage from './pages/bankCash/BankCashPage';
 import ExpenseList from './pages/expenses/ExpenseList';
+import PettyCashPage from './pages/pettyCash/PettyCashPage';
 import HrPage from './pages/hr/HrPage';
 import ReportsPage from './pages/reports/ReportsPage';
 import AuditPage from './pages/audit/AuditPage';
@@ -29,6 +30,7 @@ import PayablesPage from './pages/payables/PayablesPage';
 import ProductionOrders from './pages/production/ProductionOrders';
 import FinancePage from './pages/finance/FinancePage';
 import SettingsPage from './pages/settings/SettingsPage';
+import PermissionEditor from './pages/settings/PermissionEditor';
 
 const ProtectedRoute = ({ children }: { children: React.ReactNode }) => {
   const { user, loading } = useAuth();
@@ -57,6 +59,7 @@ export default function App() {
       <Route path="/stock-transfers" element={<ProtectedRoute><StockTransferPage /></ProtectedRoute>} />
       <Route path="/bank-cash" element={<ProtectedRoute><BankCashPage /></ProtectedRoute>} />
       <Route path="/expenses" element={<ProtectedRoute><ExpenseList /></ProtectedRoute>} />
+      <Route path="/petty-cash" element={<ProtectedRoute><PettyCashPage /></ProtectedRoute>} />
       <Route path="/hr" element={<ProtectedRoute><HrPage /></ProtectedRoute>} />
       <Route path="/reports" element={<ProtectedRoute><ReportsPage /></ProtectedRoute>} />
       <Route path="/audit" element={<ProtectedRoute><AuditPage /></ProtectedRoute>} />
@@ -66,6 +69,7 @@ export default function App() {
       <Route path="/collections" element={<ProtectedRoute><CollectionsPage /></ProtectedRoute>} />
       <Route path="/customer-statement/:customerId" element={<ProtectedRoute><CustomerStatementDetail /></ProtectedRoute>} />
       <Route path="/settings" element={<ProtectedRoute><SettingsPage /></ProtectedRoute>} />
+      <Route path="/settings/permissions/:userId" element={<ProtectedRoute><PermissionEditor /></ProtectedRoute>} />
       <Route path="*" element={<Navigate to="/" />} />
     </Routes>
   );

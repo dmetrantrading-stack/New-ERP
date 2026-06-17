@@ -1,10 +1,10 @@
 import { Router, Response } from 'express';
 import { query } from '../../config/database';
-import { authenticate, AuthRequest, authorize } from '../../middleware/auth';
+import { authenticate, AuthRequest } from '../../middleware/auth';
 
 const router = Router();
 
-router.get('/', authenticate, authorize('Admin', 'Auditor', 'Owner'), async (req: AuthRequest, res: Response) => {
+router.get('/', authenticate, async (req: AuthRequest, res: Response) => {
   try {
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 100;

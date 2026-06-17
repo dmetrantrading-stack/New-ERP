@@ -1,6 +1,6 @@
 import { Router, Response } from 'express';
 import { query } from '../../config/database';
-import { authenticate, AuthRequest } from '../../middleware/auth';
+import { authenticate, AuthRequest, hasUserPerm } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
 import { v4 as uuidv4 } from 'uuid';
 import jwt from 'jsonwebtoken';
@@ -187,15 +187,15 @@ router.get('/employees/:id/ledger', authenticate, async (req: AuthRequest, res: 
 
 router.post('/employees', authenticate, auditLog('HR', 'Create Employee'), async (req: AuthRequest, res: Response) => {
   try {
-    const { first_name, last_name, middle_name, address, phone, email, position, department, daily_rate, monthly_rate, sss, philhealth, pagibig, tin, employment_type, hire_date, credit_limit } = req.body;
+    const { first_name, last_name, middle_name, address, phone, email, position, department, daily_rate, monthly_rate, sss, philhealth, pagibig, tin, employment_type, hire_date, credit_limit, sss_default_amount } = req.body;
     if (!first_name || !last_name) return res.status(400).json({ error: 'First and last name are required' });
 
     const code = await getNextCode('employees', 'employee_code', 'DME-', 5);
 
     const result = await query(
-      `INSERT INTO employees (employee_code, first_name, last_name, middle_name, address, phone, email, position, department, daily_rate, monthly_rate, sss, philhealth, pagibig, tin, employment_type, hire_date, credit_limit)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
-      [code, first_name, last_name, middle_name, address, phone, email, position, department, daily_rate || 0, monthly_rate || 0, sss, philhealth, pagibig, tin, employment_type || 'Regular', hire_date, credit_limit || 0]
+      `INSERT INTO employees (employee_code, first_name, last_name, middle_name, address, phone, email, position, department, daily_rate, monthly_rate, sss, philhealth, pagibig, tin, employment_type, hire_date, credit_limit, sss_default_amount)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING *`,
+      [code, first_name, last_name, middle_name, address, phone, email, position, department, daily_rate || 0, monthly_rate || 0, sss, philhealth, pagibig, tin, employment_type || 'Regular', hire_date, credit_limit || 0, sss_default_amount || 0]
     );
     res.status(201).json(result.rows[0]);
   } catch (error: any) { res.status(500).json({ error: error.message }); }
@@ -203,7 +203,7 @@ router.post('/employees', authenticate, auditLog('HR', 'Create Employee'), async
 
 router.put('/employees/:id', authenticate, auditLog('HR', 'Update Employee'), async (req: AuthRequest, res: Response) => {
   try {
-    const { first_name, last_name, middle_name, address, phone, email, position, department, daily_rate, monthly_rate, sss, philhealth, pagibig, tin, employment_type, is_active, hire_date, credit_limit } = req.body;
+    const { first_name, last_name, middle_name, address, phone, email, position, department, daily_rate, monthly_rate, sss, philhealth, pagibig, tin, employment_type, is_active, hire_date, credit_limit, sss_default_amount } = req.body;
     const result = await query(
       `UPDATE employees SET first_name=COALESCE($1,first_name), last_name=COALESCE($2,last_name),
         middle_name=COALESCE($3,middle_name), address=COALESCE($4,address), phone=COALESCE($5,phone),
@@ -212,8 +212,8 @@ router.put('/employees/:id', authenticate, auditLog('HR', 'Update Employee'), as
         sss=COALESCE($11,sss), philhealth=COALESCE($12,philhealth), pagibig=COALESCE($13,pagibig),
         tin=COALESCE($14,tin), employment_type=COALESCE($15,employment_type),
         is_active=COALESCE($16,is_active), hire_date=COALESCE($17,hire_date),
-        credit_limit=COALESCE($18,credit_limit), updated_at=CURRENT_TIMESTAMP WHERE id=$19 RETURNING *`,
-      [first_name, last_name, middle_name, address, phone, email, position, department, daily_rate, monthly_rate, sss, philhealth, pagibig, tin, employment_type, is_active, hire_date, credit_limit, req.params.id]
+        credit_limit=COALESCE($18,credit_limit), sss_default_amount=COALESCE($19,sss_default_amount), updated_at=CURRENT_TIMESTAMP WHERE id=$20 RETURNING *`,
+      [first_name, last_name, middle_name, address, phone, email, position, department, daily_rate, monthly_rate, sss, philhealth, pagibig, tin, employment_type, is_active, hire_date, credit_limit, sss_default_amount, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Employee not found' });
     res.json(result.rows[0]);
@@ -462,20 +462,24 @@ router.get('/cash-advances', authenticate, async (req: AuthRequest, res: Respons
 
 router.post('/cash-advances', authenticate, auditLog('HR', 'Create Cash Advance'), async (req: AuthRequest, res: Response) => {
   try {
-    const { employee_id, amount, payment_account_type, payment_account_id, notes } = req.body;
+    const { employee_id, amount, payment_account_type, payment_account_id, notes, installment_amount, installment_count } = req.body;
     if (!employee_id || !amount || amount <= 0) return res.status(400).json({ error: 'Employee and valid amount are required' });
 
-    const emp = await query('SELECT credit_limit, cash_advance_balance FROM employees WHERE id = $1', [employee_id]);
+    const emp = await query('SELECT credit_limit, cash_advance_balance, employee_code FROM employees WHERE id = $1', [employee_id]);
     if (emp.rows.length === 0) return res.status(404).json({ error: 'Employee not found' });
     if (emp.rows[0].credit_limit > 0 && emp.rows[0].cash_advance_balance + amount > emp.rows[0].credit_limit) {
       return res.status(400).json({ error: 'Exceeds employee credit limit' });
     }
 
+    const instAmt = parseFloat(installment_amount || '0');
+    const instCount = parseInt(installment_count || '0');
+    if (instAmt > 0 && instAmt > amount) return res.status(400).json({ error: 'Installment amount cannot exceed advance amount' });
+
     const id = uuidv4();
     await query(
-      `INSERT INTO cash_advances (id, employee_id, amount, remaining_balance, payment_account_type, payment_account_id, notes, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-      [id, employee_id, amount, amount, payment_account_type, payment_account_id, notes, req.user!.id]
+      `INSERT INTO cash_advances (id, employee_id, amount, remaining_balance, installment_amount, installment_count, payment_account_type, payment_account_id, notes, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [id, employee_id, amount, amount, instAmt, instCount, payment_account_type, payment_account_id, notes, req.user!.id]
     );
 
     // Accounting: Debit Employee CA Receivable, Credit Cash/Bank
@@ -579,7 +583,7 @@ router.get('/payroll', authenticate, async (req: AuthRequest, res: Response) => 
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.post('/payroll', authenticate, auditLog('HR', 'Create Payroll'), async (req: AuthRequest, res: Response) => {
+router.post('/payroll', authenticate, hasUserPerm('hr.payroll.create'), auditLog('HR', 'Create Payroll'), async (req: AuthRequest, res: Response) => {
   try {
     const { employee_id, pay_period_start, pay_period_end, days_worked, other_deductions, notes } = req.body;
     if (!employee_id || !pay_period_start || !pay_period_end) return res.status(400).json({ error: 'Employee and pay period are required' });
@@ -591,13 +595,22 @@ router.post('/payroll', authenticate, auditLog('HR', 'Create Payroll'), async (r
     const grossPay = (days_worked || 0) * dailyRate;
 
     // Auto-compute cash advance deduction
-    const caResult = await query(
-      `SELECT COALESCE(SUM(remaining_balance), 0) as total FROM cash_advances WHERE employee_id = $1 AND status = 'Active'`,
+    // Compute cash advance deduction — respect installment caps
+    const activeCAs = await query(
+      `SELECT id, remaining_balance, installment_amount FROM cash_advances WHERE employee_id = $1 AND status = 'Active' ORDER BY advance_date ASC`,
       [employee_id]
     );
-    const caBalance = parseFloat(caResult.rows[0].total);
+    let caDeduction = 0;
+    for (const ca of activeCAs.rows) {
+      const bal = parseFloat(ca.remaining_balance);
+      const instAmt = parseFloat(ca.installment_amount || '0');
+      const cap = instAmt > 0 ? Math.min(instAmt, bal) : bal;
+      const deduct = Math.min(cap, Math.max(0, grossPay - caDeduction));
+      caDeduction += deduct;
+    }
+    caDeduction = Math.min(caDeduction, grossPay);
 
-    // Auto-compute grocery credit deduction from sales_invoices
+    // Auto-compute grocery credit deduction
     const gcResult = await query(
       `SELECT COALESCE(SUM(balance), 0) as total FROM sales_invoices
        WHERE employee_id = $1 AND customer_type = 'Employee' AND status IN ('Posted', 'Partial')`,
@@ -605,21 +618,11 @@ router.post('/payroll', authenticate, auditLog('HR', 'Create Payroll'), async (r
     );
     const gcBalance = parseFloat(gcResult.rows[0].total);
 
-    // Deduct from payroll
-    const caDeduction = Math.min(caBalance, grossPay);
     const remainingAfterCA = grossPay - caDeduction;
     const gcDeduction = Math.min(gcBalance, remainingAfterCA);
 
-    // Auto-compute SSS employee share deduction
-    const sssResult = await query(
-      `SELECT COALESCE(SUM(employee_amount), 0) as total FROM sss_contributions
-       WHERE employee_id = $1 AND status = 'Posted' AND period_start >= $2 AND period_end <= $3`,
-      [employee_id, pay_period_start, pay_period_end]
-    );
-    const sssDeduction = parseFloat(sssResult.rows[0].total);
-
     const otherTotal = (other_deductions || []).reduce((s: number, d: any) => s + parseFloat(d.amount || 0), 0);
-    const deductionsTotal = caDeduction + gcDeduction + sssDeduction + otherTotal;
+    const deductionsTotal = caDeduction + gcDeduction + otherTotal;
     const netPay = Math.max(0, grossPay - deductionsTotal);
 
     const payroll_number = await getNextCode('payroll', 'payroll_number', 'PY-', 4);
@@ -640,9 +643,6 @@ router.post('/payroll', authenticate, auditLog('HR', 'Create Payroll'), async (r
     if (gcDeduction > 0) {
       await query(`INSERT INTO payroll_deductions (id, payroll_id, deduction_type, amount) VALUES ($1,$2,'Grocery Credit',$3)`, [uuidv4(), id, gcDeduction]);
     }
-    if (sssDeduction > 0) {
-      await query(`INSERT INTO payroll_deductions (id, payroll_id, deduction_type, amount) VALUES ($1,$2,'SSS',$3)`, [uuidv4(), id, sssDeduction]);
-    }
     for (const d of other_deductions || []) {
       await query(`INSERT INTO payroll_deductions (id, payroll_id, deduction_type, amount) VALUES ($1,$2,$3,$4)`, [uuidv4(), id, d.type, d.amount]);
     }
@@ -651,7 +651,7 @@ router.post('/payroll', authenticate, auditLog('HR', 'Create Payroll'), async (r
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.put('/payroll/:id/approve', authenticate, async (req: AuthRequest, res: Response) => {
+router.put('/payroll/:id/approve', authenticate, hasUserPerm('hr.payroll.approve'), async (req: AuthRequest, res: Response) => {
   try {
     const p = await query(`SELECT p.*, e.employee_code FROM payroll p JOIN employees e ON p.employee_id = e.id WHERE p.id=$1`, [req.params.id]);
     if (p.rows.length === 0) return res.status(404).json({ error: 'Not found' });
@@ -663,13 +663,6 @@ router.put('/payroll/:id/approve', authenticate, async (req: AuthRequest, res: R
     const gcDed = parseFloat(payroll.grocery_credit_deduction || 0);
     const netPay = parseFloat(payroll.net_pay);
 
-    // Get SSS employee deduction for this payroll
-    const sssDedRow = await query(
-      `SELECT COALESCE(SUM(amount), 0) as total FROM payroll_deductions WHERE payroll_id = $1 AND deduction_type = 'SSS'`,
-      [req.params.id]
-    );
-    const sssDed = parseFloat(sssDedRow.rows[0].total);
-
     if (grossPay <= 0) return res.status(400).json({ error: 'Gross pay must be greater than zero' });
 
     // Accounting entry
@@ -678,10 +671,6 @@ router.put('/payroll/:id/approve', authenticate, async (req: AuthRequest, res: R
       { accountCode: '6000', description: `Salaries - ${payroll.payroll_number}`, debit: grossPay, credit: 0 },
       { accountCode: '2300', description: `Payroll Payable - ${payroll.payroll_number}`, debit: 0, credit: netPay },
     ];
-
-    if (sssDed > 0) {
-      lines.push({ accountCode: '2310', description: `SSS deduction - ${payroll.payroll_number}`, debit: 0, credit: sssDed });
-    }
 
     if (caDed > 0) {
       lines.push({ accountCode: '1110', description: `CA deduction - ${payroll.payroll_number}`, debit: 0, credit: caDed });
@@ -790,18 +779,12 @@ router.put('/payroll/:id/cancel', authenticate, async (req: AuthRequest, res: Re
       const caDed = parseFloat(p.rows[0].cash_advance_deduction || 0);
       const gcDed = parseFloat(p.rows[0].grocery_credit_deduction || 0);
       const netPay = parseFloat(p.rows[0].net_pay);
-      const sssDedCancelRow = await query(
-        `SELECT COALESCE(SUM(amount), 0) as total FROM payroll_deductions WHERE payroll_id = $1 AND deduction_type = 'SSS'`,
-        [req.params.id]
-      );
-      const sssDedCancel = parseFloat(sssDedCancelRow.rows[0].total);
 
       const jeNumber = await getNextCode('journal_entries', 'entry_number', 'JE-', 4);
       const lines: { accountCode: string; description: string; debit: number; credit: number }[] = [
         { accountCode: '2300', description: `Reverse Payroll Payable`, debit: netPay, credit: 0 },
         { accountCode: '6000', description: `Reverse Salaries`, debit: 0, credit: grossPay },
       ];
-      if (sssDedCancel > 0) lines.push({ accountCode: '2310', description: 'Reverse SSS deduction', debit: sssDedCancel, credit: 0 });
       if (caDed > 0) lines.push({ accountCode: '1110', description: 'Reverse CA deduction', debit: caDed, credit: 0 });
       if (gcDed > 0) lines.push({ accountCode: '1120', description: 'Reverse GC deduction', debit: gcDed, credit: 0 });
 
@@ -940,6 +923,32 @@ router.get('/sss-contributions', authenticate, async (req: AuthRequest, res: Res
        ORDER BY sc.created_at DESC`
     );
     res.json(result.rows);
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+// Auto-generate SSS contributions for all employees with a default amount
+router.post('/sss-contributions/generate', authenticate, async (req: AuthRequest, res: Response) => {
+  try {
+    const periodStart = req.body.period_start || new Date().toISOString().slice(0, 7) + '-01';
+    const periodEnd = req.body.period_end || new Date().toISOString().slice(0, 7) + '-' + new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0).getDate();
+    let created = 0;
+    const emps = await query(`SELECT id, sss_default_amount FROM employees WHERE is_active = true AND sss_default_amount > 0`);
+    for (const e of emps.rows) {
+      const existing = await query(
+        `SELECT 1 FROM sss_contributions WHERE employee_id = $1 AND period_start = $2`,
+        [e.id, periodStart]
+      );
+      if (existing.rows.length > 0) continue;
+      const contributionNumber = await getNextCode('sss_contributions', 'contribution_number', 'SSS-', 5);
+      const amt = parseFloat(e.sss_default_amount);
+      await query(
+        `INSERT INTO sss_contributions (id, contribution_number, employee_id, period_start, period_end, employer_amount, employee_amount, total_amount, status, notes)
+         VALUES ($1,$2,$3,$4,$5,$6,0,$6,'Draft','Auto-generated from employee default')`,
+        [uuidv4(), contributionNumber, e.id, periodStart, periodEnd, amt]
+      );
+      created++;
+    }
+    res.json({ created, period_start: periodStart, period_end: periodEnd });
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 

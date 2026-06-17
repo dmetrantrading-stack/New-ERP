@@ -35,6 +35,7 @@ import settingsRoutes from './modules/settings/settings.routes';
 import productionRoutes from './modules/production/production.routes';
 import attachmentRoutes from './modules/attachments/attachment.routes';
 import supplierPriceHistoryRoutes from './modules/supplier-price-history/supplier-price-history.routes';
+import pettyCashRoutes from './modules/pettyCash/pettyCash.routes';
 
 const app = express();
 
@@ -77,6 +78,7 @@ app.use('/api/settings', settingsRoutes);
 app.use('/api/production', productionRoutes);
 app.use('/api/attachments', attachmentRoutes);
 app.use('/api/supplier-price-history', supplierPriceHistoryRoutes);
+app.use('/api/petty-cash', pettyCashRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {

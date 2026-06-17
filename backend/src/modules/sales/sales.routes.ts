@@ -1,6 +1,6 @@
 ﻿import { Router, Response } from 'express';
 import { query, getClient } from '../../config/database';
-import { authenticate, AuthRequest } from '../../middleware/auth';
+import { authenticate, AuthRequest, hasUserPerm } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
 import { v4 as uuidv4 } from 'uuid';
 import jwt from 'jsonwebtoken';
@@ -30,7 +30,7 @@ const generateInvoiceNumber = async (): Promise<string> => {
 };
 
 // ==================== SALES INVOICES (Multi-Tax-Type Engine) ====================
-router.post('/invoices', authenticate, auditLog('Sales', 'Create Invoice'), async (req: AuthRequest, res: Response) => {
+router.post('/invoices', authenticate, hasUserPerm('sales.sales-invoice.create'), auditLog('Sales', 'Create Invoice'), async (req: AuthRequest, res: Response) => {
   try {
     const invoice_number = await generateInvoiceNumber();
     const {
@@ -789,7 +789,7 @@ router.patch('/invoices/:id', authenticate, auditLog('Sales', 'Edit Invoice'), a
 });
 
 // ==================== COLLECTION RECEIPTS ====================
-router.post('/collections', authenticate, auditLog('Sales', 'Create Collection'), async (req: AuthRequest, res: Response) => {
+router.post('/collections', authenticate, hasUserPerm('sales.collections.create'), auditLog('Sales', 'Create Collection'), async (req: AuthRequest, res: Response) => {
   try {
     const { customer_id, invoice_id, payment_method, reference_number, amount, notes, bank_account_id, collection_date, ewt_amount, lgu_amount, allocations, check_date, check_bank } = req.body;
 

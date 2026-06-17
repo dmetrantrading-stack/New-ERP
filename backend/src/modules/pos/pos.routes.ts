@@ -1,6 +1,6 @@
 import { Router, Response } from 'express';
 import { query, getClient } from '../../config/database';
-import { authenticate, AuthRequest } from '../../middleware/auth';
+import { authenticate, AuthRequest, hasUserPerm } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -177,7 +177,7 @@ router.get('/shifts/:id', authenticate, async (req: AuthRequest, res: Response) 
 });
 
 // ==================== POS TRANSACTIONS ====================
-router.post('/transactions', authenticate, auditLog('POS', 'Sale'), async (req: AuthRequest, res: Response) => {
+router.post('/transactions', authenticate, hasUserPerm('pos.write'), auditLog('POS', 'Sale'), async (req: AuthRequest, res: Response) => {
   const client = await getClient();
   try {
     await client.query('BEGIN');

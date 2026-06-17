@@ -1,6 +1,6 @@
 import { Router, Response } from 'express';
 import { query, getClient } from '../../config/database';
-import { authenticate, AuthRequest } from '../../middleware/auth';
+import { authenticate, AuthRequest, hasUserPerm } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
 import { v4 as uuidv4 } from 'uuid';
 import jwt from 'jsonwebtoken';
@@ -473,11 +473,22 @@ const generateAPVNumber = async (): Promise<string> => {
   return 'APV-' + yr + '-' + String(r.rows[0]?.next || 1).padStart(6, '0');
 };
 
-router.post('/apv', authenticate, auditLog('Payables', 'Create APV'), async (req: AuthRequest, res: Response) => {
+router.post('/apv', authenticate, hasUserPerm('payables.write'), auditLog('Payables', 'Create APV'), async (req: AuthRequest, res: Response) => {
   try {
     const apv_number = await generateAPVNumber();
     const { supplier_id, po_id, gr_id, apv_date, due_date, payment_terms, supplier_invoice_number, supplier_invoice_date, notes, items } = req.body;
     if (!items || items.length === 0) return res.status(400).json({ error: 'At least one item required' });
+
+    // Prevent duplicate APV for the same PO
+    if (po_id) {
+      const existing = await query(
+        `SELECT apv_number, status FROM ap_vouchers WHERE po_id = $1 AND status IN ('Draft','Posted','Partially Paid','Fully Paid')`,
+        [po_id]
+      );
+      if (existing.rows.length > 0) {
+        return res.status(409).json({ error: `PO already has an APV: ${existing.rows[0].apv_number} (${existing.rows[0].status})` });
+      }
+    }
 
     let gross = 0, discount = 0, vatable = 0, vat = 0;
     for (const it of items) {
@@ -556,7 +567,7 @@ router.patch('/apv/:id', authenticate, async (req: AuthRequest, res: Response) =
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.post('/apv/:id/post', authenticate, auditLog('Payables', 'Post APV'), async (req: AuthRequest, res: Response) => {
+router.post('/apv/:id/post', authenticate, hasUserPerm('payables.write'), auditLog('Payables', 'Post APV'), async (req: AuthRequest, res: Response) => {
   const client = await getClient();
   try {
     await client.query('BEGIN');

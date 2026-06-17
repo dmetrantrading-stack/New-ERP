@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import api from '../../lib/api';
 import { formatCurrency, formatDate } from '../../lib/utils';
 import {
-  Plus, Edit2, DollarSign, Clock, FileText, X, Wallet, ShoppingCart,
+  Plus, Edit2, DollarSign, FileText, X, Wallet, ShoppingCart,
   CheckCircle, XCircle, Shield, UserCheck, CreditCard, Printer,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
@@ -31,7 +31,6 @@ export default function HrPage() {
   const [payroll, setPayroll] = useState<any[]>([]);
   const [cashAdvances, setCashAdvances] = useState<any[]>([]);
   const [groceryCredits, setGroceryCredits] = useState<any[]>([]);
-  const [attendance, setAttendance] = useState<any[]>([]);
   const [sssContributions, setSssContributions] = useState<any[]>([]);
   const [ledgerData, setLedgerData] = useState<any>(null);
   const [payslipData, setPayslipData] = useState<any>(null);
@@ -39,7 +38,6 @@ export default function HrPage() {
   // Modals
   const [showEmployeeModal, setShowEmployeeModal] = useState(false);
   const [showPayrollModal, setShowPayrollModal] = useState(false);
-  const [showAttendanceModal, setShowAttendanceModal] = useState(false);
   const [showCashAdvModal, setShowCashAdvModal] = useState(false);
   const [showGroceryModal, setShowGroceryModal] = useState(false);
   const [showPayslipModal, setShowPayslipModal] = useState(false);
@@ -54,8 +52,10 @@ export default function HrPage() {
   // Attendance Sheet state
   const [sheetData, setSheetData] = useState<any>(null);
   const today = new Date();
-  const [sheetFrom, setSheetFrom] = useState(toLocalDate(new Date(today.getFullYear(), today.getMonth(), 1)));
-  const [sheetTo, setSheetTo] = useState(toLocalDate(new Date(today.getFullYear(), today.getMonth(), 15)));
+  const isSecondHalf = today.getDate() >= 16;
+  const lastDayOfMonth = new Date(today.getFullYear(), today.getMonth() + 1, 0).getDate();
+  const [sheetFrom, setSheetFrom] = useState(toLocalDate(new Date(today.getFullYear(), today.getMonth(), isSecondHalf ? 16 : 1)));
+  const [sheetTo, setSheetTo] = useState(toLocalDate(new Date(today.getFullYear(), today.getMonth(), isSecondHalf ? lastDayOfMonth : 15)));
   const [sheetEmployeeId, setSheetEmployeeId] = useState('');
   const [sheetSaving, setSheetSaving] = useState(false);
   const [sheetChanges, setSheetChanges] = useState<Record<string, string>>({});
@@ -63,10 +63,9 @@ export default function HrPage() {
   const [editEmployee, setEditEmployee] = useState<any>(null);
   const [loading, setLoading] = useState(false);
 
-  const [empForm, setEmpForm] = useState<any>({ first_name: '', last_name: '', position: '', department: '', daily_rate: 0, monthly_rate: 0, phone: '', email: '', sss: '', philhealth: '', pagibig: '', tin: '', employment_type: 'Regular', hire_date: '', credit_limit: 0 });
+  const [empForm, setEmpForm] = useState<any>({ first_name: '', last_name: '', position: '', department: '', daily_rate: 0, monthly_rate: 0, phone: '', email: '', sss: '', philhealth: '', pagibig: '', tin: '', employment_type: 'Regular', hire_date: '', credit_limit: 0, sss_default_amount: 0 });
   const [payrollForm, setPayrollForm] = useState<any>({ employee_id: '', pay_period_start: '', pay_period_end: '', days_worked: 0, other_deductions: [] });
-  const [attendanceForm, setAttendanceForm] = useState({ employee_id: '', date: '', time_in: '', time_out: '' });
-  const [cashAdvForm, setCashAdvForm] = useState<any>({ employee_id: '', amount: 0, payment_account_type: 'cash', notes: '' });
+  const [cashAdvForm, setCashAdvForm] = useState<any>({ employee_id: '', amount: 0, payment_account_type: 'cash', notes: '', installment_amount: 0, installment_count: 0 });
   const [groceryForm, setGroceryForm] = useState<any>({ employee_id: '', location_id: '', credit_date: '', notes: '', items: [{ product_id: '', description: '', quantity: 1, unit_price: 0, discount: 0, cost: 0 }] });
   const [sssForm, setSssForm] = useState<any>({ employee_id: '', period_start: '', period_end: '', employer_amount: 0, employee_amount: 0, notes: '' });
   const [payAccount, setPayAccount] = useState({ payment_account_type: 'cash', payment_account_id: '', payment_date: '', reference_number: '' });
@@ -82,7 +81,6 @@ export default function HrPage() {
     if (tab === 'payroll') { api.get('/hr/payroll').then((r) => setPayroll(r.data)).catch(() => {}); }
     if (tab === 'cash-advances') { api.get('/hr/cash-advances').then((r) => setCashAdvances(r.data)).catch(() => {}); }
     if (tab === 'grocery') { api.get('/hr/grocery-credits').then((r) => setGroceryCredits(r.data)).catch(() => {}); }
-    if (tab === 'attendance') { api.get('/hr/attendance').then((r) => setAttendance(r.data)).catch(() => {}); }
     if (tab === 'sss') { api.get('/hr/sss-contributions').then((r) => setSssContributions(r.data)).catch(() => {}); }
     if (tab === 'attendance-sheet') { loadSheet(); }
   }, [activeTab]);
@@ -157,7 +155,7 @@ export default function HrPage() {
   // === EMPLOYEES ===
   const openCreateEmployee = () => {
     setEditEmployee(null);
-    setEmpForm({ first_name: '', last_name: '', position: '', department: '', daily_rate: 0, monthly_rate: 0, phone: '', email: '', sss: '', philhealth: '', pagibig: '', tin: '', employment_type: 'Regular', hire_date: '', credit_limit: 0 });
+    setEmpForm({ first_name: '', last_name: '', position: '', department: '', daily_rate: 0, monthly_rate: 0, phone: '', email: '', sss: '', philhealth: '', pagibig: '', tin: '', employment_type: 'Regular', hire_date: '', credit_limit: 0, sss_default_amount: 0 });
     setShowEmployeeModal(true);
   };
   const openEditEmployee = (e: any) => { setEditEmployee(e); setEmpForm(e); setShowEmployeeModal(true); };
@@ -239,17 +237,6 @@ export default function HrPage() {
     } catch { toast.error('Failed to load details'); }
   };
 
-  // === ATTENDANCE ===
-  const openCreateAttendance = () => { setAttendanceForm({ employee_id: '', date: '', time_in: '', time_out: '' }); setShowAttendanceModal(true); };
-  const saveAttendance = async () => {
-    try {
-      await api.post('/hr/attendance', attendanceForm);
-      toast.success('Recorded');
-      setShowAttendanceModal(false);
-      api.get('/hr/attendance').then((r) => setAttendance(r.data));
-    } catch (err: any) { toast.error(err.response?.data?.error || 'Error'); }
-  };
-
   // === PAYROLL ===
   const openPayroll = () => { setPayrollForm({ employee_id: '', pay_period_start: '', pay_period_end: '', days_worked: 0, other_deductions: [] }); setShowPayrollModal(true); };
   const savePayroll = async () => {
@@ -303,7 +290,17 @@ export default function HrPage() {
   };
 
   // === SSS ===
-  const openSss = () => { setSssForm({ employee_id: '', period_start: '', period_end: '', employer_amount: 0, notes: '' }); setShowSssModal(true); };
+  const openSss = () => { setSssForm({ employee_id: '', period_start: '', period_end: '', employer_amount: 0, employee_amount: 0, notes: '' }); setShowSssModal(true); };
+  const generateSSS = async () => {
+    const today = new Date();
+    const start = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-01`;
+    const end = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${new Date(today.getFullYear(), today.getMonth() + 1, 0).getDate()}`;
+    try {
+      const res = await api.post('/hr/sss-contributions/generate', { period_start: start, period_end: end });
+      toast.success(`${res.data.created} SSS contributions generated for ${start} — ${end}`);
+      api.get('/hr/sss-contributions').then((r) => setSssContributions(r.data));
+    } catch (err: any) { toast.error(err.response?.data?.error || 'Error'); }
+  };
   const saveSss = async () => {
     try {
       await api.post('/hr/sss-contributions', sssForm);
@@ -331,7 +328,6 @@ export default function HrPage() {
     { key: 'employees', label: 'Employees', icon: UserCheck },
     { key: 'cash-advances', label: 'Cash Advances', icon: Wallet },
     { key: 'grocery', label: 'Grocery Credits', icon: ShoppingCart },
-    { key: 'attendance', label: 'Attendance', icon: Clock },
     { key: 'attendance-sheet', label: 'Attendance Sheet', icon: FileText },
     { key: 'payroll', label: 'Payroll', icon: DollarSign },
 
@@ -349,8 +345,8 @@ export default function HrPage() {
           {activeTab === 'grocery' && (
             <a href="/sales" className="flex items-center gap-2 px-4 py-2 bg-teal-600 text-white rounded-lg text-sm hover:bg-teal-700"><ShoppingCart size={16} /> Create in Sales Invoice</a>
           )}
-          {activeTab === 'attendance' && <button onClick={openCreateAttendance} className="flex items-center gap-2 px-4 py-2 bg-purple-600 text-white rounded-lg text-sm hover:bg-purple-700"><Clock size={16} /> Add Attendance</button>}
           {activeTab === 'payroll' && <button onClick={openPayroll} className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg text-sm hover:bg-green-700"><DollarSign size={16} /> Compute Payroll</button>}
+          {activeTab === 'sss' && <button onClick={generateSSS} className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700"><Shield size={16} /> Generate SSS for Month</button>}
         </div>
       </div>
 
@@ -396,13 +392,14 @@ export default function HrPage() {
       {activeTab === 'cash-advances' && (
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
           <table className="data-table">
-            <thead><tr><th>Employee</th><th>Date</th><th>Amount</th><th>Remaining</th><th>Account</th><th>Status</th><th>Actions</th></tr></thead>
+            <thead><tr><th>Employee</th><th>Date</th><th>Amount</th><th>Installment</th><th>Remaining</th><th>Account</th><th>Status</th><th>Actions</th></tr></thead>
             <tbody>
               {cashAdvances.map((ca) => (
                 <tr key={ca.id}>
                   <td className="font-medium">{employeeName(ca)}</td>
                   <td>{formatDate(ca.advance_date)}</td>
                   <td className="font-bold text-orange-700">{formatCurrency(ca.amount)}</td>
+                  <td className="text-xs">{parseFloat(ca.installment_amount) > 0 ? `${formatCurrency(ca.installment_amount)}/pay` : 'Lump sum'}</td>
                   <td>{formatCurrency(ca.remaining_balance)}</td>
                   <td className="text-xs">{ca.payment_account_type || 'cash'}</td>
                   <td><span className={statusBadge(ca.status)}>{ca.status}</span></td>
@@ -413,7 +410,7 @@ export default function HrPage() {
                   </td>
                 </tr>
               ))}
-              {cashAdvances.length === 0 && <tr><td colSpan={7} className="text-center text-gray-500 py-6">No cash advances yet</td></tr>}
+              {cashAdvances.length === 0 && <tr><td colSpan={8} className="text-center text-gray-500 py-6">No cash advances yet</td></tr>}
             </tbody>
           </table>
         </div>
@@ -439,27 +436,6 @@ export default function HrPage() {
                 </tr>
               ))}
               {groceryCredits.length === 0 && <tr><td colSpan={7} className="text-center text-gray-500 py-6">No employee grocery credits yet. Create a Sales Invoice with Customer Type = Employee.</td></tr>}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {/* ========== ATTENDANCE TAB ========== */}
-      {activeTab === 'attendance' && (
-        <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
-          <table className="data-table">
-            <thead><tr><th>Employee</th><th>Date</th><th>Time In</th><th>Time Out</th><th>Status</th></tr></thead>
-            <tbody>
-              {attendance.map((a) => (
-                <tr key={a.id}>
-                  <td className="font-medium">{a.last_name}, {a.first_name}</td>
-                  <td>{formatDate(a.date)}</td>
-                  <td>{a.time_in ? new Date(a.time_in).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '-'}</td>
-                  <td>{a.time_out ? new Date(a.time_out).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '-'}</td>
-                  <td><span className={statusBadge(a.status)}>{a.status}</span></td>
-                </tr>
-              ))}
-              {attendance.length === 0 && <tr><td colSpan={5} className="text-center text-gray-500 py-6">No attendance records yet</td></tr>}
             </tbody>
           </table>
         </div>
@@ -552,6 +528,8 @@ export default function HrPage() {
                   </select></div>
                 <div><label className="block text-sm font-medium mb-1">Hire Date</label><input type="date" value={empForm.hire_date || ''} onChange={(e) => setEmpForm({ ...empForm, hire_date: e.target.value })} className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" /></div>
                 <div><label className="block text-sm font-medium mb-1">Credit Limit</label><input type="number" step="0.01" value={empForm.credit_limit} onChange={(e) => setEmpForm({ ...empForm, credit_limit: parseFloat(e.target.value) || 0 })} className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" /></div>
+                <div><label className="block text-sm font-medium mb-1">Default SSS Monthly</label><input type="number" step="0.01" value={empForm.sss_default_amount} onChange={(e) => setEmpForm({ ...empForm, sss_default_amount: parseFloat(e.target.value) || 0 })} placeholder="e.g. 780" className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" /></div>
+                <p className="text-[10px] text-gray-400">Set the monthly SSS amount if the company shoulders both shares. Leave 0 if the employee does not have SSS.</p>
               </div>
               <div className="flex justify-end gap-3 mt-6">
                 <button onClick={() => setShowEmployeeModal(false)} className="px-4 py-2 border rounded-lg text-sm">Cancel</button>
@@ -575,6 +553,11 @@ export default function HrPage() {
                     {employees.map((e) => <option key={e.id} value={e.id}>{employeeName(e)}</option>)}
                   </select></div>
                 <div><label className="block text-sm font-medium mb-1">Amount *</label><input type="number" value={cashAdvForm.amount} onChange={(e) => setCashAdvForm({ ...cashAdvForm, amount: parseFloat(e.target.value) || 0 })} className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" /></div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div><label className="block text-sm font-medium mb-1">Installment / Payroll</label><input type="number" value={cashAdvForm.installment_amount} onChange={(e) => setCashAdvForm({ ...cashAdvForm, installment_amount: parseFloat(e.target.value) || 0 })} placeholder="e.g. 1000" className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" /></div>
+                  <div><label className="block text-sm font-medium mb-1">No. of Installments</label><input type="number" value={cashAdvForm.installment_count} onChange={(e) => setCashAdvForm({ ...cashAdvForm, installment_count: parseInt(e.target.value) || 0 })} placeholder="e.g. 4" className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" /></div>
+                </div>
+                <p className="text-[10px] text-gray-400 -mt-1">Leave at 0 to deduct full balance in one payroll. Set installment amount to deduct a fixed amount per pay period.</p>
                 <div><label className="block text-sm font-medium mb-1">Payment Account</label>
                   <select value={cashAdvForm.payment_account_type} onChange={(e) => setCashAdvForm({ ...cashAdvForm, payment_account_type: e.target.value })} className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
                     <option value="cash">Cash on Hand</option><option value="bank">Bank</option>
@@ -627,31 +610,6 @@ export default function HrPage() {
               <div className="flex justify-end gap-3 mt-6">
                 <button onClick={() => setShowGroceryModal(false)} className="px-4 py-2 border rounded-lg text-sm">Cancel</button>
                 <button onClick={saveGrocery} className="px-4 py-2 bg-teal-600 text-white rounded-lg text-sm hover:bg-teal-700">Save</button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Attendance Modal */}
-      {showAttendanceModal && (
-        <div className="modal-overlay" onClick={() => setShowAttendanceModal(false)}>
-          <div className="modal-content max-w-sm" onClick={(e) => e.stopPropagation()}>
-            <div className="p-6">
-              <h2 className="text-lg font-semibold mb-4">Record Attendance</h2>
-              <div className="space-y-3">
-                <div><label className="block text-sm font-medium mb-1">Employee *</label>
-                  <select value={attendanceForm.employee_id} onChange={(e) => setAttendanceForm({ ...attendanceForm, employee_id: e.target.value })} className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
-                    <option value="">Select</option>
-                    {employees.map((e) => <option key={e.id} value={e.id}>{employeeName(e)}</option>)}
-                  </select></div>
-                <div><label className="block text-sm font-medium mb-1">Date *</label><input type="date" value={attendanceForm.date} onChange={(e) => setAttendanceForm({ ...attendanceForm, date: e.target.value })} className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" /></div>
-                <div><label className="block text-sm font-medium mb-1">Time In *</label><input type="time" value={attendanceForm.time_in} onChange={(e) => setAttendanceForm({ ...attendanceForm, time_in: e.target.value })} className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" /></div>
-                <div><label className="block text-sm font-medium mb-1">Time Out</label><input type="time" value={attendanceForm.time_out} onChange={(e) => setAttendanceForm({ ...attendanceForm, time_out: e.target.value })} className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" /></div>
-              </div>
-              <div className="flex justify-end gap-3 mt-6">
-                <button onClick={() => setShowAttendanceModal(false)} className="px-4 py-2 border rounded-lg text-sm">Cancel</button>
-                <button onClick={saveAttendance} className="px-4 py-2 bg-purple-600 text-white rounded-lg text-sm hover:bg-purple-700">Save</button>
               </div>
             </div>
           </div>

@@ -1171,6 +1171,7 @@ const migrate = async () => {
     await client.query(`ALTER TABLE collection_receipts ADD COLUMN IF NOT EXISTS bank_account_id INTEGER REFERENCES bank_accounts(id)`);
     await client.query(`ALTER TABLE collection_receipts ADD COLUMN IF NOT EXISTS check_date DATE`);
     await client.query(`ALTER TABLE collection_receipts ADD COLUMN IF NOT EXISTS check_bank VARCHAR(100)`);
+    await client.query(`ALTER TABLE collection_receipts ADD COLUMN IF NOT EXISTS deposited BOOLEAN DEFAULT false`);
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS collection_receipt_allocations (
@@ -1196,6 +1197,9 @@ const migrate = async () => {
     await client.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS cash_advance_balance DECIMAL(15,2) DEFAULT 0`);
     await client.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS grocery_credit_balance DECIMAL(15,2) DEFAULT 0`);
     await client.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS credit_limit DECIMAL(15,2) DEFAULT 0`);
+    await client.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS sss_default_amount DECIMAL(15,2) DEFAULT 0`);
+    await client.query(`ALTER TABLE roles ADD COLUMN IF NOT EXISTS approval_limit DECIMAL(15,2) DEFAULT 0`);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS location_id INTEGER REFERENCES locations(id)`);
     await client.query(`ALTER TABLE payroll ADD COLUMN IF NOT EXISTS cash_advance_deduction DECIMAL(15,2) DEFAULT 0`);
     await client.query(`ALTER TABLE payroll ADD COLUMN IF NOT EXISTS grocery_credit_deduction DECIMAL(15,2) DEFAULT 0`);
     await client.query(`ALTER TABLE payroll ADD COLUMN IF NOT EXISTS other_deductions DECIMAL(15,2) DEFAULT 0`);
@@ -1204,6 +1208,8 @@ const migrate = async () => {
     await client.query(`ALTER TABLE payroll ADD COLUMN IF NOT EXISTS payment_ref VARCHAR(100)`);
     await client.query(`ALTER TABLE cash_advances ADD COLUMN IF NOT EXISTS payment_account_type VARCHAR(50)`);
     await client.query(`ALTER TABLE cash_advances ADD COLUMN IF NOT EXISTS payment_account_id INTEGER`);
+    await client.query(`ALTER TABLE cash_advances ADD COLUMN IF NOT EXISTS installment_amount DECIMAL(15,2) DEFAULT 0`);
+    await client.query(`ALTER TABLE cash_advances ADD COLUMN IF NOT EXISTS installment_count INTEGER DEFAULT 0`);
     await client.query(`ALTER TABLE sales_invoices ADD COLUMN IF NOT EXISTS customer_type VARCHAR(50) DEFAULT 'Customer'`);
     await client.query(`ALTER TABLE sales_invoices ADD COLUMN IF NOT EXISTS employee_id INTEGER REFERENCES employees(id)`);
     await client.query(`ALTER TABLE sales_invoices ADD COLUMN IF NOT EXISTS payment_method VARCHAR(50)`);
@@ -1263,6 +1269,25 @@ const migrate = async () => {
       "INSERT INTO chart_of_accounts (account_code, account_name, account_type) VALUES ('1015','Checks on Hand / Undeposited','Asset') ON CONFLICT (account_code) DO NOTHING"
     );
     await client.query(
+      "INSERT INTO chart_of_accounts (account_code, account_name, account_type) VALUES ('1016','Petty Cash Fund','Asset') ON CONFLICT (account_code) DO NOTHING"
+    );
+    // Petty cash expense categories
+    const pcvCategories: [string, string][] = [
+      ['6083','Meals & Snacks Expense'], ['6084','Janitorial & Cleaning Expense'],
+      ['6086','Representation Expense'], ['6088','Postage & Courier Expense'],
+    ];
+    for (const [code, name] of pcvCategories) {
+      await client.query(
+        "INSERT INTO chart_of_accounts (account_code, account_name, account_type) VALUES ($1,$2,'Expense') ON CONFLICT (account_code) DO NOTHING",
+        [code, name]
+      );
+    }
+    await client.query(
+      `INSERT INTO bank_accounts (bank_name, account_name, account_number, account_type, gl_account_code, balance, is_active)
+       VALUES ('Checks on Hand', 'Undeposited Checks', 'N/A', 'Checks on Hand', '1015', 0, true)
+       ON CONFLICT DO NOTHING`
+    );
+    await client.query(
       "INSERT INTO chart_of_accounts (account_code, account_name, account_type) VALUES ('1106','Input VAT','Asset') ON CONFLICT (account_code) DO NOTHING"
     );
 
@@ -1304,6 +1329,40 @@ const migrate = async () => {
       INSERT INTO system_settings (setting_key, setting_value)
       VALUES ('auto_update_cost_from_rr', 'false')
       ON CONFLICT (setting_key) DO NOTHING
+    `);
+
+    // ==================== PETTY CASH VOUCHERS ====================
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS petty_cash_vouchers (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        pcv_number VARCHAR(50) UNIQUE NOT NULL,
+        voucher_date DATE NOT NULL DEFAULT CURRENT_DATE,
+        payee VARCHAR(255) NOT NULL,
+        amount DECIMAL(15,2) NOT NULL,
+        category VARCHAR(100),
+        description TEXT,
+        status VARCHAR(50) DEFAULT 'Unreplenished' CHECK (status IN ('Unreplenished', 'Replenished', 'Cancelled')),
+        replenished_at TIMESTAMP,
+        replenished_by UUID REFERENCES users(id),
+        created_by UUID REFERENCES users(id),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await client.query(
+      `INSERT INTO bank_accounts (bank_name, account_name, account_number, account_type, gl_account_code, balance, is_active)
+       VALUES ('Petty Cash Fund', 'Office Petty Cash', 'PCF-001', 'Petty Cash Fund', '1016', 0, true)
+       ON CONFLICT DO NOTHING`
+    );
+
+    // ==================== USER PERMISSIONS ====================
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS user_permissions (
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        permission_key VARCHAR(100) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, permission_key)
+      )
     `);
 
     await client.query('COMMIT');

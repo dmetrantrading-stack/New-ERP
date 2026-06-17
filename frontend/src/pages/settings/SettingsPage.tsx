@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import api from '../../lib/api';
-import { Trash2, AlertTriangle, Save, Search, Wifi, WifiOff, Upload } from 'lucide-react';
+import { Trash2, AlertTriangle, Save, Search, Wifi, WifiOff, Upload, Shield } from 'lucide-react';
 import toast from 'react-hot-toast';
 
 export default function SettingsPage() {
@@ -13,6 +14,9 @@ export default function SettingsPage() {
   const [comPorts, setComPorts] = useState<any[]>([]);
   const [printerStatus, setPrinterStatus] = useState<string>('');
   const [logoUploading, setLogoUploading] = useState(false);
+  const [activeTab, setActiveTab] = useState<'business' | 'users'>('business');
+  const [users, setUsers] = useState<any[]>([]);
+  const navigate = useNavigate();
 
   const [biz, setBiz] = useState<any>({
     business_name: '', trade_name: '', address: '', barangay: '', city: '', province: '', zip_code: '',
@@ -25,6 +29,10 @@ export default function SettingsPage() {
   useEffect(() => {
     api.get('/settings/business-details').then(r => { if (r.data) { setBiz(r.data); if (r.data.printer_port) scanPorts(); } }).catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (activeTab === 'users') api.get('/users').then(r => setUsers(r.data?.value || r.data || [])).catch(() => {});
+  }, [activeTab]);
 
   const scanPorts = async () => {
     setScanningPorts(true);
@@ -103,7 +111,12 @@ export default function SettingsPage() {
     <div className="space-y-6">
       <h1 className="text-2xl font-bold text-gray-900">Settings</h1>
 
-      {/* Business Details */}
+      <div className="flex gap-2">
+        <button onClick={() => setActiveTab('business')} className={`px-4 py-2 text-sm font-medium rounded-lg ${activeTab === 'business' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600'}`}>Business Details</button>
+        <button onClick={() => setActiveTab('users')} className={`px-4 py-2 text-sm font-medium rounded-lg ${activeTab === 'users' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600'}`}>Users &amp; Permissions</button>
+      </div>
+
+      {activeTab === 'business' && (<>
       <div className="bg-white rounded-lg border border-gray-200 p-6">
         <h2 className="text-lg font-semibold text-gray-900 mb-4">Basic Business Details</h2>
         <div className="space-y-6">
@@ -338,7 +351,29 @@ export default function SettingsPage() {
             </div>
           )}
         </div>
-      </div>
+        </div>
+      </>)}
+      {activeTab === 'users' && (
+        <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+          <table className="data-table">
+            <thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Status</th><th>Last Login</th><th>Actions</th></tr></thead>
+            <tbody>
+              {users.map(u => (
+                <tr key={u.id}>
+                  <td className="font-medium">{u.full_name}</td>
+                  <td className="font-mono text-xs">{u.username}</td>
+                  <td><span className="px-2 py-0.5 text-xs rounded bg-blue-100 text-blue-700">{u.role_name}</span></td>
+                  <td><span className={`px-2 py-1 text-xs rounded-full ${u.is_active ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{u.is_active ? 'Active' : 'Inactive'}</span></td>
+                  <td className="text-xs text-gray-500">{u.last_login ? new Date(u.last_login).toLocaleString() : 'Never'}</td>
+                  <td>
+                    <button onClick={() => navigate(`/settings/permissions/${u.id}`)} className="flex items-center gap-1 px-2 py-1 text-xs bg-blue-100 text-blue-700 rounded hover:bg-blue-200"><Shield size={12} /> Permissions</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }

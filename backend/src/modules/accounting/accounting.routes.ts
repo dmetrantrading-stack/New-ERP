@@ -29,8 +29,32 @@ router.post('/chart-of-accounts', authenticate, auditLog('Accounting', 'Create A
     );
     res.status(201).json(result.rows[0]);
   } catch (error: any) {
+    if (error.code === '23505') return res.status(409).json({ error: 'Account code already exists' });
     res.status(500).json({ error: error.message });
   }
+});
+
+router.put('/chart-of-accounts/:id', authenticate, auditLog('Accounting', 'Edit Account'), async (req: AuthRequest, res: Response) => {
+  try {
+    const { account_code, account_name, account_type, parent_id, is_active } = req.body;
+    if (!account_code || !account_name || !account_type) {
+      return res.status(400).json({ error: 'Account code, name, and type are required' });
+    }
+    // Check uniqueness (exclude self)
+    const dup = await query('SELECT id FROM chart_of_accounts WHERE account_code = $1 AND id != $2', [account_code, req.params.id]);
+    if (dup.rows.length > 0) return res.status(409).json({ error: 'Account code already exists' });
+
+    const result = await query(
+      `UPDATE chart_of_accounts SET account_code = $1, account_name = $2, account_type = $3,
+        parent_id = $4, is_active = COALESCE($5, is_active), updated_at = CURRENT_TIMESTAMP
+       WHERE id = $6 RETURNING *`,
+      [account_code, account_name, account_type, parent_id || null, is_active !== undefined ? is_active : null, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Account not found' });
+    res.json(result.rows[0]);
+  } catch (error: any) {
+    if (error.code === '23505') return res.status(409).json({ error: 'Account code already exists' });
+    res.status(500).json({ error: error.message }); }
 });
 
 // ==================== JOURNAL ENTRIES ====================
@@ -213,15 +237,15 @@ router.get('/income-statement', authenticate, async (req: AuthRequest, res: Resp
 
     const result = await query(`
       SELECT coa.account_type, coa.account_code, coa.account_name,
-             COALESCE(SUM(CASE WHEN coa.account_type IN ('Income')
-               THEN jel.credit - jel.debit
-               ELSE jel.debit - jel.credit END), 0) as balance
+             COALESCE((SELECT SUM(CASE WHEN coa.account_type IN ('Income')
+                        THEN jel.credit - jel.debit
+                        ELSE jel.debit - jel.credit END)
+                       FROM journal_entry_lines jel
+                       JOIN journal_entries je ON jel.entry_id = je.id AND je.status = 'Posted'
+                         AND je.entry_date >= $1 AND je.entry_date <= $2
+                       WHERE jel.account_id = coa.id), 0) as balance
        FROM chart_of_accounts coa
-       LEFT JOIN journal_entry_lines jel ON coa.id = jel.account_id
-       LEFT JOIN journal_entries je ON jel.entry_id = je.id AND je.status = 'Posted'
-         AND je.entry_date >= $1 AND je.entry_date <= $2
        WHERE coa.account_type IN ('Income', 'Expense', 'Cost of Goods Sold')
-       GROUP BY coa.id, coa.account_type, coa.account_code, coa.account_name
        ORDER BY coa.account_type, coa.account_code
      `, [from, to]);
 

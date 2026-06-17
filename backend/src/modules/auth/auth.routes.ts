@@ -20,7 +20,7 @@ router.post('/login', validate(loginSchema), async (req: Request, res: Response)
     const { username, password } = req.body;
 
     const result = await query(
-      `SELECT u.*, r.name as role_name, r.permissions
+      `SELECT u.*, r.name as role_name
        FROM users u JOIN roles r ON u.role_id = r.id
        WHERE u.username = $1 AND u.is_active = true`,
       [username]
@@ -36,6 +36,8 @@ router.post('/login', validate(loginSchema), async (req: Request, res: Response)
     if (!validPassword) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
+
+    const userPerms = await query('SELECT permission_key FROM user_permissions WHERE user_id = $1', [user.id]);
 
     const token = jwt.sign(
       { userId: user.id, username: user.username, role: user.role_name },
@@ -60,7 +62,7 @@ router.post('/login', validate(loginSchema), async (req: Request, res: Response)
         email: user.email,
         role_id: user.role_id,
         role_name: user.role_name,
-        permissions: user.permissions,
+        permissions: userPerms.rows.map((r: any) => r.permission_key),
       },
     });
   } catch (error: any) {
