@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
+import { userHasPermission, userHasAnyPermission } from '../utils/permissions';
 import { config } from '../config';
 import { query } from '../config/database';
 
@@ -47,7 +48,16 @@ export const hasUserPerm = (permission: string) => {
   return (req: AuthRequest, res: Response, next: NextFunction) => {
     if (!req.user) return res.status(401).json({ error: 'Authentication required' });
     const isAdmin = req.user.role_name === 'Admin' || req.user.role_name === 'Owner';
-    if (isAdmin || (req.user.permissions || []).includes(permission)) return next();
+    if (userHasPermission(req.user.permissions, permission, isAdmin)) return next();
     return res.status(403).json({ error: `Permission denied: ${permission}` });
+  };
+};
+
+export const hasUserAnyPerm = (permissions: string[]) => {
+  return (req: AuthRequest, res: Response, next: NextFunction) => {
+    if (!req.user) return res.status(401).json({ error: 'Authentication required' });
+    const isAdmin = req.user.role_name === 'Admin' || req.user.role_name === 'Owner';
+    if (userHasAnyPermission(req.user.permissions, permissions, isAdmin)) return next();
+    return res.status(403).json({ error: 'Permission denied' });
   };
 };

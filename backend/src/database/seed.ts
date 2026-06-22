@@ -55,11 +55,21 @@ const seed = async () => {
       { code: '3020', name: 'Retained Earnings', type: 'Equity' },
       // Income
       { code: '4000', name: 'Sales Revenue', type: 'Income' },
+      { code: '4010', name: 'Sales - Fish', type: 'Income' },
+      { code: '4011', name: 'Sales - Vegetable', type: 'Income' },
+      { code: '4012', name: 'Sales - Pork Meat', type: 'Income' },
+      { code: '4013', name: 'Sales - Beef Meat', type: 'Income' },
+      { code: '4014', name: 'Sales - Frozen Foods', type: 'Income' },
       { code: '4100', name: 'Service Income', type: 'Income' },
       { code: '4200', name: 'Other Income', type: 'Income' },
       { code: '4500', name: 'Employee Sales', type: 'Income' },
       // Cost of Goods Sold
       { code: '5000', name: 'Cost of Sales', type: 'Cost of Goods Sold' },
+      { code: '5110', name: 'Cost of Sales - Fish', type: 'Cost of Goods Sold' },
+      { code: '5111', name: 'Cost of Sales - Vegetable', type: 'Cost of Goods Sold' },
+      { code: '5112', name: 'Cost of Sales - Pork Meat', type: 'Cost of Goods Sold' },
+      { code: '5113', name: 'Cost of Sales - Beef Meat', type: 'Cost of Goods Sold' },
+      { code: '5114', name: 'Cost of Sales - Frozen Foods', type: 'Cost of Goods Sold' },
       { code: '5010', name: 'Purchase Discounts', type: 'Cost of Goods Sold' },
       { code: '5020', name: 'Inventory Adjustments', type: 'Cost of Goods Sold' },
       // Expenses
@@ -73,6 +83,19 @@ const seed = async () => {
       { code: '6070', name: 'Repairs and Maintenance', type: 'Expense' },
       { code: '6080', name: 'Miscellaneous Expense', type: 'Expense' },
       { code: '6090', name: 'SSS Employer Expense', type: 'Expense' },
+      { code: '6110', name: 'Christmas Bonus', type: 'Expense' },
+      { code: '6111', name: 'Purchaser Commissions', type: 'Expense' },
+      { code: '6112', name: 'Store/Office Equipment', type: 'Expense' },
+      { code: '6113', name: 'Subscription Expense', type: 'Expense' },
+      { code: '6114', name: 'Tax, Permits & Licenses', type: 'Expense' },
+      { code: '6115', name: 'Advertising and Marketing Expense', type: 'Expense' },
+      { code: '6116', name: 'Bank Charges', type: 'Expense' },
+      { code: '6117', name: 'Donations', type: 'Expense' },
+      { code: '6118', name: 'General and Administrative Expense', type: 'Expense' },
+      { code: '6119', name: 'Internet Fee', type: 'Expense' },
+      { code: '6120', name: 'Legal Fees', type: 'Expense' },
+      { code: '6121', name: 'Motor Vehicle Expense', type: 'Expense' },
+      { code: '6122', name: 'Food Allowance Expense', type: 'Expense' },
     ];
     for (const acc of accounts) {
       await client.query(
@@ -83,7 +106,25 @@ const seed = async () => {
 
     // Seed Expense Categories
     const expenseCategories: [string, string][] = [
-      ['Salaries', '6000'], ['Utilities', '6040'], ['Repairs', '6070'], ['Miscellaneous', '6080'],
+      ['Salaries', '6000'],
+      ['Utilities', '6040'],
+      ['Repairs', '6070'],
+      ['Miscellaneous', '6080'],
+      ['Christmas Bonus', '6110'],
+      ['Purchaser Commissions', '6111'],
+      ['Store/Office Equipment', '6112'],
+      ['Subscription Expense', '6113'],
+      ['Tax, Permits & Licenses', '6114'],
+      ['Advertising and Marketing Expense', '6115'],
+      ['Bank Charges', '6116'],
+      ['Donations', '6117'],
+      ['General and Administrative Expense', '6118'],
+      ['Internet Fee', '6119'],
+      ['Legal Fees', '6120'],
+      ['Motor Vehicle Expense', '6121'],
+      ['Food Allowance Expense', '6122'],
+      ['Fuel Expense', '6010'],
+      ['Pantry Supply Expense', '6030'],
     ];
     for (const [name, accountCode] of expenseCategories) {
       const exists = await client.query('SELECT id FROM expense_categories WHERE name = $1', [name]);
@@ -111,6 +152,7 @@ const seed = async () => {
       { key: 'receipt_footer', value: 'Thank you for your patronage!' },
       { key: 'pos_default_mode', value: 'Retail' },
       { key: 'enable_negative_inventory', value: 'false' },
+      { key: 'invoice_copy_mode', value: 'delivered' },
     ];
     for (const s of settings) {
       await client.query(

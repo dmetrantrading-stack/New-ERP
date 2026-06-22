@@ -1,6 +1,6 @@
 import { Router, Response } from 'express';
 import { query } from '../../config/database';
-import { authenticate, AuthRequest } from '../../middleware/auth';
+import { authenticate, AuthRequest, hasUserPerm } from '../../middleware/auth';
 import { AppError } from '../../middleware/errorHandler';
 import { auditLog } from '../../middleware/audit';
 
@@ -24,7 +24,7 @@ router.get('/all', authenticate, async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.post('/', authenticate, auditLog('Brands', 'Create'), async (req: AuthRequest, res: Response) => {
+router.post('/', authenticate, hasUserPerm('inventory.inventory.edit'), auditLog('Brands', 'Create'), async (req: AuthRequest, res: Response) => {
   try {
     const { name, description } = req.body;
     if (!name) return res.status(400).json({ error: 'Brand name is required' });
@@ -39,7 +39,7 @@ router.post('/', authenticate, auditLog('Brands', 'Create'), async (req: AuthReq
   }
 });
 
-router.put('/:id', authenticate, auditLog('Brands', 'Update'), async (req: AuthRequest, res: Response) => {
+router.put('/:id', authenticate, hasUserPerm('inventory.inventory.edit'), auditLog('Brands', 'Update'), async (req: AuthRequest, res: Response) => {
   try {
     const { name, description, is_active } = req.body;
     if (name) {
@@ -57,7 +57,7 @@ router.put('/:id', authenticate, auditLog('Brands', 'Update'), async (req: AuthR
   }
 });
 
-router.delete('/:id', authenticate, auditLog('Brands', 'Delete'), async (req: AuthRequest, res: Response) => {
+router.delete('/:id', authenticate, hasUserPerm('inventory.inventory.edit'), auditLog('Brands', 'Delete'), async (req: AuthRequest, res: Response) => {
   try {
     const { id } = req.params;
 

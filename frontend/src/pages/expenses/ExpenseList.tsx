@@ -1,9 +1,26 @@
 import React, { useState, useEffect } from 'react';
+import ModalOverlay from '../../components/ModalOverlay';
 import api from '../../lib/api';
-import { formatCurrency } from '../../lib/utils';
-import { Plus, Trash2, Edit2 } from 'lucide-react';
+import { formatCurrency, formatDate, formatDateTime, parseNumericField } from '../../lib/utils';
+import NumericInput from '../../components/NumericInput';
+import { Plus, Trash2, Edit2, Receipt } from 'lucide-react';
 import Pagination from '../../components/Pagination';
 import toast from 'react-hot-toast';
+import {
+  FinancePageShell,
+  FinanceModuleHeader,
+  FinanceHeaderBadge,
+  FinanceKpiCard,
+  FinanceSearchToolbar,
+  FinanceDataCard,
+  FinanceTableWrap,
+  financeTableHeadClass,
+  FinanceStatusBadge,
+  FinanceSidebar,
+  FinanceSidebarStat,
+  FinanceQuickLinks,
+  FinancePrimaryButton,
+} from '../../components/finance/FinanceModuleLayout';
 
 export default function ExpenseList() {
   const [expenses, setExpenses] = useState<any[]>([]);
@@ -11,11 +28,12 @@ export default function ExpenseList() {
   const [showModal, setShowModal] = useState(false);
   const [showEditModal, setShowEditModal] = useState(false);
   const [editForm, setEditForm] = useState<any>(null);
-  const [form, setForm] = useState({ category_id: '', description: '', amount: 0, expense_date: new Date().toISOString().split('T')[0], payment_method: 'Cash', reference_number: '', notes: '' });
+  const [form, setForm] = useState({ category_id: '', description: '', amount: '', expense_date: new Date().toISOString().split('T')[0], payment_method: 'Cash', reference_number: '', notes: '' });
   const [page, setPage] = useState(1);
   const [total, setTotal] = useState(0);
   const [showCatModal, setShowCatModal] = useState(false);
   const [catForm, setCatForm] = useState({ name: '', account_code: '' });
+  const [search, setSearch] = useState('');
   const limit = 20;
 
   const loadExpenses = () => {
@@ -33,21 +51,21 @@ export default function ExpenseList() {
 
   const handleSave = async () => {
     if (!form.category_id) { toast.error('Please select a category'); return; }
-    if (!form.amount || parseFloat(String(form.amount)) <= 0) { toast.error('Amount must be greater than 0'); return; }
+    if (!form.amount || parseNumericField(form.amount) <= 0) { toast.error('Amount must be greater than 0'); return; }
     try {
-      await api.post('/expenses', form);
+      await api.post('/expenses', { ...form, amount: parseNumericField(form.amount) });
       toast.success('Expense recorded');
       setShowModal(false);
-      setForm({ category_id: '', description: '', amount: 0, expense_date: new Date().toISOString().split('T')[0], payment_method: 'Cash', reference_number: '', notes: '' });
+      setForm({ category_id: '', description: '', amount: '', expense_date: new Date().toISOString().split('T')[0], payment_method: 'Cash', reference_number: '', notes: '' });
       loadExpenses();
     } catch (err: any) { toast.error(err.response?.data?.error || 'Error'); }
   };
 
   const openEdit = (e: any) => { setEditForm({ ...e }); setShowEditModal(true); };
   const saveEdit = async () => {
-    if (!editForm?.amount || parseFloat(String(editForm.amount)) <= 0) { toast.error('Amount must be greater than 0'); return; }
+    if (!editForm?.amount || parseNumericField(editForm.amount) <= 0) { toast.error('Amount must be greater than 0'); return; }
     try {
-      await api.put(`/expenses/${editForm.id}`, editForm);
+      await api.put(`/expenses/${editForm.id}`, { ...editForm, amount: parseNumericField(editForm.amount) });
       toast.success('Expense updated');
       setShowEditModal(false);
       setEditForm(null);
@@ -66,40 +84,93 @@ export default function ExpenseList() {
     } catch (err: any) { toast.error(err.response?.data?.error || 'Error'); }
   };
 
-  return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold text-gray-900">Expenses</h1>
-        <button onClick={() => setShowModal(true)} className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700"><Plus size={16} /> Add Expense</button>
-      </div>
+  const filtered = expenses.filter((e) => {
+    if (!search.trim()) return true;
+    const q = search.toLowerCase();
+    return e.expense_number?.toLowerCase().includes(q) || e.category_name?.toLowerCase().includes(q) || e.description?.toLowerCase().includes(q);
+  });
+  const pageTotal = filtered.reduce((s, e) => s + parseFloat(e.amount || 0), 0);
+  const postedCount = expenses.filter((e) => e.status === 'Posted').length;
 
-      <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
-        <table className="data-table">
-          <thead><tr><th>Ref #</th><th>Category</th><th>Description</th><th>Amount</th><th>Date</th><th>Payment</th><th>Status</th><th>Actions</th></tr></thead>
-          <tbody>
-            {expenses.map((e: any) => (
-              <tr key={e.id}>
-                <td className="font-mono text-xs">{e.expense_number}</td>
-                <td><span className="px-2 py-0.5 text-xs rounded bg-gray-100">{e.category_name}</span></td>
-                <td>{e.description}</td>
-                <td className="font-medium text-red-600">{formatCurrency(e.amount)}</td>
-                <td className="text-xs">{new Date(e.expense_date).toLocaleDateString()}</td>
-                <td>{e.payment_method}</td>
-                <td><span className={`px-2 py-1 text-xs rounded-full ${e.status === 'Posted' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{e.status}</span></td>
-                  <td>
-                    <button onClick={() => openEdit(e)} className="p-1.5 hover:bg-blue-50 rounded text-blue-600"><Edit2 size={15} /></button>
-                    <button onClick={() => handleDelete(e.id)} className="p-1.5 hover:bg-red-50 rounded text-red-600"><Trash2 size={15} /></button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        <Pagination page={page} totalPages={Math.ceil(total / limit)} total={total} onPageChange={setPage} />
+  return (
+    <FinancePageShell>
+      <FinanceModuleHeader
+        icon={Receipt}
+        title="Expenses"
+        badges={<FinanceHeaderBadge>{total} records</FinanceHeaderBadge>}
+        actions={<FinancePrimaryButton onClick={() => setShowModal(true)}><Plus size={14} /> Add expense</FinancePrimaryButton>}
+      />
+
+      <div className="flex-1 flex min-h-0">
+        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+            <FinanceKpiCard label="Total records" value={total} hint="All expense entries" />
+            <FinanceKpiCard label="Posted (page)" value={postedCount} tone="green" />
+            <FinanceKpiCard label="Page total" value={formatCurrency(pageTotal)} tone="red" hint="Current page only" />
+            <FinanceKpiCard label="Categories" value={categories.length} tone="blue" />
+          </div>
+
+          <FinanceSearchToolbar search={search} onSearchChange={setSearch} placeholder="Ref #, category, description…" />
+
+          <FinanceDataCard title="Expense register" subtitle="Operating expenses with automatic journal posting">
+            <FinanceTableWrap>
+            <table className="w-full text-sm">
+              <thead>
+                <tr className={financeTableHeadClass}>
+                  <th className="py-2.5 px-4 text-left">Ref #</th>
+                  <th className="py-2.5 px-4 text-left">Category</th>
+                  <th className="py-2.5 px-4 text-left">Description</th>
+                  <th className="py-2.5 px-4 text-right">Amount</th>
+                  <th className="py-2.5 px-4 text-left">Expense Date</th>
+                  <th className="py-2.5 px-4 text-left">Recorded</th>
+                  <th className="py-2.5 px-4 text-left">Payment</th>
+                  <th className="py-2.5 px-4 text-center">Status</th>
+                  <th className="py-2.5 px-4 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {filtered.length === 0 && (
+                  <tr><td colSpan={9} className="px-4 py-12 text-center text-slate-400 italic">No expenses match your search</td></tr>
+                )}
+                {filtered.map((e: any) => (
+                  <tr key={e.id} className="hover:bg-blue-50/40 transition-colors">
+                    <td className="px-4 py-2.5 font-mono text-[11px] font-semibold text-blue-700">{e.expense_number}</td>
+                    <td className="px-4 py-2.5"><span className="px-2 py-0.5 text-[10px] rounded-full bg-slate-100 text-slate-700 ring-1 ring-slate-200">{e.category_name}</span></td>
+                    <td className="px-4 py-2.5 text-slate-700">{e.description || '—'}</td>
+                    <td className="px-4 py-2.5 text-right font-semibold tabular-nums text-red-700">{formatCurrency(e.amount)}</td>
+                    <td className="px-4 py-2.5 text-xs text-slate-600">{formatDate(e.expense_date)}</td>
+                    <td className="px-4 py-2.5 text-xs text-slate-500 tabular-nums whitespace-nowrap">{e.created_at ? formatDateTime(e.created_at) : '—'}</td>
+                    <td className="px-4 py-2.5 text-xs text-slate-600">{e.payment_method}</td>
+                    <td className="px-4 py-2.5 text-center"><FinanceStatusBadge status={e.status} /></td>
+                    <td className="px-4 py-2.5 text-right">
+                      <button onClick={() => openEdit(e)} className="p-1.5 hover:bg-blue-50 rounded-lg text-blue-600" title="Edit"><Edit2 size={14} /></button>
+                      <button onClick={() => handleDelete(e.id)} className="p-1.5 hover:bg-red-50 rounded-lg text-red-600" title="Cancel"><Trash2 size={14} /></button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            </FinanceTableWrap>
+            <div className="px-4 py-3 border-t border-slate-100">
+              <Pagination page={page} totalPages={Math.ceil(total / limit)} total={total} onPageChange={setPage} />
+            </div>
+          </FinanceDataCard>
+        </div>
+
+        <FinanceSidebar>
+          <FinanceSidebarStat label="Page total" value={formatCurrency(pageTotal)} hint={`${postedCount} posted on this page`} />
+          <FinanceQuickLinks links={[
+            { to: '/accounting', label: 'Accounting →' },
+            { to: '/petty-cash', label: 'Petty Cash →' },
+            { to: '/bank-cash', label: 'Bank & Cash →' },
+          ]} />
+          <p className="text-[11px] text-slate-500 leading-relaxed">Expenses post journal entries automatically when saved. Cancelled expenses reverse the entry.</p>
+        </FinanceSidebar>
       </div>
 
       {showModal && (
-        <div className="modal-overlay" onClick={() => setShowModal(false)}>
-          <div className="modal-content max-w-md" onClick={(e) => e.stopPropagation()}>
+        <ModalOverlay onClose={() => setShowModal(false)}>
+          <div className="modal-content max-w-md">
             <div className="p-6">
               <h2 className="text-lg font-semibold mb-4">Add Expense</h2>
               <div className="grid grid-cols-2 gap-3">
@@ -116,7 +187,7 @@ export default function ExpenseList() {
                   <input type="text" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })}
                     className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" /></div>
                 <div><label className="block text-sm font-medium mb-1">Amount</label>
-                  <input type="number" step="0.01" value={form.amount} onChange={(e) => setForm({ ...form, amount: parseFloat(e.target.value) || 0 })}
+                  <NumericInput step="0.01" value={form.amount} onValueChange={(amount) => setForm({ ...form, amount })}
                     className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" /></div>
                 <div><label className="block text-sm font-medium mb-1">Date</label>
                   <input type="date" value={form.expense_date} onChange={(e) => setForm({ ...form, expense_date: e.target.value })}
@@ -140,13 +211,13 @@ export default function ExpenseList() {
               </div>
             </div>
           </div>
-        </div>
+        </ModalOverlay>
       )}
 
       {/* Edit Expense Modal */}
       {showEditModal && editForm && (
-        <div className="modal-overlay" onClick={() => setShowEditModal(false)}>
-          <div className="modal-content max-w-md" onClick={(e) => e.stopPropagation()}>
+        <ModalOverlay onClose={() => setShowEditModal(false)}>
+          <div className="modal-content max-w-md">
             <div className="p-6">
               <h2 className="text-lg font-semibold mb-4">Edit Expense</h2>
               <div className="grid grid-cols-2 gap-3">
@@ -163,7 +234,7 @@ export default function ExpenseList() {
                   <input type="text" value={editForm.description || ''} onChange={(e) => setEditForm({ ...editForm, description: e.target.value })}
                     className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" /></div>
                 <div><label className="block text-sm font-medium mb-1">Amount</label>
-                  <input type="number" step="0.01" value={editForm.amount} onChange={(e) => setEditForm({ ...editForm, amount: parseFloat(e.target.value) || 0 })}
+                  <NumericInput step="0.01" value={editForm.amount} onValueChange={(amount) => setEditForm({ ...editForm, amount })}
                     className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" /></div>
                 <div><label className="block text-sm font-medium mb-1">Date</label>
                   <input type="date" value={editForm.expense_date?.split('T')[0] || ''} onChange={(e) => setEditForm({ ...editForm, expense_date: e.target.value })}
@@ -187,13 +258,13 @@ export default function ExpenseList() {
               </div>
             </div>
           </div>
-        </div>
+        </ModalOverlay>
       )}
 
       {/* Add Category Modal */}
       {showCatModal && (
-        <div className="modal-overlay" onClick={() => setShowCatModal(false)}>
-          <div className="modal-content max-w-sm" onClick={e => e.stopPropagation()}>
+        <ModalOverlay onClose={() => setShowCatModal(false)}>
+          <div className="modal-content max-w-sm">
             <div className="p-6">
               <h2 className="text-lg font-semibold mb-4">Add Category</h2>
               <div className="space-y-3">
@@ -206,8 +277,8 @@ export default function ExpenseList() {
               </div>
             </div>
           </div>
-        </div>
+        </ModalOverlay>
       )}
-    </div>
+    </FinancePageShell>
   );
 }

@@ -2,14 +2,19 @@ import { Router, Response } from 'express';
 import multer from 'multer';
 import XLSX from 'xlsx';
 import { query } from '../../config/database';
-import { authenticate, AuthRequest } from '../../middleware/auth';
+import { authenticate, AuthRequest, hasUserPerm, hasUserAnyPerm } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
 import { AppError } from '../../middleware/errorHandler';
+import { auditAfter, auditBefore, auditSnapshot, AUDIT_FIELDS } from '../../utils/auditHelpers';
 import { v4 as uuidv4 } from 'uuid';
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 }, fileFilter: (_req, file, cb) => { const ok = file.mimetype === 'text/csv' || file.originalname.endsWith('.csv') || file.mimetype === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' || file.originalname.endsWith('.xlsx'); cb(null, ok); } });
 
 const router = Router();
+
+const productView = hasUserPerm('inventory.inventory.view');
+const productSearch = hasUserAnyPerm(['inventory.inventory.view', 'pos.view', 'pos.write']);
+const productExport = hasUserPerm('inventory.inventory.export');
 
 // Generate next SKU
 const generateSKU = async (): Promise<string> => {
@@ -18,8 +23,57 @@ const generateSKU = async (): Promise<string> => {
   return `DMT-${String(nextNum).padStart(5, '0')}`;
 };
 
+async function assertProductPayload(body: any, excludeId?: string, existingRow?: any) {
+  const name = String(body.name || '').trim();
+  if (!name) throw new AppError('Product name is required');
+
+  const numericFields: [string, unknown][] = [
+    ['Cost', body.cost],
+    ['Retail price', body.retail_price],
+    ['Wholesale price', body.wholesale_price],
+    ['Distributor price', body.distributor_price],
+    ['Reorder level', body.reorder_level],
+    ['Chilled price', body.chilled_price],
+  ];
+  for (const [label, val] of numericFields) {
+    if (val === undefined || val === null || val === '') continue;
+    const n = parseFloat(String(val));
+    if (Number.isNaN(n) || n < 0) throw new AppError(`${label} cannot be negative`);
+  }
+
+  if (body.has_chilled_variant && (parseFloat(String(body.chilled_price ?? '')) || 0) <= 0) {
+    throw new AppError('Chilled price is required when chilled variant is enabled');
+  }
+
+  const barcode = String(body.barcode || '').trim();
+  if (barcode) {
+    const existingBarcode = existingRow
+      ? String(existingRow.barcode || '').trim().toLowerCase()
+      : '';
+    const barcodeUnchanged = Boolean(
+      excludeId && existingBarcode !== '' && existingBarcode === barcode.toLowerCase(),
+    );
+
+    if (!barcodeUnchanged) {
+      const params: any[] = [barcode.toLowerCase()];
+      let sql = `SELECT id, name FROM products
+        WHERE barcode IS NOT NULL AND TRIM(barcode) != '' AND LOWER(TRIM(barcode)) = $1`;
+      if (excludeId) {
+        sql += ' AND id != $2';
+        params.push(excludeId);
+      }
+      const dup = await query(sql, params);
+      if (dup.rows.length > 0) {
+        throw new AppError(`Barcode already used by "${dup.rows[0].name}"`);
+      }
+    }
+  }
+
+  return { name, barcode: barcode || null };
+}
+
 // Get all products with search, pagination
-router.get('/', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/', authenticate, productView, async (req: AuthRequest, res: Response) => {
   try {
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 50;
@@ -127,15 +181,23 @@ const parseFile = (buffer: Buffer, originalName: string): { headers: string[]; r
 };
 
 // Search products (for POS/autocomplete)
-router.get('/search/quick', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/search/quick', authenticate, productSearch, async (req: AuthRequest, res: Response) => {
   try {
     const search = req.query.q as string || '';
-    const location_id = req.query.location_id || 1;
+    const location_id = parseInt(String(req.query.location_id ?? '1'), 10) || 1;
 
     const result = await query(
       `SELECT p.id, p.sku, p.name, p.barcode, p.retail_price, p.wholesale_price,
         p.distributor_price, p.cost, p.tax_type, p.price_type, p.has_variants, p.has_chilled_variant,
-        p.chilled_price, COALESCE(i.quantity, 0) as stock
+        p.chilled_price, COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure, COALESCE(i.available_quantity, 0) as stock,
+        COALESCE(
+          (SELECT json_agg(json_build_object(
+            'id', pv.id, 'name', pv.name, 'retail_price', pv.retail_price, 'additional_cost', pv.additional_cost
+          ) ORDER BY pv.name)
+           FROM product_variants pv
+           WHERE pv.product_id = p.id AND pv.is_active = true),
+          '[]'::json
+        ) AS variants
        FROM products p
        LEFT JOIN inventory i ON i.product_id = p.id AND i.location_id = $3
        WHERE p.is_active = true AND (
@@ -147,22 +209,33 @@ router.get('/search/quick', authenticate, async (req: AuthRequest, res: Response
        LIMIT 20`,
       [`%${search}%`, search, location_id]
     );
-    res.json(result.rows);
+    res.json(result.rows.map((row: any) => ({
+      ...row,
+      variants: Array.isArray(row.variants) ? row.variants : [],
+    })));
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 });
 
 // Exact barcode / SKU lookup (no wildcard) — used by POS scanner Enter
-router.get('/search/exact', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/search/exact', authenticate, productSearch, async (req: AuthRequest, res: Response) => {
   try {
     const q = req.query.q as string || '';
-    const location_id = req.query.location_id || 1;
+    const location_id = parseInt(String(req.query.location_id ?? '1'), 10) || 1;
 
     const result = await query(
       `SELECT p.id, p.sku, p.name, p.barcode, p.retail_price, p.wholesale_price,
         p.distributor_price, p.cost, p.tax_type, p.price_type, p.has_variants, p.has_chilled_variant,
-        p.chilled_price, COALESCE(i.quantity, 0) as stock
+        p.chilled_price, COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure, COALESCE(i.available_quantity, 0) as stock,
+        COALESCE(
+          (SELECT json_agg(json_build_object(
+            'id', pv.id, 'name', pv.name, 'retail_price', pv.retail_price, 'additional_cost', pv.additional_cost
+          ) ORDER BY pv.name)
+           FROM product_variants pv
+           WHERE pv.product_id = p.id AND pv.is_active = true),
+          '[]'::json
+        ) AS variants
        FROM products p
        LEFT JOIN inventory i ON i.product_id = p.id AND i.location_id = $3
        WHERE p.is_active = true AND (p.barcode = $1 OR p.sku = $2)
@@ -170,14 +243,16 @@ router.get('/search/exact', authenticate, async (req: AuthRequest, res: Response
        LIMIT 1`,
       [q, q, location_id]
     );
-    res.json(result.rows[0] || null);
+    const row = result.rows[0];
+    if (!row) return res.json(null);
+    res.json({ ...row, variants: Array.isArray(row.variants) ? row.variants : [] });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 });
 
 // Export products
-router.get('/export', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/export', authenticate, productExport, async (req: AuthRequest, res: Response) => {
   try {
     const format = (req.query.format as string) || 'csv';
     const search = req.query.search as string || '';
@@ -231,7 +306,7 @@ router.get('/export', authenticate, async (req: AuthRequest, res: Response) => {
 });
 
 // Download blank template
-router.get('/export/template', authenticate, async (_req: AuthRequest, res: Response) => {
+router.get('/export/template', authenticate, productExport, async (_req: AuthRequest, res: Response) => {
   const headerRow = ['Name','Barcode','Category','Brand','Unit of Measure','Cost','Retail Price','Wholesale Price','Distributor Price','Reorder Level','Tax Type','Price Type','Description','Has Chilled Variant','Chilled Price'];
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename=product_import_template.csv');
@@ -239,7 +314,7 @@ router.get('/export/template', authenticate, async (_req: AuthRequest, res: Resp
 });
 
 // Import products — preview (no save)
-router.post('/import/preview', authenticate, upload.single('file'), async (req: AuthRequest, res: Response) => {
+router.post('/import/preview', authenticate, hasUserPerm('inventory.inventory.edit'), upload.single('file'), async (req: AuthRequest, res: Response) => {
   try {
     if (!req.file) throw new AppError('No file uploaded');
     const { headers, rows } = parseFile(req.file.buffer, req.file.originalname);
@@ -352,7 +427,7 @@ router.post('/import/preview', authenticate, upload.single('file'), async (req: 
 });
 
 // Import products — execute (create/update)
-router.post('/import/execute', authenticate, upload.single('file'), async (req: AuthRequest, res: Response) => {
+router.post('/import/execute', authenticate, hasUserPerm('inventory.inventory.edit'), upload.single('file'), async (req: AuthRequest, res: Response) => {
   try {
     if (!req.file) throw new AppError('No file uploaded');
     const { headers, rows } = parseFile(req.file.buffer, req.file.originalname);
@@ -491,7 +566,7 @@ router.post('/import/execute', authenticate, upload.single('file'), async (req: 
 });
 
 // Get single product
-router.get('/:id', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/:id', authenticate, productSearch, async (req: AuthRequest, res: Response) => {
   try {
     const result = await query(
       `SELECT p.*, c.name as category_name, b.name as brand_name
@@ -511,7 +586,7 @@ router.get('/:id', authenticate, async (req: AuthRequest, res: Response) => {
 });
 
 // Create product
-router.post('/', authenticate, auditLog('Products', 'Create'), async (req: AuthRequest, res: Response) => {
+router.post('/', authenticate, hasUserPerm('inventory.inventory.create'), auditLog('Products', 'Create'), async (req: AuthRequest, res: Response) => {
   try {
     const {
       name, barcode, category_id, brand_id, unit_of_measure, cost,
@@ -519,7 +594,7 @@ router.post('/', authenticate, auditLog('Products', 'Create'), async (req: AuthR
       tax_type, price_type, description, image_url, has_variants, has_chilled_variant, chilled_price
     } = req.body;
 
-    if (!name) throw new AppError('Product name is required');
+    const normalized = await assertProductPayload(req.body);
     const sku = await generateSKU();
     const id = uuidv4();
 
@@ -527,7 +602,7 @@ router.post('/', authenticate, auditLog('Products', 'Create'), async (req: AuthR
       `INSERT INTO products (id, sku, name, barcode, category_id, brand_id, unit_of_measure, cost,
         retail_price, wholesale_price, distributor_price, reorder_level, tax_type, price_type, description, image_url, has_variants, has_chilled_variant, chilled_price)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`,
-      [id, sku, name, barcode, category_id, brand_id, unit_of_measure || 'pc', cost || 0,
+      [id, sku, normalized.name, normalized.barcode, category_id, brand_id, unit_of_measure || 'pc', cost || 0,
         retail_price || 0, wholesale_price || 0, distributor_price || 0, reorder_level || 0,
         tax_type || 'VAT', price_type || 'VAT Inclusive', description, image_url, has_variants || false,
         has_chilled_variant || false, chilled_price || 0]
@@ -550,19 +625,21 @@ router.post('/', authenticate, auditLog('Products', 'Create'), async (req: AuthR
 });
 
 // Update product
-router.put('/:id', authenticate, auditLog('Products', 'Update'), async (req: AuthRequest, res: Response) => {
+router.put('/:id', authenticate, hasUserPerm('inventory.inventory.edit'), auditLog('Products', 'Update'), async (req: AuthRequest, res: Response) => {
   try {
     const existing = await query('SELECT * FROM products WHERE id = $1', [req.params.id]);
     if (existing.rows.length === 0) {
       return res.status(404).json({ error: 'Product not found' });
     }
-    (req as any).oldValues = existing.rows[0];
+    (req as any).oldValues = auditSnapshot(existing.rows[0], AUDIT_FIELDS.product);
 
     const {
       name, barcode, category_id, brand_id, unit_of_measure, cost,
       retail_price, wholesale_price, distributor_price, reorder_level,
       tax_type, price_type, description, image_url, is_active, has_chilled_variant, chilled_price
     } = req.body;
+
+    const normalized = await assertProductPayload(req.body, req.params.id, existing.rows[0]);
 
     await query(
       `UPDATE products SET name = $1, barcode = $2, category_id = $3, brand_id = $4,
@@ -571,7 +648,7 @@ router.put('/:id', authenticate, auditLog('Products', 'Update'), async (req: Aut
         image_url = $14, is_active = COALESCE($15, is_active), has_chilled_variant = $16,
         chilled_price = $17, updated_at = CURRENT_TIMESTAMP
        WHERE id = $18`,
-      [name, barcode, category_id || null, brand_id || null, unit_of_measure, cost,
+      [normalized.name, normalized.barcode, category_id || null, brand_id || null, unit_of_measure, cost,
         retail_price, wholesale_price, distributor_price, reorder_level,
         tax_type, price_type, description, image_url, is_active, has_chilled_variant || false,
         chilled_price || 0, req.params.id]
@@ -583,6 +660,41 @@ router.put('/:id', authenticate, auditLog('Products', 'Update'), async (req: Aut
     }
 
     const product = await query('SELECT p.*, c.name as category_name FROM products p LEFT JOIN categories c ON p.category_id = c.id WHERE p.id = $1', [req.params.id]);
+    auditAfter(req, auditSnapshot(product.rows[0], AUDIT_FIELDS.product));
+    res.json(product.rows[0]);
+  } catch (error: any) {
+    res.status(error instanceof AppError ? error.statusCode : 500).json({ error: error.message });
+  }
+});
+
+// Update reorder level only (skips full product validation e.g. barcode duplicate check)
+router.patch('/:id/reorder-level', authenticate, hasUserPerm('inventory.inventory.edit'), auditLog('Products', 'Update Reorder Level'), async (req: AuthRequest, res: Response) => {
+  try {
+    const existing = await query('SELECT * FROM products WHERE id = $1', [req.params.id]);
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+    (req as any).oldValues = auditSnapshot(existing.rows[0], AUDIT_FIELDS.product);
+
+    const { reorder_level } = req.body;
+    if (reorder_level === undefined || reorder_level === null || reorder_level === '') {
+      return res.status(400).json({ error: 'Reorder level is required' });
+    }
+    const parsed = parseFloat(String(reorder_level));
+    if (Number.isNaN(parsed) || parsed < 0) {
+      return res.status(400).json({ error: 'Reorder level cannot be negative' });
+    }
+
+    await query(
+      'UPDATE products SET reorder_level = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+      [parsed, req.params.id],
+    );
+
+    const product = await query(
+      'SELECT p.*, c.name as category_name FROM products p LEFT JOIN categories c ON p.category_id = c.id WHERE p.id = $1',
+      [req.params.id],
+    );
+    auditAfter(req, auditSnapshot(product.rows[0], AUDIT_FIELDS.product));
     res.json(product.rows[0]);
   } catch (error: any) {
     res.status(error instanceof AppError ? error.statusCode : 500).json({ error: error.message });
@@ -590,7 +702,7 @@ router.put('/:id', authenticate, auditLog('Products', 'Update'), async (req: Aut
 });
 
 // Disable product
-router.patch('/:id/toggle', authenticate, auditLog('Products', 'Toggle Status'), async (req: AuthRequest, res: Response) => {
+router.patch('/:id/toggle', authenticate, hasUserPerm('inventory.inventory.edit'), auditLog('Products', 'Toggle Status'), async (req: AuthRequest, res: Response) => {
   try {
     const product = await query('SELECT * FROM products WHERE id = $1', [req.params.id]);
     if (product.rows.length === 0) {
@@ -606,7 +718,7 @@ router.patch('/:id/toggle', authenticate, auditLog('Products', 'Toggle Status'),
 });
 
 // Get product variants
-router.get('/:id/variants', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/:id/variants', authenticate, productView, async (req: AuthRequest, res: Response) => {
   try {
     const result = await query(
       'SELECT * FROM product_variants WHERE product_id = $1 AND is_active = true ORDER BY name',
@@ -619,7 +731,7 @@ router.get('/:id/variants', authenticate, async (req: AuthRequest, res: Response
 });
 
 // Create product variant
-router.post('/:id/variants', authenticate, auditLog('Products', 'Create Variant'), async (req: AuthRequest, res: Response) => {
+router.post('/:id/variants', authenticate, hasUserPerm('inventory.inventory.edit'), auditLog('Products', 'Create Variant'), async (req: AuthRequest, res: Response) => {
   try {
     const { name, retail_price, additional_cost } = req.body;
     if (!name) throw new AppError('Variant name is required');
@@ -647,7 +759,7 @@ router.post('/:id/variants', authenticate, auditLog('Products', 'Create Variant'
 });
 
 // Update product variant
-router.put('/:id/variants/:variantId', authenticate, auditLog('Products', 'Update Variant'), async (req: AuthRequest, res: Response) => {
+router.put('/:id/variants/:variantId', authenticate, hasUserPerm('inventory.inventory.edit'), auditLog('Products', 'Update Variant'), async (req: AuthRequest, res: Response) => {
   try {
     const { name, retail_price, additional_cost, is_active } = req.body;
 
@@ -683,7 +795,7 @@ router.put('/:id/variants/:variantId', authenticate, auditLog('Products', 'Updat
 });
 
 // Delete product variant
-router.delete('/:id/variants/:variantId', authenticate, auditLog('Products', 'Delete Variant'), async (req: AuthRequest, res: Response) => {
+router.delete('/:id/variants/:variantId', authenticate, hasUserPerm('inventory.inventory.edit'), auditLog('Products', 'Delete Variant'), async (req: AuthRequest, res: Response) => {
   try {
     const existing = await query('SELECT * FROM product_variants WHERE id = $1 AND product_id = $2', [req.params.variantId, req.params.id]);
     if (existing.rows.length === 0) {
@@ -699,7 +811,7 @@ router.delete('/:id/variants/:variantId', authenticate, auditLog('Products', 'De
 });
 
 // Delete product
-router.delete('/:id', authenticate, auditLog('Products', 'Delete'), async (req: AuthRequest, res: Response) => {
+router.delete('/:id', authenticate, hasUserPerm('inventory.inventory.edit'), auditLog('Products', 'Delete'), async (req: AuthRequest, res: Response) => {
   try {
     const existing = await query('SELECT * FROM products WHERE id = $1', [req.params.id]);
     if (existing.rows.length === 0) {

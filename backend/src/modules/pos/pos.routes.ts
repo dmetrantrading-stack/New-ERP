@@ -2,9 +2,24 @@ import { Router, Response } from 'express';
 import { query, getClient } from '../../config/database';
 import { authenticate, AuthRequest, hasUserPerm } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
+import { postCashInJournal, postCashOutJournal, postInventoryVarianceJournal } from '../../utils/journalEntryHelpers';
+import {
+  aggregateByAccountCode,
+  aggregateGlCogsByAccountCode,
+  insertCogsInventoryLines,
+  insertCogsInventoryReversalLines,
+  insertRevenueCreditLines,
+  insertRevenueDebitLines,
+  loadCategoryAccountsForProducts,
+  posLineNetRevenue,
+  sumLineGlCogs,
+} from '../../utils/categoryGlPosting';
+import { deductInventoryFefo } from '../../utils/batchFefo';
 import { v4 as uuidv4 } from 'uuid';
 
 const router = Router();
+
+const posView = hasUserPerm('pos.view');
 
 const generateRefNumber = async (prefix: string, table: string, column: string): Promise<string> => {
   const safePrefix = prefix.replace(/[^A-Z]/g, '');
@@ -17,7 +32,7 @@ const generateRefNumber = async (prefix: string, table: string, column: string):
 };
 
 // ==================== POS SHIFTS ====================
-router.post('/shifts/open', authenticate, auditLog('POS', 'Shift Open'), async (req: AuthRequest, res: Response) => {
+router.post('/shifts/open', authenticate, hasUserPerm('pos.write'), auditLog('POS', 'Shift Open'), async (req: AuthRequest, res: Response) => {
   try {
     const shift_number = await generateRefNumber('SH', 'pos_shifts', 'shift_number');
     const { opening_cash } = req.body;
@@ -48,7 +63,7 @@ router.post('/shifts/open', authenticate, auditLog('POS', 'Shift Open'), async (
   }
 });
 
-router.post('/shifts/close', authenticate, auditLog('POS', 'Shift Close'), async (req: AuthRequest, res: Response) => {
+router.post('/shifts/close', authenticate, hasUserPerm('pos.write'), auditLog('POS', 'Shift Close'), async (req: AuthRequest, res: Response) => {
   try {
     const { closing_cash, notes } = req.body;
     const shift = await query(
@@ -99,7 +114,7 @@ router.post('/shifts/close', authenticate, auditLog('POS', 'Shift Close'), async
   }
 });
 
-router.get('/shifts/current', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/shifts/current', authenticate, posView, async (req: AuthRequest, res: Response) => {
   try {
     const shift = await query(
       "SELECT * FROM pos_shifts WHERE user_id = $1 AND status = 'Open' ORDER BY created_at DESC LIMIT 1",
@@ -112,7 +127,7 @@ router.get('/shifts/current', authenticate, async (req: AuthRequest, res: Respon
 });
 
 // Get all shifts
-router.get('/shifts', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/shifts', authenticate, posView, async (req: AuthRequest, res: Response) => {
   try {
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 50;
@@ -150,7 +165,7 @@ router.get('/shifts', authenticate, async (req: AuthRequest, res: Response) => {
 });
 
 // Get single shift with transactions
-router.get('/shifts/:id', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/shifts/:id', authenticate, posView, async (req: AuthRequest, res: Response) => {
   try {
     const shift = await query(
       `SELECT ps.*, u.full_name as user_name
@@ -183,10 +198,14 @@ router.post('/transactions', authenticate, hasUserPerm('pos.write'), auditLog('P
     await client.query('BEGIN');
     const transaction_number = await generateRefNumber('POS', 'pos_transactions', 'transaction_number');
     const {
-      shift_id, customer_id, customer_name, price_mode, items, payment_method,
+      shift_id, customer_id, customer_name, employee_id, price_mode, items, payment_method,
       payment_details, amount_tendered, location_id
     } = req.body;
     if (!location_id) throw new Error('Location ID is required');
+
+    if (payment_method === 'Salary Deduction' && !employee_id) {
+      return res.status(400).json({ error: 'Employee is required for salary deduction' });
+    }
 
     // Validate shift
     if (shift_id) {
@@ -234,6 +253,7 @@ router.post('/transactions', authenticate, hasUserPerm('pos.write'), auditLog('P
     for (const item of transactionItems) {
       const tax = productTaxMap[item.product_id] || { tax_type: 'VAT', price_type: 'VAT Inclusive' };
       const lineFinal = item.total;
+      item.netRevenue = posLineNetRevenue(lineFinal, tax);
       if (tax.tax_type === 'VAT Exempt') {
         totalVatExempt += lineFinal;
       } else if (tax.tax_type === 'Zero Rated') {
@@ -272,35 +292,36 @@ router.post('/transactions', authenticate, hasUserPerm('pos.write'), auditLog('P
 
     for (const item of transactionItems) {
       const itemId = uuidv4();
-      const costResult = await client.query('SELECT unit_cost FROM inventory WHERE product_id = $1 AND location_id = $2', [item.product_id, location_id]);
-      const cost = costResult.rows[0]?.unit_cost || 0;
-      item.cost = cost; // Store for COGS calculation later
+      const locId = location_id;
+      const inv = await client.query('SELECT * FROM inventory WHERE product_id = $1 AND location_id = $2', [item.product_id, locId]);
+      if (inv.rows.length > 0) {
+        const availableQty = parseFloat(inv.rows[0].quantity);
+        const setting = await client.query("SELECT setting_value FROM system_settings WHERE setting_key = 'enable_negative_inventory'");
+        if (item.quantity > availableQty && setting.rows[0]?.setting_value !== 'true') {
+          throw new Error(`Insufficient stock for ${item.description || item.product_id}`);
+        }
+      } else {
+        const setting = await client.query("SELECT setting_value FROM system_settings WHERE setting_key = 'enable_negative_inventory'");
+        if (setting.rows[0]?.setting_value !== 'true') {
+          throw new Error(`No stock for ${item.description || item.product_id}`);
+        }
+      }
+
+      const fefo = await deductInventoryFefo(client, {
+        product_id: item.product_id,
+        location_id: locId,
+        quantity: item.quantity,
+        reference_type: 'POS Sale',
+        reference_id: id,
+        created_by: req.user!.id,
+      });
+      item.cost = fefo.unitCost;
 
       await client.query(
         `INSERT INTO pos_transaction_items (id, transaction_id, product_id, variant_id, description, quantity, unit_price, discount, total, cost, selected_variant)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
         [itemId, id, item.product_id, item.variant_id, item.description, item.quantity, item.unit_price,
-         item.discount || 0, item.total, cost, item.selected_variant || null]
-      );
-
-      // Deduct inventory
-      const locId = location_id;
-      const inv = await client.query('SELECT * FROM inventory WHERE product_id = $1 AND location_id = $2', [item.product_id, locId]);
-      if (inv.rows.length > 0) {
-        const newQty = parseFloat(inv.rows[0].quantity) - item.quantity;
-        const setting = await client.query("SELECT setting_value FROM system_settings WHERE setting_key = 'enable_negative_inventory'");
-        if (newQty < 0 && setting.rows[0]?.setting_value !== 'true') {
-          throw new Error(`Insufficient stock for ${item.description || item.product_id}`);
-        }
-        await client.query('UPDATE inventory SET quantity = $1 WHERE id = $2', [newQty, inv.rows[0].id]);
-      }
-
-      // Inventory ledger
-      const ledgerQty = inv.rows[0] ? parseFloat(inv.rows[0].quantity) - item.quantity : -item.quantity;
-      await client.query(
-        `INSERT INTO inventory_ledger (id, product_id, location_id, reference_type, reference_id, transaction_type, quantity, running_quantity, unit_cost, total_cost, created_by)
-         VALUES ($1, $2, $3, 'POS Sale', $4, 'OUT', $5, $6, $7, $8, $9)`,
-        [uuidv4(), item.product_id, locId, id, item.quantity, ledgerQty, cost, item.quantity * cost, req.user!.id]
+         item.discount || 0, item.total, fefo.unitCost, item.selected_variant || null]
       );
     }
 
@@ -337,7 +358,15 @@ router.post('/transactions', authenticate, hasUserPerm('pos.write'), auditLog('P
     const entryNumber = await generateRefNumber('JE', 'journal_entries', 'entry_number');
     const totalCost = transactionItems.reduce((sum: number, i: any) => sum + (i.quantity * (i.cost || 0)), 0);
     // GL COGS uses net-of-VAT cost (inventory stored VAT-inclusive for operational GP)
-    const glCogs = totalCost / 1.12;
+    const posCogsGlLines = transactionItems.map((item: any) => {
+      const tax = productTaxMap[item.product_id] || { tax_type: 'VAT', price_type: 'VAT Inclusive' };
+      return {
+        product_id: item.product_id,
+        cogsGrossAmount: item.quantity * (item.cost || 0),
+        tax_type: tax.tax_type,
+      };
+    });
+    const glCogs = sumLineGlCogs(posCogsGlLines);
     const jeTotal = grossTotal + glCogs;
 
     await client.query(
@@ -361,12 +390,20 @@ router.post('/transactions', authenticate, hasUserPerm('pos.write'), auditLog('P
       [uuidv4(), entryId, debitAccount, `${payment_method} Sales ${transaction_number}`, grossTotal, id]
     );
 
+    const posCategoryMap = await loadCategoryAccountsForProducts(client, productIds as string[]);
+    const posRevenueBuckets = aggregateByAccountCode(
+      transactionItems.map((item: any) => ({
+        product_id: item.product_id,
+        revenueAmount: item.netRevenue || 0,
+      })),
+      posCategoryMap,
+      'revenue_account_code',
+      'revenueAmount',
+    );
+
     const revenueTotal = totalVatable + totalVatExempt + totalZeroRated;
-    // Credit Sales Revenue
-    await client.query(
-      `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
-       VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '4000'), $3, 0, $4, 'POS Sale', $5)`,
-      [uuidv4(), entryId, `Sales Revenue ${transaction_number}`, revenueTotal, id]
+    await insertRevenueCreditLines(
+      client, entryId, posRevenueBuckets, 'POS Sale', id, `Sales Revenue ${transaction_number}`,
     );
 
     // Credit VAT Payable
@@ -378,14 +415,11 @@ router.post('/transactions', authenticate, hasUserPerm('pos.write'), auditLog('P
       );
     }
 
-    // Debit Cost of Sales / Credit Inventory
+    // Debit Cost of Sales / Credit Inventory (by category)
     if (totalCost > 0) {
-      await client.query(
-        `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
-         VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '5000'), $3, $4, 0, 'POS Sale', $5),
-                ($6, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '1200'), $7, 0, $4, 'POS Sale', $5)`,
-        [uuidv4(), entryId, `COGS ${transaction_number}`, glCogs, id,
-         uuidv4(), `Inventory ${transaction_number}`]
+      const posCogsBuckets = aggregateGlCogsByAccountCode(posCogsGlLines, posCategoryMap);
+      await insertCogsInventoryLines(
+        client, entryId, posCogsBuckets, 'POS Sale', id, transaction_number,
       );
     }
 
@@ -414,16 +448,17 @@ router.post('/transactions', authenticate, hasUserPerm('pos.write'), auditLog('P
       }
     }
 
-    // Employee Grocery Credit: create sales_invoice for salary deduction
-    if (payment_method === 'Salary Deduction' && customer_id) {
-      const emp = await client.query('SELECT id, employee_code FROM employees WHERE id = $1', [customer_id]);
+    // Employee grocery credit: create sales invoice for salary deduction
+    if (payment_method === 'Salary Deduction' && employee_id) {
+      const emp = await client.query('SELECT id, employee_code, first_name, last_name FROM employees WHERE id = $1', [employee_id]);
       if (emp.rows.length > 0) {
+        const e = emp.rows[0];
         const invNumber = `SI-${new Date().getFullYear()}-${String(Date.now()).slice(-6)}`;
         const siId = uuidv4();
         await client.query(
           `INSERT INTO sales_invoices (id, invoice_number, customer_type, employee_id, customer_name, price_mode, invoice_date, payment_method, payment_terms, status, subtotal, discount, tax, tax_type, total, amount_paid, balance, cashier_id, created_by)
            VALUES ($1,$2,'Employee',$3,$4,$5,CURRENT_DATE,'Salary Deduction','Salary Deduction','Posted',$6,$7,$8,'VAT',$9,0,$10,$11,$12)`,
-          [siId, invNumber, emp.rows[0].id, `Employee ${emp.rows[0].employee_code}`, price_mode || 'Retail',
+          [siId, invNumber, e.id, `${e.last_name}, ${e.first_name}`, price_mode || 'Retail',
            subtotal, discountTotal, totalVat, grossTotal, grossTotal, req.user!.id, req.user!.id]
         );
         for (const item of transactionItems) {
@@ -433,7 +468,7 @@ router.post('/transactions', authenticate, hasUserPerm('pos.write'), auditLog('P
             [uuidv4(), siId, item.product_id, item.description, item.quantity, item.unit_price, item.discount || 0, 0, item.total, item.cost || 0, location_id]
           );
         }
-        await client.query('UPDATE employees SET grocery_credit_balance = grocery_credit_balance + $1 WHERE id = $2', [grossTotal, emp.rows[0].id]);
+        await client.query('UPDATE employees SET grocery_credit_balance = grocery_credit_balance + $1 WHERE id = $2', [grossTotal, e.id]);
       }
     }
 
@@ -457,7 +492,7 @@ router.post('/transactions', authenticate, hasUserPerm('pos.write'), auditLog('P
 });
 
 // Get current shift transactions
-router.get('/transactions/current', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/transactions/current', authenticate, posView, async (req: AuthRequest, res: Response) => {
   try {
     const shift = await query(
       "SELECT id FROM pos_shifts WHERE user_id = $1 AND status = 'Open' ORDER BY created_at DESC LIMIT 1",
@@ -487,7 +522,7 @@ router.get('/transactions/current', authenticate, async (req: AuthRequest, res: 
 });
 
 // Get ALL transactions (across all shifts)
-router.get('/transactions', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/transactions', authenticate, posView, async (req: AuthRequest, res: Response) => {
   try {
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 50;
@@ -533,7 +568,7 @@ router.get('/transactions', authenticate, async (req: AuthRequest, res: Response
 });
 
 // Get single transaction with items
-router.get('/transactions/:id', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/transactions/:id', authenticate, posView, async (req: AuthRequest, res: Response) => {
   try {
     const txn = await query(
       `SELECT pt.*, u.full_name as cashier_name
@@ -560,7 +595,7 @@ router.get('/transactions/:id', authenticate, async (req: AuthRequest, res: Resp
 });
 
 // Void POS transaction
-router.post('/transactions/:id/void', authenticate, auditLog('POS', 'Void'), async (req: AuthRequest, res: Response) => {
+router.post('/transactions/:id/void', authenticate, hasUserPerm('pos.write'), auditLog('POS', 'Void'), async (req: AuthRequest, res: Response) => {
   const client = await getClient();
   try {
     await client.query('BEGIN');
@@ -575,8 +610,16 @@ router.post('/transactions/:id/void', authenticate, auditLog('POS', 'Void'), asy
       [reason, req.user!.id, req.params.id]
     );
 
-    // Restore inventory
-    const items = await client.query('SELECT pti.*, inv.location_id FROM pos_transaction_items pti JOIN inventory inv ON pti.product_id = inv.product_id WHERE pti.transaction_id = $1', [req.params.id]);
+    // Restore inventory at the same location used for the original sale
+    const items = await client.query(
+      `SELECT pti.*,
+        (SELECT il.location_id FROM inventory_ledger il
+         WHERE il.reference_id = pti.transaction_id AND il.product_id = pti.product_id
+           AND il.transaction_type = 'OUT'
+         ORDER BY il.created_at DESC LIMIT 1) AS location_id
+       FROM pos_transaction_items pti WHERE pti.transaction_id = $1`,
+      [req.params.id]
+    );
     for (const item of items.rows) {
       const locId = item.location_id || 1;
       await client.query('UPDATE inventory SET quantity = quantity + $1 WHERE product_id = $2 AND location_id = $3',
@@ -595,7 +638,7 @@ router.post('/transactions/:id/void', authenticate, auditLog('POS', 'Void'), asy
         : t.payment_method === 'Maya' ? 'maya_sales'
         : t.payment_method === 'Credit Card' ? 'card_sales'
         : t.payment_method === 'Bank Transfer' ? 'bank_transfer_sales'
-        : t.payment_method === 'Charge' ? 'charge_sales'
+        : t.payment_method === 'Charge' || t.payment_method === 'Check' || t.payment_method === 'Salary Deduction' ? 'charge_sales'
         : 'cash_sales';
       await client.query(
         `UPDATE pos_shifts SET total_sales = total_sales - $1, ${pmColumn} = ${pmColumn} - $1, discount_total = discount_total - $2, net_sales = net_sales - $1, void_total = void_total + $1 WHERE id = $3`,
@@ -607,10 +650,59 @@ router.post('/transactions/:id/void', authenticate, auditLog('POS', 'Void'), asy
     const voidEntryId = uuidv4();
     const voidEntryNumber = await generateRefNumber('JE', 'journal_entries', 'entry_number');
     const grossTotal = parseFloat(t.total);
-    const netOfVat = grossTotal / 1.12;
-    const vatAmount = grossTotal - netOfVat;
     const totalCost = items.rows.reduce((sum: number, i: any) => sum + (i.quantity * parseFloat(i.cost || 0)), 0);
     const jeTotal = grossTotal + totalCost;
+
+    const voidProductIds = [...new Set(items.rows.map((i: any) => i.product_id))];
+    const voidProductTaxMap: Record<string, { tax_type: string; price_type: string }> = {};
+    if (voidProductIds.length > 0) {
+      const prodResult = await client.query(
+        `SELECT id, tax_type, price_type FROM products WHERE id = ANY($1::uuid[])`,
+        [voidProductIds],
+      );
+      for (const p of prodResult.rows) {
+        voidProductTaxMap[p.id] = { tax_type: p.tax_type || 'VAT', price_type: p.price_type || 'VAT Inclusive' };
+      }
+    }
+    const voidPosCategoryMap = await loadCategoryAccountsForProducts(client, voidProductIds as string[]);
+    const voidPosRevenueBuckets = aggregateByAccountCode(
+      items.rows.map((item: any) => {
+        const tax = voidProductTaxMap[item.product_id] || { tax_type: 'VAT', price_type: 'VAT Inclusive' };
+        return {
+          product_id: item.product_id,
+          revenueAmount: posLineNetRevenue(parseFloat(item.total), tax),
+        };
+      }),
+      voidPosCategoryMap,
+      'revenue_account_code',
+      'revenueAmount',
+    );
+    const voidPosCogsGlLines = items.rows.map((item: any) => {
+      const tax = voidProductTaxMap[item.product_id] || { tax_type: 'VAT', price_type: 'VAT Inclusive' };
+      return {
+        product_id: item.product_id,
+        cogsGrossAmount: parseFloat(item.quantity) * parseFloat(item.cost || 0),
+        tax_type: tax.tax_type,
+      };
+    });
+    const voidPosCogsBuckets = aggregateGlCogsByAccountCode(voidPosCogsGlLines, voidPosCategoryMap);
+
+    let voidVatAmount = 0;
+    for (const item of items.rows) {
+      const tax = voidProductTaxMap[item.product_id] || { tax_type: 'VAT', price_type: 'VAT Inclusive' };
+      const lineFinal = parseFloat(item.total);
+      if (tax.tax_type === 'VAT Exempt' || tax.tax_type === 'Zero Rated') continue;
+      if (tax.tax_type === 'VAT' || tax.tax_type === 'VATable') {
+        if (tax.price_type === 'VAT Inclusive') {
+          voidVatAmount += lineFinal - lineFinal / 1.12;
+        } else {
+          voidVatAmount += lineFinal * 0.12;
+        }
+      } else {
+        voidVatAmount += lineFinal - lineFinal / 1.12;
+      }
+    }
+    voidVatAmount = Math.round(voidVatAmount * 100) / 100;
 
     await client.query(
       `INSERT INTO journal_entries (id, entry_number, entry_date, reference_type, reference_id, description, total_debit, total_credit, created_by)
@@ -618,7 +710,9 @@ router.post('/transactions/:id/void', authenticate, auditLog('POS', 'Void'), asy
       [voidEntryId, voidEntryNumber, req.params.id, `Void POS Transaction ${t.transaction_number}`, jeTotal, req.user!.id]
     );
 
-    // Reverse: Credit Revenue, Debit VAT, Credit the payment account
+    await insertRevenueDebitLines(
+      client, voidEntryId, voidPosRevenueBuckets, 'Void POS', req.params.id, `Reverse Revenue ${t.transaction_number}`,
+    );
     const pm = t.payment_method || 'Cash';
     const bankAcctVoid = await client.query(
       'SELECT gl_account_code FROM bank_accounts WHERE pos_payment_method = $1 AND is_active = true LIMIT 1',
@@ -628,25 +722,22 @@ router.post('/transactions/:id/void', authenticate, auditLog('POS', 'Void'), asy
     const reverseAccount = bankAcctVoid.rows.length > 0
       ? bankAcctVoid.rows[0].gl_account_code
       : (reverseFallback[pm as string] || '1000');
-    await client.query(
-      `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
-       VALUES
-         ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '4000'), $3, $4, 0, 'Void POS', $5),
-         ($6, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '2100'), $7, $8, 0, 'Void POS', $5),
-         ($9, $2, (SELECT id FROM chart_of_accounts WHERE account_code = $10), $11, 0, $12, 'Void POS', $5)`,
-      [uuidv4(), voidEntryId, `Reverse Revenue ${t.transaction_number}`, netOfVat, req.params.id,
-       uuidv4(), `Reverse VAT ${t.transaction_number}`, vatAmount,
-       uuidv4(), reverseAccount, `Reverse ${pm} ${t.transaction_number}`, grossTotal]
-    );
-
-    // Reverse COGS: Debit Inventory, Credit COGS
-    if (totalCost > 0) {
+    if (voidVatAmount > 0) {
       await client.query(
         `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
-         VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '1200'), $3, $4, 0, 'Void POS', $5),
-                ($6, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '5000'), $7, 0, $4, 'Void POS', $5)`,
-        [uuidv4(), voidEntryId, `Reverse Inventory ${t.transaction_number}`, totalCost, req.params.id,
-         uuidv4(), `Reverse COGS ${t.transaction_number}`]
+         VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '2100'), $3, $4, 0, 'Void POS', $5)`,
+        [uuidv4(), voidEntryId, `Reverse VAT ${t.transaction_number}`, voidVatAmount, req.params.id],
+      );
+    }
+    await client.query(
+      `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
+       VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = $3), $4, 0, $5, 'Void POS', $6)`,
+      [uuidv4(), voidEntryId, reverseAccount, `Reverse ${pm} ${t.transaction_number}`, grossTotal, req.params.id],
+    );
+
+    if (totalCost > 0) {
+      await insertCogsInventoryReversalLines(
+        client, voidEntryId, voidPosCogsBuckets, 'Void POS', req.params.id, t.transaction_number,
       );
     }
 
@@ -688,7 +779,7 @@ router.post('/transactions/:id/void', authenticate, auditLog('POS', 'Void'), asy
 });
 
 // ==================== SUSPENDED SALES ====================
-router.post('/suspend', authenticate, auditLog('POS', 'Suspend Sale'), async (req: AuthRequest, res: Response) => {
+router.post('/suspend', authenticate, hasUserPerm('pos.write'), auditLog('POS', 'Suspend Sale'), async (req: AuthRequest, res: Response) => {
   try {
     const txn_number = await generateRefNumber('SUS', 'suspended_sales', 'transaction_number');
     const { customer_id, customer_name, price_mode, items, subtotal, discount_total, tax_total, total, shift_id } = req.body;
@@ -707,7 +798,19 @@ router.post('/suspend', authenticate, auditLog('POS', 'Suspend Sale'), async (re
   }
 });
 
-router.get('/suspend', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/employees', authenticate, hasUserPerm('pos.write'), async (req: AuthRequest, res: Response) => {
+  try {
+    const result = await query(
+      `SELECT id, employee_code, first_name, last_name, department, credit_limit, grocery_credit_balance
+       FROM employees WHERE is_active = true ORDER BY last_name, first_name`
+    );
+    res.json(result.rows);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/suspend', authenticate, posView, async (req: AuthRequest, res: Response) => {
   try {
     const result = await query(
       `SELECT * FROM suspended_sales WHERE cashier_id = $1 ORDER BY created_at DESC`,
@@ -719,7 +822,7 @@ router.get('/suspend', authenticate, async (req: AuthRequest, res: Response) => 
   }
 });
 
-router.delete('/suspend/:id', authenticate, auditLog('POS', 'Delete Suspend'), async (req: AuthRequest, res: Response) => {
+router.delete('/suspend/:id', authenticate, hasUserPerm('pos.write'), auditLog('POS', 'Delete Suspend'), async (req: AuthRequest, res: Response) => {
   try {
     const existing = await query('SELECT id FROM suspended_sales WHERE id = $1', [req.params.id]);
     if (existing.rows.length === 0) return res.status(404).json({ error: 'Suspended sale not found' });
@@ -733,7 +836,7 @@ router.delete('/suspend/:id', authenticate, auditLog('POS', 'Delete Suspend'), a
 // ==================== CASH IN / CASH OUT ====================
 
 // Cash In — add money to cash drawer
-router.post('/cash-in', authenticate, auditLog('POS', 'Cash In'), async (req: AuthRequest, res: Response) => {
+router.post('/cash-in', authenticate, hasUserPerm('pos.write'), auditLog('POS', 'Cash In'), async (req: AuthRequest, res: Response) => {
   try {
     const { amount, reason, notes } = req.body;
     const amt = parseFloat(amount);
@@ -754,12 +857,19 @@ router.post('/cash-in', authenticate, auditLog('POS', 'Cash In'), async (req: Au
       [ctId, ctNum, 'Cash In', amt, 'POS Shift', s.id, reason || notes || 'Cash In', req.user!.id]
     );
 
+    await postCashInJournal(query, {
+      referenceId: ctId,
+      description: `POS Cash In ${ctNum}`,
+      amount: amt,
+      userId: req.user!.id,
+    });
+
     res.json({ id: ctId, transaction_number: ctNum, expected_cash: newExpected });
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
 // Cash Out — remove money from cash drawer
-router.post('/cash-out', authenticate, auditLog('POS', 'Cash Out'), async (req: AuthRequest, res: Response) => {
+router.post('/cash-out', authenticate, hasUserPerm('pos.write'), auditLog('POS', 'Cash Out'), async (req: AuthRequest, res: Response) => {
   try {
     const { amount, reason, notes } = req.body;
     const amt = parseFloat(amount);
@@ -779,6 +889,13 @@ router.post('/cash-out', authenticate, auditLog('POS', 'Cash Out'), async (req: 
       'INSERT INTO cash_transactions (id, transaction_number, transaction_type, amount, reference_type, reference_id, notes, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
       [ctId, ctNum, 'Cash Out', amt, 'POS Shift', s.id, reason || notes || 'Cash Out', req.user!.id]
     );
+
+    await postCashOutJournal(query, {
+      referenceId: ctId,
+      description: `POS Cash Out ${ctNum}`,
+      amount: amt,
+      userId: req.user!.id,
+    });
 
     res.json({ id: ctId, transaction_number: ctNum, expected_cash: newExpected });
   } catch (error: any) { res.status(500).json({ error: error.message }); }

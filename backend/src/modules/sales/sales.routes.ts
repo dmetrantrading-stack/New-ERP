@@ -3,8 +3,38 @@ import { query, getClient } from '../../config/database';
 import { authenticate, AuthRequest, hasUserPerm } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
 import { v4 as uuidv4 } from 'uuid';
-import jwt from 'jsonwebtoken';
-import { config } from '../../config';
+import { calculateInvoiceItems, resolveInvoiceEwtRate } from '../../utils/invoiceTax';
+import {
+  aggregateByAccountCode,
+  aggregateGlCogsByAccountCode,
+  insertCogsInventoryLines,
+  insertCogsInventoryReversalLines,
+  insertRevenueCreditLines,
+  insertRevenueDebitLines,
+  invoiceLineNetRevenue,
+  loadCategoryAccountsForProducts,
+  storedInvoiceItemNetRevenue,
+  sumLineGlCogs,
+  invoiceHadCogsRecognized,
+  shouldSkipInvoiceInventoryCogs,
+} from '../../utils/categoryGlPosting';
+import { deductInventoryFefo } from '../../utils/batchFefo';
+import { auditAfter, auditBefore, auditSnapshot, AUDIT_FIELDS } from '../../utils/auditHelpers';
+import { AppError } from '../../middleware/errorHandler';
+import { assertPeriodNotLocked } from '../../utils/periodLock';
+import {
+  tableRow, renderEnterpriseNotesBlock, renderEnterpriseSectionTitle,
+  renderEnterpriseAgingRow, renderEnterpriseTotalBanner, fmtCurrency, fmtDate,
+} from '../../utils/printLayout';
+import {
+  buildSalesEnterpriseDocument,
+  buildCustomerMetaRows,
+  buildEnterpriseTwoPartySignatures,
+  buildBillingStatementSignatures,
+  buildBillingStatementSummaryRows,
+  computeBillingStatementTotals,
+  SALES_LINE_ITEM_HEADERS,
+} from '../../utils/salesEnterprisePrint';
 
 const router = Router();
 
@@ -13,7 +43,7 @@ const generateRefNumber = async (prefix: string, table: string, column: string):
   const safeTable = table.replace(/[^a-z_]/g, '');
   const safeColumn = column.replace(/[^a-z_]/g, '');
   const result = await query(
-    `SELECT COALESCE(MAX(CAST(SUBSTRING(${safeColumn}, ${safePrefix.length + 2}) AS INTEGER)), 0) + 1 as next FROM ${safeTable} WHERE ${safeColumn} ~ '^${safePrefix}-'`
+    `SELECT COALESCE(MAX(CAST(SUBSTRING(${safeColumn}, ${safePrefix.length + 2}) AS INTEGER)), 0) + 1 as next FROM ${safeTable} WHERE ${safeColumn} ~ '^${safePrefix}-[0-9]+$'`
   );
   return `${safePrefix}-${String(result.rows[0]?.next || 1).padStart(5, '0')}`;
 };
@@ -32,103 +62,43 @@ const generateInvoiceNumber = async (): Promise<string> => {
 // ==================== SALES INVOICES (Multi-Tax-Type Engine) ====================
 router.post('/invoices', authenticate, hasUserPerm('sales.sales-invoice.create'), auditLog('Sales', 'Create Invoice'), async (req: AuthRequest, res: Response) => {
   try {
+    await assertPeriodNotLocked(new Date().toISOString().slice(0, 10));
     const invoice_number = await generateInvoiceNumber();
     const {
       customer_id, customer_name, customer_type, employee_id, price_mode, items, discount,
-      payment_method, payment_terms, amount_tendered, due_date, notes, invoice_tax_type, ewt_rate
+      payment_method, payment_terms, amount_tendered, due_date, notes, terms_conditions, invoice_tax_type, ewt_rate,
+      so_id, skip_inventory, dn_id
     } = req.body;
     const ewtPercent = parseFloat(ewt_rate || '0');
     const isEmployee = customer_type === 'Employee';
     const effectivePaymentMethod = isEmployee ? 'Salary Deduction' : (payment_method || 'Cash');
 
     const id = uuidv4();
-    let subtotal = 0;
-    let totalDiscount = 0;
-    let totalVat = 0;
-    let totalLguTax = 0;
-    let totalWht = 0;
-    let totalVatableSales = 0;
-    let totalVatExemptSales = 0;
-    let totalZeroRatedSales = 0;
-
-    const invoiceItems = (items || []).map((item: any) => {
-      const qty = parseFloat(item.quantity);
-      const price = parseFloat(item.unit_price);
-      const disc = parseFloat(item.discount || 0);
-      const lineTaxType = item.tax_type || invoice_tax_type || 'VAT';
-      const gross = qty * price;
-      const lineDiscount = gross * (disc / 100);
-      const netAfterDisc = gross - lineDiscount;
-
-      let lineTax = 0;
-      let lineFinalTotal = netAfterDisc;
-      let itemVatableSales = 0;
-
-      if (lineTaxType === 'VAT' || lineTaxType === 'VATable') {
-        itemVatableSales = netAfterDisc / 1.12;
-        lineTax = netAfterDisc - itemVatableSales;
-        lineFinalTotal = netAfterDisc;
-        totalVatableSales += itemVatableSales;
-        totalVat += lineTax;
-        // EWT for VATable: apply ewt_rate on vatable sales if set
-        if (ewtPercent > 0) {
-          totalWht += itemVatableSales * (ewtPercent / 100);
-        }
-      } else if (lineTaxType === 'VAT Exempt') {
-        totalVatExemptSales += netAfterDisc;
-        lineFinalTotal = netAfterDisc;
-        // EWT on VAT exempt: apply on gross if ewt_rate set
-        if (ewtPercent > 0) {
-          totalWht += netAfterDisc * (ewtPercent / 100);
-        }
-      } else if (lineTaxType === 'Zero Rated') {
-        totalZeroRatedSales += netAfterDisc;
-        lineFinalTotal = netAfterDisc;
-      } else if (lineTaxType === 'LGU' || lineTaxType === 'LGU 5% Final VAT') {
-        const netOfVat = netAfterDisc / 1.12;
-        const vat12 = netAfterDisc - netOfVat;
-        const lgu5 = netOfVat * 0.05;
-        const wht1 = netOfVat * 0.01;
-        lineTax = vat12;
-        totalVat += vat12;
-        totalLguTax += lgu5;
-        totalWht += wht1;
-        totalVatableSales += netOfVat;
-        lineFinalTotal = netAfterDisc;
-      }
-
-      subtotal += gross;
-      totalDiscount += lineDiscount;
-
-      return {
-        ...item,
-        quantity: qty,
-        unit_price: price,
-        discount: disc,
-        tax_type: lineTaxType,
-        tax_amount: lineTax,
-        total: lineFinalTotal,
-      };
-    });
-
-    const total = subtotal - totalDiscount;
+    const { lines: invoiceItems, totals } = calculateInvoiceItems(items || [], ewtPercent, invoice_tax_type || 'VAT');
+    const {
+      subtotal, totalDiscount, totalVat, totalLguTax, totalWht,
+      totalVatableSales, totalVatExemptSales, totalZeroRatedSales, netRevenue,
+    } = totals;
     const discountAmount = parseFloat(discount || 0);
-    const finalTotal = total - discountAmount;
-    const netRevenue = totalVatableSales + totalVatExemptSales + totalZeroRatedSales;
+    const finalTotal = subtotal - totalDiscount - discountAmount;
     const amountDue = finalTotal - totalLguTax;
+    const skipInvOps = await shouldSkipInvoiceInventoryCogs(
+      { query },
+      { skip_inventory: !!skip_inventory, dn_id: dn_id || null, so_id: so_id || null },
+    );
 
     await query(
-      `INSERT INTO sales_invoices (id, invoice_number, customer_id, customer_name, customer_type, employee_id, price_mode, invoice_date,
-        due_date, payment_method, payment_terms, status, notes, subtotal, discount, tax, tax_type, total, amount_paid, balance,
-        vatable_sales, vat_exempt_sales, zero_rated_sales, vat_amount, lgu_final_tax, withholding_tax,
-        cashier_id, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_DATE, $8, $9, $10, 'Posted', $11, $12, $13, $14, $15, $16, $17, $18,
-        $19, $20, $21, $22, $23, $24, $25, $26)`,
+       `INSERT INTO sales_invoices (id, invoice_number, customer_id, customer_name, customer_type, employee_id, price_mode, invoice_date,
+         due_date, payment_method, payment_terms, status, notes, terms_conditions, subtotal, discount, tax, tax_type, total, amount_paid, balance,
+         vatable_sales, vat_exempt_sales, zero_rated_sales, vat_amount, lgu_final_tax, withholding_tax, ewt_rate, so_id, dn_id,
+         cashier_id, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_DATE, $8, $9, $10, 'Posted', $11, $12, $13, $14, $15, $16, $17, $18, $19,
+         $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)`,
       [id, invoice_number, isEmployee ? null : customer_id, customer_name, customer_type || 'Customer', isEmployee ? employee_id : null,
         price_mode || 'Retail', due_date, effectivePaymentMethod, payment_terms,
-        notes, subtotal, discountAmount, totalVat, invoice_tax_type || 'VAT',
+        notes, terms_conditions || null, subtotal, discountAmount, totalVat, invoice_tax_type || 'VAT',
         finalTotal, amount_tendered || 0, finalTotal - (amount_tendered || 0),
-        totalVatableSales, totalVatExemptSales, totalZeroRatedSales, totalVat, totalLguTax, totalWht,
+        totalVatableSales, totalVatExemptSales, totalZeroRatedSales, totalVat, totalLguTax, totalWht, ewtPercent, so_id || null, dn_id || null,
         req.user!.id, req.user!.id]
     );
 
@@ -136,22 +106,35 @@ router.post('/invoices', authenticate, hasUserPerm('sales.sales-invoice.create')
       const itemId = uuidv4();
       const locId = item.location_id || 1;
 
+      // Get cost from inventory (always, even when skipping deduction)
       const inv = await query('SELECT * FROM inventory WHERE product_id = $1 AND location_id = $2', [item.product_id, locId]);
       let cost = 0;
       let availableQty = 0;
-
       if (inv.rows.length > 0) {
         cost = parseFloat(inv.rows[0].unit_cost);
         availableQty = parseFloat(inv.rows[0].quantity);
-        if (item.quantity > availableQty) {
+      }
+
+      if (!skipInvOps) {
+        if (inv.rows.length > 0 && item.quantity > availableQty) {
           return res.status(400).json({ error: `Insufficient stock at selected location. Available: ${availableQty}, Requested: ${item.quantity}` });
         }
-        await query('UPDATE inventory SET quantity = $1 WHERE id = $2', [availableQty - item.quantity, inv.rows[0].id]);
-      } else {
-        const setting = await query("SELECT setting_value FROM system_settings WHERE setting_key = 'enable_negative_inventory'");
-        if (setting.rows[0]?.setting_value !== 'true') {
-          return res.status(400).json({ error: `No stock found at selected location.` });
+        if (inv.rows.length === 0) {
+          const setting = await query("SELECT setting_value FROM system_settings WHERE setting_key = 'enable_negative_inventory'");
+          if (setting.rows[0]?.setting_value !== 'true') {
+            return res.status(400).json({ error: `No stock found at selected location.` });
+          }
         }
+        const fefo = await deductInventoryFefo({ query }, {
+          product_id: item.product_id,
+          location_id: locId,
+          quantity: item.quantity,
+          reference_type: 'Sales Invoice',
+          reference_id: id,
+          created_by: req.user!.id,
+        });
+        cost = fefo.unitCost;
+        availableQty = fefo.runningQuantity;
       }
 
       item.cost = cost;
@@ -162,11 +145,6 @@ router.post('/invoices', authenticate, hasUserPerm('sales.sales-invoice.create')
          item.discount || 0, item.tax_amount || 0, item.total, cost, locId, item.tax_type || 'VAT', item.tax_amount || 0, item.selected_variant || null]
       );
 
-      await query(
-        `INSERT INTO inventory_ledger (id, product_id, location_id, reference_type, reference_id, transaction_type, quantity, running_quantity, unit_cost, total_cost, notes, created_by)
-         VALUES ($1, $2, $3, 'Sales Invoice', $4, 'OUT', $5, $6, $7, $8, $9, $10)`,
-        [uuidv4(), item.product_id, locId, id, item.quantity, availableQty - item.quantity, cost, item.quantity * cost, null, req.user!.id]
-      );
     }
 
     if (isEmployee && employee_id) {
@@ -179,7 +157,13 @@ router.post('/invoices', authenticate, hasUserPerm('sales.sales-invoice.create')
     const entryId = uuidv4();
     const entryNumber = await generateRefNumber('JE', 'journal_entries', 'entry_number');
     const totalCogs = invoiceItems.reduce((sum: number, i: any) => sum + (i.quantity * parseFloat(i.cost || 0)), 0);
-    const jeTotal = amountDue + totalCogs;
+    const cogsGlLines = invoiceItems.map((item: any) => ({
+      product_id: item.product_id,
+      cogsGrossAmount: item.quantity * parseFloat(item.cost || 0),
+      tax_type: item.tax_type,
+    }));
+    const glCogs = !skipInvOps && totalCogs > 0 ? sumLineGlCogs(cogsGlLines) : 0;
+    const jeTotal = amountDue + glCogs;
     await query(
       `INSERT INTO journal_entries (id, entry_number, entry_date, reference_type, reference_id, description, total_debit, total_credit, created_by)
        VALUES ($1, $2, CURRENT_DATE, 'Sales Invoice', $3, $4, $5, $5, $6)`,
@@ -222,10 +206,21 @@ router.post('/invoices', authenticate, hasUserPerm('sales.sales-invoice.create')
       }
     }
 
-    // Credit Sales Revenue
-    await query(`INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
-      VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '4000'), $3, 0, $4, 'Sales Invoice', $5)`,
-      [uuidv4(), entryId, `Revenue ${invoice_number}`, netRevenue, id]);
+    // Credit Sales Revenue (by product category)
+    const categoryMap = await loadCategoryAccountsForProducts(
+      { query },
+      invoiceItems.map((item: any) => item.product_id),
+    );
+    const revenueBuckets = aggregateByAccountCode(
+      invoiceItems.map((item: any) => ({
+        product_id: item.product_id,
+        revenueAmount: invoiceLineNetRevenue(item),
+      })),
+      categoryMap,
+      'revenue_account_code',
+      'revenueAmount',
+    );
+    await insertRevenueCreditLines({ query }, entryId, revenueBuckets, 'Sales Invoice', id, `Revenue ${invoice_number}`);
 
     // Credit VAT Payable (12%)
     if (totalVat > 0) {
@@ -241,13 +236,22 @@ router.post('/invoices', authenticate, hasUserPerm('sales.sales-invoice.create')
         [uuidv4(), entryId, `LGU Final VAT ${invoice_number}`, totalLguTax, id]);
     }
 
-    // Debit COGS, Credit Inventory (net-of-VAT for GL)
-    const glCogs = totalCogs / 1.12;
-    if (totalCogs > 0) {
-      await query(`INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
-        VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '5000'), $3, $4, 0, 'Sales Invoice', $5),
-               ($6, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '1200'), $7, 0, $4, 'Sales Invoice', $5)`,
-        [uuidv4(), entryId, `COGS ${invoice_number}`, glCogs, id, uuidv4(), `Inventory ${invoice_number}`]);
+    // Debit COGS, Credit Inventory (net-of-VAT for GL) — skip when DR/SO workflow already expensed inventory
+    if (!skipInvOps && totalCogs > 0) {
+      const cogsBuckets = aggregateGlCogsByAccountCode(
+        invoiceItems.map((item: any) => ({
+          product_id: item.product_id,
+          cogsGrossAmount: item.quantity * parseFloat(item.cost || 0),
+          tax_type: item.tax_type,
+        })),
+        categoryMap,
+      );
+      await insertCogsInventoryLines({ query }, entryId, cogsBuckets, 'Sales Invoice', id, invoice_number);
+    }
+
+    // Link SO and mark as Invoiced
+    if (so_id) {
+      await query("UPDATE sales_orders SET status = 'Invoiced', updated_at = CURRENT_TIMESTAMP WHERE id = $1", [so_id]);
     }
 
     const grossProfit = finalTotal - totalCogs;
@@ -264,7 +268,7 @@ router.post('/invoices', authenticate, hasUserPerm('sales.sales-invoice.create')
   }
 });
 
-router.get('/invoices', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/invoices', authenticate, hasUserPerm('sales.sales-invoice.view'), async (req: AuthRequest, res: Response) => {
   try {
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 50;
@@ -300,7 +304,85 @@ router.get('/invoices', authenticate, async (req: AuthRequest, res: Response) =>
   }
 });
 
-router.get('/invoices/:id', authenticate, async (req: AuthRequest, res: Response) => {
+// Prefill payload for duplicating an invoice (no DB write)
+router.get('/invoices/:id/copy-to-invoice', authenticate, hasUserPerm('sales.sales-invoice.create'), async (req: AuthRequest, res: Response) => {
+  try {
+    const invoice = await query(
+      `SELECT si.*, c.customer_name, c.customer_code, c.address as customer_address,
+              c.phone as customer_phone, c.tin as customer_tin, c.customer_type,
+              so.so_number, sq.sq_number, dn.dr_number
+       FROM sales_invoices si
+       LEFT JOIN customers c ON si.customer_id = c.id
+       LEFT JOIN sales_orders so ON si.so_id = so.id
+       LEFT JOIN sales_quotations sq ON so.sq_id = sq.id
+       LEFT JOIN delivery_notes dn ON si.dn_id = dn.id
+       WHERE si.id = $1`,
+      [req.params.id]
+    );
+    if (invoice.rows.length === 0) return res.status(404).json({ error: 'Invoice not found' });
+    if (['Void', 'Cancelled'].includes(invoice.rows[0].status)) {
+      return res.status(400).json({ error: `Cannot copy ${invoice.rows[0].status} invoice` });
+    }
+
+    const items = await query(
+      `SELECT sii.*, p.name as product_name, p.sku, p.unit_of_measure
+       FROM sales_invoice_items sii
+       LEFT JOIN products p ON sii.product_id = p.id
+       WHERE sii.invoice_id = $1 ORDER BY sii.id`,
+      [req.params.id]
+    );
+    if (items.rows.length === 0) return res.status(400).json({ error: 'No items on invoice' });
+
+    const row = invoice.rows[0];
+    const mappedItems = items.rows.map((i: any) => ({
+      product_id: i.product_id,
+      variant_id: i.variant_id,
+      product_name: i.product_name || '',
+      sku: i.sku || '',
+      unit_of_measure: i.unit_of_measure || '',
+      description: i.description || i.product_name || '',
+      quantity: parseFloat(i.quantity),
+      unit_price: parseFloat(i.unit_price),
+      discount: parseFloat(i.discount || 0),
+      tax_type: i.tax_type || row.tax_type || 'VATable',
+      vat_amount: parseFloat(i.vat_amount || 0),
+      location_id: i.location_id || 1,
+      unit_cost: parseFloat(i.cost || 0),
+    }));
+    const ewtRate = resolveInvoiceEwtRate(row.ewt_rate, mappedItems, row.withholding_tax, row.tax_type || 'VATable');
+    const skipInvForCopy = await shouldSkipInvoiceInventoryCogs(
+      { query },
+      { dn_id: row.dn_id, so_id: row.so_id, invoice_id: row.id },
+    );
+
+    res.json({
+      source_invoice_id: row.id,
+      source_invoice_number: row.invoice_number,
+      source_so_number: row.so_number || null,
+      source_sq_number: row.sq_number || null,
+      source_dr_number: row.dr_number || null,
+      customer_id: row.customer_id,
+      customer_name: row.customer_name,
+      customer_code: row.customer_code || '',
+      customer_tin: row.customer_tin || '',
+      customer_phone: row.customer_phone || '',
+      customer_address: row.customer_address || '',
+      customer_type: row.customer_type || 'Customer',
+      employee_id: row.employee_id,
+      payment_terms: row.payment_terms || '',
+      payment_method: row.payment_method || 'Cash',
+      invoice_tax_type: row.tax_type || 'VATable',
+      ewt_rate: ewtRate,
+      due_date: row.due_date || '',
+      notes: row.notes || '',
+      skip_inventory: skipInvForCopy,
+      duplicate: true,
+      items: mappedItems,
+    });
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+router.get('/invoices/:id', authenticate, hasUserPerm('sales.sales-invoice.view'), async (req: AuthRequest, res: Response) => {
   try {
     const invoice = await query(
       `SELECT si.*, u.full_name as cashier_name, c.customer_name, c.address as customer_address, c.tin as customer_tin,
@@ -315,7 +397,8 @@ router.get('/invoices/:id', authenticate, async (req: AuthRequest, res: Response
     if (invoice.rows.length === 0) return res.status(404).json({ error: 'Invoice not found' });
 
     const items = await query(
-      `SELECT sii.*, p.sku, p.name as product_name
+      `SELECT sii.*, p.sku, p.name as product_name,
+              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
        FROM sales_invoice_items sii
        JOIN products p ON sii.product_id = p.id
        WHERE sii.invoice_id = $1`,
@@ -329,15 +412,8 @@ router.get('/invoices/:id', authenticate, async (req: AuthRequest, res: Response
 });
 
 // Printable Invoice (public via token in query param)
-router.get('/invoices/:id/print', async (req: any, res: Response) => {
+router.get('/invoices/:id/print', authenticate, hasUserPerm('sales.sales-invoice.print'), async (req: any, res: Response) => {
   try {
-    // Authenticate via query token
-    const token = req.query.token as string || (req.headers.authorization || '').replace('Bearer ', '');
-    if (!token) return res.status(401).json({ error: 'Authentication required' });
-    let decoded: any;
-    try { decoded = jwt.verify(token, config.jwtSecret); }
-    catch { return res.status(401).json({ error: 'Invalid token' }); }
-
     const inv = await query(
       `SELECT si.*, u.full_name as cashier_name, c.customer_name, c.customer_code, c.tin as customer_tin, c.address as customer_address, c.phone as customer_phone,
               e.first_name as emp_first, e.last_name as emp_last
@@ -355,7 +431,7 @@ router.get('/invoices/:id/print', async (req: any, res: Response) => {
     const b = biz.rows[0] || {};
 
     const items = await query(
-      `SELECT sii.*, p.sku, p.name as product_name, p.unit_of_measure
+      `SELECT sii.*, p.sku, p.name as product_name, COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
        FROM sales_invoice_items sii JOIN products p ON sii.product_id = p.id WHERE sii.invoice_id = $1 ORDER BY sii.id`,
       [req.params.id]
     );
@@ -363,166 +439,103 @@ router.get('/invoices/:id/print', async (req: any, res: Response) => {
     const totalQty = items.rows.reduce((s: number, r: any) => s + parseFloat(r.quantity), 0);
     const grossTotal = parseFloat(i.subtotal) || 0;
     const discountAmt = parseFloat(i.discount) || 0;
-    const afterDiscount = grossTotal - discountAmt;
     const netOfVAT = parseFloat(i.vatable_sales || 0);
+    const vatExemptSales = parseFloat(i.vat_exempt_sales || 0);
+    const zeroRatedSales = parseFloat(i.zero_rated_sales || 0);
     const vatAmount = parseFloat(i.vat_amount || i.tax || 0);
     const total = parseFloat(i.total) || 0;
     const isCash = i.payment_method === 'Cash';
-    const invoiceType = isCash ? 'CASH SALES INVOICE' : 'CHARGE SALES INVOICE (CREDIT)';
+    const invoiceType = isCash ? 'Cash Sales Invoice' : 'Charge Sales Invoice (Credit)';
 
-    const fc = (val: any) => {
-      const n = parseFloat(val);
-      return isNaN(n) ? '0.00' : n.toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    };
+    const customerName = i.customer_type === 'Employee' && i.emp_first
+      ? `${i.emp_last}, ${i.emp_first}`
+      : (i.customer_name || 'Walk-in');
 
-    const itemRows = items.rows.map((row: any, idx: number) => `
-      <tr>
-        <td style="padding:4px 6px;font-size:10px">${row.product_name || row.description || '-'}</td>
-        <td style="padding:4px 6px;font-size:10px;text-align:center">${parseFloat(row.quantity)}</td>
-        <td style="padding:4px 6px;font-size:10px;text-align:center">${row.unit_of_measure || '-'}</td>
-        <td style="padding:4px 6px;font-size:10px;text-align:right">${fc(row.unit_price)}</td>
-        <td style="padding:4px 6px;font-size:10px;text-align:right">${fc(row.total)}</td>
-      </tr>
-    `).join('');
+    const itemRows = items.rows.map((row: any, idx: number) =>
+      tableRow([
+        { html: String(idx + 1), align: 'c' },
+        { html: row.sku || '—' },
+        { html: row.product_name || row.description || '—' },
+        { html: String(parseFloat(row.quantity)), align: 'c' },
+        { html: row.unit_of_measure || '—', align: 'c' },
+        { html: fmtCurrency(row.unit_price), align: 'r' },
+        { html: fmtCurrency(row.total), align: 'r' },
+      ])
+    ).join('');
 
-    const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Sales Invoice ${i.invoice_number}</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:'Courier New',monospace;font-size:10px;color:#111;padding:8mm 10mm;max-width:210mm;margin:0 auto;letter-spacing:0.2px;text-rendering:optimizeSpeed}
-.company-header{text-align:center;margin-bottom:8px}
-.company-header h1{font-size:18px;font-weight:bold;letter-spacing:4px;margin:0}
-.company-header .tagline{font-size:9px;color:#111;margin:3px 0}
-.company-header .info{font-size:8px;color:#111;margin:2px 0}
-.dot-divider{text-align:center;font-size:11px;font-weight:bold;margin:4px 0;letter-spacing:1px}
-.dot-divider-thin{text-align:center;font-size:10px;color:#444;margin:2px 0;letter-spacing:1px}
-.invoice-title{text-align:center;border:1px dotted #444;padding:6px 0;margin:8px 0}
-.invoice-title h2{font-size:14px;font-weight:bold;letter-spacing:6px;margin:0}
-.invoice-title .sub{font-size:9px;color:#333}
-.details{display:flex;gap:20px;margin:10px 0}
-.details-left{flex:1;border:1px dotted #444;padding:8px 10px}
-.details-right{flex:1;border:1px dotted #444;padding:8px 10px}
-.details-left .label,.details-right .label{font-size:9px;font-weight:bold;text-transform:uppercase;margin-bottom:5px}
-.details p{font-size:9px;margin:2px 0}
-.details .highlight{font-weight:bold;font-size:10px;text-decoration:underline}
-.items-table{width:100%;border-collapse:collapse;margin:10px 0}
-.items-table th{background:#f8f8f8;border:1px dotted #444;padding:5px 6px;font-size:9px;text-align:left;font-weight:bold}
-.items-table td{border:1px dotted #444;padding:4px 6px;font-size:9px}
-.computation{display:flex;justify-content:flex-end;margin:10px 0}
-.comp-table{width:260px;border-collapse:collapse}
-.comp-table td{padding:3px 8px;font-size:9px}
-.comp-table td:last-child{text-align:right}
-.comp-table .total-row{border-top:2px dotted #000;font-size:12px;font-weight:bold}
-.compliance{display:flex;gap:20px;margin:12px 0}
-.compliance-left{flex:1;border:1px dotted #444;padding:8px 10px}
-.compliance-right{flex:1;border:1px dotted #444;padding:8px 10px}
-.compliance h4{font-size:9px;font-weight:bold;text-transform:uppercase;margin-bottom:4px}
-.compliance p{font-size:8px;line-height:1.4;color:#111}
-.signatures{display:flex;justify-content:space-between;margin-top:28px;gap:10px}
-.sig-block{text-align:center;flex:1}
-.sig-block .sig-line{border-bottom:1px solid #000;height:34px;margin-bottom:4px}
-.sig-block .sig-label{font-size:8px;color:#222}
-.footer-note{text-align:center;font-size:7px;color:#666;margin-top:14px}
-@media print{body{padding:5mm 8mm;font-size:10px}}
-</style></head><body>
-
-<!-- Company Header -->
-<div class="company-header">
-  <h1>${b.business_name || 'D METRAN TRADING'}</h1>
-  <div class="tagline">${b.trade_name || 'General Merchandise &amp; Integrated Trade Distribution'}</div>
-  <div class="info">${b.address || ''}${b.city ? ', ' + b.city : ''} | Tel: ${b.telephone_number || b.mobile_number || ''} | Email: ${b.email_address || ''}</div>
-  <div class="info">TIN: ${b.tin_number || '123-456-789-000'} | ${b.vat_type || 'VAT Registered'}</div>
-</div>
-<div class="dot-divider">================================================</div>
-<div class="dot-divider-thin">------------------------------------------------</div>
-
-<!-- Invoice Title -->
-<div class="invoice-title">
-  <h2>${invoiceType}</h2>
-  <div class="sub">VAT Registered | Non-VAT Invoice upon request</div>
-</div>
-
-<!-- Details -->
-<div class="details">
-  <div class="details-left">
-    <div class="label">${isCash ? 'Cash Customer' : 'Charge Customer Account'}</div>
-    ${i.customer_type === 'Employee' && i.emp_first
-      ? `<p><strong>Name:</strong> ${i.emp_last}, ${i.emp_first}</p>`
-      : `<p><strong>Name:</strong> ${i.customer_name || 'Walk-in'}</p>`
+    const summaryRows: { label: string; value: string; total?: boolean }[] = [
+      { label: 'No. of Line Items', value: String(items.rows.length) },
+      { label: 'Total Quantity', value: String(totalQty) },
+      { label: 'Trade Subtotal', value: fmtCurrency(grossTotal) },
+    ];
+    if (discountAmt > 0) summaryRows.push({ label: 'Less Discount', value: fmtCurrency(discountAmt) });
+    if (netOfVAT > 0) {
+      summaryRows.push({ label: 'VATable Sales (Net of VAT)', value: fmtCurrency(netOfVAT) });
     }
-    ${i.customer_address ? `<p><strong>Address:</strong> ${i.customer_address}</p>` : ''}
-    ${i.customer_tin ? `<p><strong>TIN:</strong> ${i.customer_tin}</p>` : ''}
-    ${i.customer_code ? `<p><strong>Customer Code:</strong> ${i.customer_code}</p>` : ''}
-    ${i.notes ? `<p><strong>Notes:</strong> ${i.notes}</p>` : ''}
-  </div>
-  <div class="details-right">
-    <div class="label">Invoice Details</div>
-    <p><strong>Invoice No:</strong> ${i.invoice_number}</p>
-    <p><strong>Date:</strong> ${new Date(i.invoice_date).toLocaleDateString('en-PH', {year:'numeric', month:'long', day:'numeric'})}</p>
-    ${i.payment_terms ? `<p><strong>Credit Terms:</strong> <span class="highlight">${i.payment_terms}</span></p>` : ''}
-    ${i.due_date ? `<p><strong>Due Date:</strong> <span class="highlight">${new Date(i.due_date).toLocaleDateString('en-PH', {year:'numeric', month:'long', day:'numeric'})}</span></p>` : ''}
-    <p><strong>Payment Method:</strong> ${i.payment_method || 'N/A'}</p>
-    <p><strong>Status:</strong> ${i.status}</p>
-  </div>
-</div>
+    if (vatExemptSales > 0) {
+      summaryRows.push({ label: 'VAT Exempt Sales', value: fmtCurrency(vatExemptSales) });
+    }
+    if (zeroRatedSales > 0) {
+      summaryRows.push({ label: 'Zero Rated Sales', value: fmtCurrency(zeroRatedSales) });
+    }
+    if (vatAmount > 0) {
+      summaryRows.push({ label: 'Output VAT (12%)', value: fmtCurrency(vatAmount) });
+    }
+    if (parseFloat(i.lgu_final_tax || 0) > 0) {
+      summaryRows.push({ label: 'LGU Final VAT (5%)', value: fmtCurrency(i.lgu_final_tax) });
+    }
+    if (parseFloat(i.withholding_tax || 0) > 0) {
+      summaryRows.push({ label: 'Withholding Tax', value: fmtCurrency(i.withholding_tax) });
+    }
+    summaryRows.push({ label: 'TOTAL AMOUNT DUE', value: fmtCurrency(total), total: true });
+    if (isCash) {
+      summaryRows.push(
+        { label: 'Amount Tendered', value: fmtCurrency(i.amount_paid) },
+        { label: 'Change', value: fmtCurrency(Math.max(0, parseFloat(i.amount_paid) - total)) },
+      );
+    }
 
-<!-- Items Table -->
-<table class="items-table">
-  <thead><tr>
-    <th>Item Description</th>
-    <th style="width:50px;text-align:center">Qty</th>
-    <th style="width:50px;text-align:center">UOM</th>
-    <th style="width:80px;text-align:right">Unit Price</th>
-    <th style="width:90px;text-align:right">Line Total</th>
-  </tr></thead>
-  <tbody>${itemRows}</tbody>
-</table>
-
-<!-- Computation Box -->
-<div class="computation">
-  <table class="comp-table">
-    <tr><td>Total Items:</td><td>${items.rows.length}</td></tr>
-    <tr><td>Total Quantity:</td><td>${totalQty}</td></tr>
-    <tr><td>Trade Subtotal:</td><td>₱${fc(grossTotal)}</td></tr>
-    ${discountAmt > 0 ? `<tr><td>Less Discount:</td><td>₱${fc(discountAmt)}</td></tr>` : ''}
-    <tr><td>Net of VAT:</td><td>₱${fc(netOfVAT)}</td></tr>
-    <tr><td>Output VAT (12%):</td><td>₱${fc(vatAmount)}</td></tr>
-    ${parseFloat(i.lgu_final_tax || 0) > 0 ? `<tr><td>LGU Final VAT (5%):</td><td>₱${fc(i.lgu_final_tax)}</td></tr>` : ''}
-    ${parseFloat(i.withholding_tax || 0) > 0 ? `<tr><td>Withholding Tax:</td><td>₱${fc(i.withholding_tax)}</td></tr>` : ''}
-    <tr class="total-row"><td>TOTAL AMOUNT DUE:</td><td>₱${fc(total)}</td></tr>
-    ${isCash ? `
-      <tr><td>Amount Tendered:</td><td>₱${fc(i.amount_paid)}</td></tr>
-      <tr><td>Change:</td><td>₱${fc(Math.max(0, parseFloat(i.amount_paid) - total))}</td></tr>
-    ` : ''}
-  </table>
-</div>
-
-<!-- Compliance & Terms -->
-<div class="compliance">
-  <div class="compliance-left">
-    <h4>TAXATION COMPLIANCE INFORMATION</h4>
-    <p>All values declared herein include Output Value Added Tax (VAT) of 12% in compliance with Bureau of Internal Revenue regulations.</p>
-    <p style="margin-top:3px">${b.business_name || 'D METRAN TRADING'} | ${b.vat_type || 'VAT Registered'} TIN #${b.tin_number || '123-456-789-000'}</p>
-  </div>
-  <div class="compliance-right">
-    <h4>TERMS, WARRANTIES &amp; SETTLEMENT CONDITIONS</h4>
-    <p>Payment is due strictly within approved credit terms. Interest of 2.5% monthly will accrue on overdue account ledger balances.</p>
-    <p style="margin-top:3px">Goods once sold are non-refundable. Warranty claims must be filed within 7 days of receipt.</p>
-  </div>
-</div>
-
-<!-- Signatures -->
-<div class="signatures">
-  <div class="sig-block"><div class="sig-line"></div><div class="sig-label">Prepared by</div></div>
-  <div class="sig-block"><div class="sig-line"></div><div class="sig-label">Checked by</div></div>
-  <div class="sig-block"><div class="sig-line"></div><div class="sig-label">Approved by</div></div>
-  <div class="sig-block"><div class="sig-line"></div><div class="sig-label">Received by</div></div>
-</div>
-
-<div class="footer-note">
-  Printed: ${new Date().toLocaleString('en-PH')} | This is a computer-generated document | Valid without signature
-</div>
-
-</body></html>`;
+    const html = buildSalesEnterpriseDocument({
+      pageTitle: `Sales Invoice ${i.invoice_number}`,
+      docTitle: 'Sales Invoice',
+      docMetaRows: [
+        { label: 'Document No.', value: i.invoice_number || '—' },
+        { label: 'Document Date', value: fmtDate(i.invoice_date, 'short') },
+        ...(i.due_date ? [{ label: 'Due Date', value: fmtDate(i.due_date, 'short') }] : []),
+        { label: 'Status', value: String(i.status || 'Draft').toUpperCase() },
+      ],
+      customerRows: buildCustomerMetaRows({
+        name: customerName,
+        address: i.customer_address,
+        tin: i.customer_tin,
+        code: i.customer_code,
+      }),
+      detailsTitle: 'Invoice Details',
+      detailsRows: [
+        { label: 'Invoice Type', value: invoiceType },
+        { label: 'Payment Method', value: i.payment_method || 'N/A' },
+        ...(i.payment_terms ? [{ label: 'Credit Terms', value: i.payment_terms }] : []),
+        { label: 'Cashier', value: i.cashier_name || '—' },
+        { label: 'Currency', value: String(b.currency || 'PHP') },
+      ],
+      itemHeaders: SALES_LINE_ITEM_HEADERS,
+      itemRows,
+      summaryRows,
+      bottomLeftHtml: [
+        renderEnterpriseNotesBlock(
+          'Taxation Compliance Information',
+          `All values declared herein include Output Value Added Tax (VAT) of 12% in compliance with Bureau of Internal Revenue regulations. ${b.business_name || 'D METRAN TRADING'} | ${b.vat_type || 'VAT Registered'} TIN #${b.tin_number || '—'}`,
+        ),
+        renderEnterpriseNotesBlock(
+          'Terms, Warranties & Settlement Conditions',
+          i.terms_conditions?.trim() || 'Payment is due strictly within approved credit terms. Interest of 2.5% monthly will accrue on overdue account ledger balances. Goods once sold are non-refundable. Warranty claims must be filed within 7 days of receipt.',
+        ),
+        ...(i.notes ? [renderEnterpriseNotesBlock('Remarks', i.notes)] : []),
+      ].join(''),
+      footerNote: 'This is a system-generated sales invoice.',
+      status: i.status,
+      biz: b,
+    });
 
     res.send(html);
   } catch (error: any) {
@@ -531,7 +544,7 @@ body{font-family:'Courier New',monospace;font-size:10px;color:#111;padding:8mm 1
 });
 
 // Void invoice
-router.patch('/invoices/:id/void', authenticate, auditLog('Sales', 'Void Invoice'), async (req: AuthRequest, res: Response) => {
+router.patch('/invoices/:id/void', authenticate, hasUserPerm('sales.sales-invoice.edit'), auditLog('Sales', 'Void Invoice'), async (req: AuthRequest, res: Response) => {
   const client = await getClient();
   try {
     await client.query('BEGIN');
@@ -540,25 +553,40 @@ router.patch('/invoices/:id/void', authenticate, auditLog('Sales', 'Void Invoice
     if (invoice.rows.length === 0) return res.status(404).json({ error: 'Invoice not found' });
 
     const inv = invoice.rows[0];
+    auditBefore(req, auditSnapshot(inv, AUDIT_FIELDS.salesInvoice));
 
     await client.query(
       "UPDATE sales_invoices SET status = 'Void', updated_at = CURRENT_TIMESTAMP WHERE id = $1",
       [req.params.id]
     );
 
-    // Restore inventory at the original location
-    const items = await client.query('SELECT sii.*, inv.location_id FROM sales_invoice_items sii JOIN inventory inv ON sii.product_id = inv.product_id WHERE sii.invoice_id = $1', [req.params.id]);
-    for (const item of items.rows) {
-      const locId = item.location_id || 1;
-      await client.query('UPDATE inventory SET quantity = quantity + $1 WHERE product_id = $2 AND location_id = $3',
-        [item.quantity, item.product_id, locId]);
+    const skipInvOps = await shouldSkipInvoiceInventoryCogs(client, {
+      dn_id: inv.dn_id,
+      so_id: inv.so_id,
+      invoice_id: req.params.id,
+    });
 
-      // Inventory ledger entry for void
-      await client.query(
-        `INSERT INTO inventory_ledger (id, product_id, location_id, reference_type, reference_id, transaction_type, quantity, created_by)
-         VALUES ($1, $2, $3, 'Void Invoice', $4, 'IN', $5, $6)`,
-        [uuidv4(), item.product_id, locId, req.params.id, item.quantity, req.user!.id]
-      );
+    // Restore inventory only when this invoice deducted stock (not when DR/SO already did)
+    const items = await client.query('SELECT sii.*, inv.location_id FROM sales_invoice_items sii JOIN inventory inv ON sii.product_id = inv.product_id WHERE sii.invoice_id = $1', [req.params.id]);
+    const hadInvoiceInventoryDeduction = (await client.query(
+      `SELECT 1 FROM inventory_ledger
+       WHERE reference_id = $1 AND reference_type IN ('Sales Invoice', 'Sales Invoice Edit')
+       LIMIT 1`,
+      [req.params.id],
+    )).rows.length > 0;
+
+    if (hadInvoiceInventoryDeduction) {
+      for (const item of items.rows) {
+        const locId = item.location_id || 1;
+        await client.query('UPDATE inventory SET quantity = quantity + $1 WHERE product_id = $2 AND location_id = $3',
+          [item.quantity, item.product_id, locId]);
+
+        await client.query(
+          `INSERT INTO inventory_ledger (id, product_id, location_id, reference_type, reference_id, transaction_type, quantity, created_by)
+           VALUES ($1, $2, $3, 'Void Invoice', $4, 'IN', $5, $6)`,
+          [uuidv4(), item.product_id, locId, req.params.id, item.quantity, req.user!.id]
+        );
+      }
     }
 
     // Reverse customer/employee balance (creation added total minus lgu+wht, not full total)
@@ -581,7 +609,27 @@ router.patch('/invoices/:id/void', authenticate, auditLog('Sales', 'Void Invoice
     const netRevenue = Math.max(0, revenue - totalTax - lguTax);
     const isEmployee = inv.customer_type === 'Employee';
     const creditAccount = isEmployee ? '1120' : (parseFloat(inv.amount_paid) >= finalTotal ? '1000' : '1100');
-    const jeTotal = finalTotal + totalCogs;
+    const voidCogsGlLines = items.rows.map((i: any) => ({
+      product_id: i.product_id,
+      cogsGrossAmount: parseFloat(i.quantity) * parseFloat(i.cost || 0),
+      tax_type: i.tax_type,
+    }));
+    const glCogs = !skipInvOps && totalCogs > 0 ? sumLineGlCogs(voidCogsGlLines) : 0;
+    const jeTotal = finalTotal + glCogs;
+
+    const voidCategoryMap = await loadCategoryAccountsForProducts(
+      client,
+      items.rows.map((i: any) => i.product_id),
+    );
+    const voidRevenueBuckets = aggregateByAccountCode(
+      items.rows.map((i: any) => ({
+        product_id: i.product_id,
+        revenueAmount: storedInvoiceItemNetRevenue(i),
+      })),
+      voidCategoryMap,
+      'revenue_account_code',
+      'revenueAmount',
+    );
 
     await client.query(
       `INSERT INTO journal_entries (id, entry_number, entry_date, reference_type, reference_id, description, total_debit, total_credit, created_by)
@@ -589,15 +637,15 @@ router.patch('/invoices/:id/void', authenticate, auditLog('Sales', 'Void Invoice
       [voidEntryId, voidEntryNumber, req.params.id, `Void Invoice ${inv.invoice_number}`, jeTotal, req.user!.id]
     );
 
-    // Reverse: Debit Revenue, Debit VAT, Credit appropriate AR/Cash account
+    // Reverse: Debit Revenue (by category), Debit VAT, Credit appropriate AR/Cash account
+    await insertRevenueDebitLines(
+      client, voidEntryId, voidRevenueBuckets, 'Void Invoice', req.params.id, `Reverse Revenue ${inv.invoice_number}`,
+    );
     await client.query(
       `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
-       VALUES
-         ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '4000'), $3, $4, 0, 'Void Invoice', $5),
-         ($6, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '2100'), $7, $8, 0, 'Void Invoice', $5),
-         ($9, $2, (SELECT id FROM chart_of_accounts WHERE account_code = $10), $11, 0, $12, 'Void Invoice', $5)`,
-      [uuidv4(), voidEntryId, `Reverse Revenue ${inv.invoice_number}`, netRevenue, req.params.id,
-       uuidv4(), `Reverse VAT ${inv.invoice_number}`, totalTax,
+       VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '2100'), $3, $4, 0, 'Void Invoice', $5),
+              ($6, $2, (SELECT id FROM chart_of_accounts WHERE account_code = $7), $8, 0, $9, 'Void Invoice', $5)`,
+      [uuidv4(), voidEntryId, `Reverse VAT ${inv.invoice_number}`, totalTax, req.params.id,
        uuidv4(), creditAccount, `Reverse ${isEmployee ? 'Employee Receivable' : 'Cash/AR'} ${inv.invoice_number}`, finalTotal]
     );
 
@@ -619,14 +667,11 @@ router.patch('/invoices/:id/void', authenticate, auditLog('Sales', 'Void Invoice
       );
     }
 
-    // Reverse COGS: Credit COGS, Debit Inventory
-    if (totalCogs > 0) {
-      await client.query(
-        `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
-         VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '1200'), $3, $4, 0, 'Void Invoice', $5),
-                ($6, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '5000'), $7, 0, $4, 'Void Invoice', $5)`,
-        [uuidv4(), voidEntryId, `Reverse Inventory ${inv.invoice_number}`, totalCogs, req.params.id,
-         uuidv4(), `Reverse COGS ${inv.invoice_number}`]
+    // Reverse COGS: Credit COGS (by category), Debit Inventory — skip when DR/SO workflow already expensed inventory
+    if (!skipInvOps && totalCogs > 0) {
+      const voidCogsBuckets = aggregateGlCogsByAccountCode(voidCogsGlLines, voidCategoryMap);
+      await insertCogsInventoryReversalLines(
+        client, voidEntryId, voidCogsBuckets, 'Void Invoice', req.params.id, `Reverse ${inv.invoice_number}`,
       );
     }
 
@@ -643,7 +688,13 @@ router.patch('/invoices/:id/void', authenticate, auditLog('Sales', 'Void Invoice
     }
 
     await client.query('COMMIT');
-    res.json({ message: 'Invoice voided' });
+    auditAfter(req, {
+      id: req.params.id,
+      invoice_number: inv.invoice_number,
+      status: 'Void',
+      reason: reason || null,
+    });
+    res.json({ message: 'Invoice voided', id: req.params.id, invoice_number: inv.invoice_number, status: 'Void' });
   } catch (error: any) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: error.message });
@@ -653,7 +704,7 @@ router.patch('/invoices/:id/void', authenticate, auditLog('Sales', 'Void Invoice
 });
 
 // Edit invoice
-router.patch('/invoices/:id', authenticate, auditLog('Sales', 'Edit Invoice'), async (req: AuthRequest, res: Response) => {
+router.patch('/invoices/:id', authenticate, hasUserPerm('sales.sales-invoice.edit'), auditLog('Sales', 'Edit Invoice'), async (req: AuthRequest, res: Response) => {
   const client = await getClient();
   try {
     await client.query('BEGIN');
@@ -663,17 +714,33 @@ router.patch('/invoices/:id', authenticate, auditLog('Sales', 'Edit Invoice'), a
     if (!['Draft','Posted','Partial'].includes(old.status)) {
       await client.query('ROLLBACK'); return res.status(400).json({ error: `Cannot edit invoice with status ${old.status}` });
     }
+    auditBefore(req, auditSnapshot(old, AUDIT_FIELDS.salesInvoice));
 
     const { customer_id, customer_name, customer_type, employee_id, price_mode, due_date,
-            payment_method, payment_terms, notes, invoice_tax_type, ewt_rate, items } = req.body;
+            payment_method, payment_terms, notes, terms_conditions, invoice_tax_type, ewt_rate, items, skip_inventory } = req.body;
     if (!items || items.length === 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Items required' }); }
 
     const ewtPercent = parseFloat(ewt_rate || '0');
+    const skipInvOps = await shouldSkipInvoiceInventoryCogs(client, {
+      skip_inventory: skip_inventory === true,
+      dn_id: old.dn_id,
+      so_id: old.so_id,
+      invoice_id: req.params.id,
+    });
+    const originalLedger = await client.query(
+      `SELECT 1 FROM inventory_ledger
+       WHERE reference_id = $1 AND reference_type IN ('Sales Invoice', 'Sales Invoice Edit')
+       LIMIT 1`,
+      [req.params.id],
+    );
+    const hadOriginalInventoryDeduction = originalLedger.rows.length > 0;
 
     // ---- Reverse old ----
     const oldItems = await client.query('SELECT sii.*, i.location_id FROM sales_invoice_items sii JOIN inventory i ON sii.product_id = i.product_id WHERE sii.invoice_id = $1', [req.params.id]);
-    for (const oi of oldItems.rows) {
-      await client.query('UPDATE inventory SET quantity = quantity + $1 WHERE product_id = $2 AND location_id = $3', [oi.quantity, oi.product_id, oi.location_id || 1]);
+    if (hadOriginalInventoryDeduction) {
+      for (const oi of oldItems.rows) {
+        await client.query('UPDATE inventory SET quantity = quantity + $1 WHERE product_id = $2 AND location_id = $3', [oi.quantity, oi.product_id, oi.location_id || 1]);
+      }
     }
     const oldLgu = parseFloat(old.lgu_final_tax || 0);
     const oldWht = parseFloat(old.withholding_tax || 0);
@@ -687,48 +754,37 @@ router.patch('/invoices/:id', authenticate, auditLog('Sales', 'Edit Invoice'), a
     await client.query('DELETE FROM sales_invoice_items WHERE invoice_id = $1', [req.params.id]);
 
     // ---- Compute new ----
-    const invoiceItems = (items || []).map((item: any) => {
-      const qty = parseFloat(item.quantity || '0');
-      const price = parseFloat(item.unit_price || '0');
-      const disc = parseFloat(item.discount || '0');
-      const gross = qty * price;
-      const discountAmt = gross * (disc / 100);
-      const netAfterDisc = gross - discountAmt;
-      const taxType = item.tax_type || invoice_tax_type || 'VAT';
-      let lineTax = 0, itemVatable = 0, itemVat = 0, itemLgu = 0, itemWht = 0, lineFinal = 0;
-      if (taxType === 'VAT' || taxType === 'VATable') {
-        itemVatable = netAfterDisc / 1.12; lineTax = netAfterDisc - itemVatable;
-        if (ewtPercent > 0) itemWht = itemVatable * (ewtPercent / 100);
-        lineFinal = netAfterDisc;
-      } else if (taxType === 'VAT Exempt') {
-        itemVatable = netAfterDisc; lineFinal = netAfterDisc;
-        if (ewtPercent > 0) itemWht = netAfterDisc * (ewtPercent / 100);
-      } else if (taxType === 'LGU' || taxType === 'LGU 5% Final VAT') {
-        const nv = netAfterDisc / 1.12; lineTax = netAfterDisc - nv;
-        itemLgu = nv * 0.05; itemWht = nv * 0.01; itemVatable = nv; lineFinal = netAfterDisc;
-      }
-      return { ...item, quantity: qty, unit_price: price, discount: disc, tax_type: taxType, tax_amount: lineTax,
-        total: lineFinal, vatable: itemVatable, vat: lineTax - itemLgu, lgu: itemLgu, wht: itemWht, gross, discountAmt, netAfterDisc };
-    });
+    const { lines: invoiceItems, totals } = calculateInvoiceItems(items || [], ewtPercent, invoice_tax_type || 'VAT');
+    const {
+      subtotal: totalSubtotal, totalDiscount: totalDisc, totalVat, totalLguTax: totalLgu,
+      totalWht, totalVatableSales: totalVatable, totalVatExemptSales, totalZeroRatedSales,
+    } = totals;
+    let totalCogs = 0;
 
-    let totalSubtotal = 0, totalDisc = 0, totalVatable = 0, totalVat = 0, totalLgu = 0, totalWht = 0, totalCogs = 0;
     for (const item of invoiceItems) {
-      totalSubtotal += item.gross; totalDisc += item.discountAmt; totalVatable += item.vatable;
-      totalVat += item.vat; totalLgu += item.lgu; totalWht += item.wht;
       const locId = item.location_id || 1;
       const invRow = await client.query('SELECT * FROM inventory WHERE product_id = $1 AND location_id = $2', [item.product_id, locId]);
-      const cost = invRow.rows[0] ? parseFloat(invRow.rows[0].unit_cost) : 0;
+      let cost = invRow.rows[0] ? parseFloat(invRow.rows[0].unit_cost) : 0;
       const avQty = invRow.rows[0] ? parseFloat(invRow.rows[0].quantity) : 0;
-      item.cost = cost;
-      if (item.quantity > avQty) {
-        const setting = await client.query("SELECT setting_value FROM system_settings WHERE setting_key = 'enable_negative_inventory'");
-        if (setting.rows[0]?.setting_value !== 'true') { await client.query('ROLLBACK'); return res.status(400).json({ error: `Insufficient stock for ${item.description || item.product_id}` }); }
+      if (!skipInvOps) {
+        if (item.quantity > avQty) {
+          const setting = await client.query("SELECT setting_value FROM system_settings WHERE setting_key = 'enable_negative_inventory'");
+          if (setting.rows[0]?.setting_value !== 'true') { await client.query('ROLLBACK'); return res.status(400).json({ error: `Insufficient stock for ${item.description || item.product_id}` }); }
+        }
+        const fefo = await deductInventoryFefo(client, {
+          product_id: item.product_id,
+          location_id: locId,
+          quantity: item.quantity,
+          reference_type: 'Sales Invoice Edit',
+          reference_id: req.params.id,
+          created_by: req.user!.id,
+        });
+        cost = fefo.unitCost;
+        totalCogs += fefo.totalCost;
+      } else {
+        totalCogs += item.quantity * cost;
       }
-      await client.query('UPDATE inventory SET quantity = quantity - $1 WHERE product_id = $2 AND location_id = $3', [item.quantity, item.product_id, locId]);
-      const newQty = avQty - item.quantity;
-      await client.query(`INSERT INTO inventory_ledger (id, product_id, location_id, reference_type, reference_id, transaction_type, quantity, running_quantity, unit_cost, total_cost, created_by)
-        VALUES ($1,$2,$3,'Sales Invoice Edit',$4,'OUT',$5,$6,$7,$8,$9)`, [uuidv4(), item.product_id, locId, req.params.id, item.quantity, newQty, cost, item.quantity * cost, req.user!.id]);
-      totalCogs += item.quantity * cost;
+      item.cost = cost;
 
       await client.query(`INSERT INTO sales_invoice_items (id, invoice_id, product_id, variant_id, description, quantity, unit_price, discount, tax, total, cost, location_id, tax_type, vat_amount, selected_variant)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
@@ -740,11 +796,11 @@ router.patch('/invoices/:id', authenticate, auditLog('Sales', 'Edit Invoice'), a
     const amountDue = finalTotal - totalLgu;
 
     await client.query(`UPDATE sales_invoices SET customer_id=$1, customer_name=$2, customer_type=$3, employee_id=$4, price_mode=$5,
-      due_date=$6, payment_method=$7, payment_terms=$8, notes=$9, subtotal=$10, discount=$11, tax=$12, tax_type=$13, total=$14,
-      vatable_sales=$15, vat_amount=$16, lgu_final_tax=$17, withholding_tax=$18, balance=$19, updated_at=CURRENT_TIMESTAMP WHERE id=$20`,
+      due_date=$6, payment_method=$7, payment_terms=$8, notes=$9, terms_conditions=$10, subtotal=$11, discount=$12, tax=$13, tax_type=$14, total=$15,
+      vatable_sales=$16, vat_exempt_sales=$17, zero_rated_sales=$18, vat_amount=$19, lgu_final_tax=$20, withholding_tax=$21, ewt_rate=$22, balance=$23, updated_at=CURRENT_TIMESTAMP WHERE id=$24`,
       [customer_type === 'Employee' ? null : customer_id, customer_name, customer_type || 'Customer', customer_type === 'Employee' ? employee_id : null,
-       price_mode || 'Retail', due_date, payment_method, payment_terms, notes, totalSubtotal, totalDisc, totalVat, invoice_tax_type || 'VAT',
-       finalTotal, totalVatable, totalVat, totalLgu, totalWht, finalTotal - parseFloat(old.amount_paid), req.params.id]);
+       price_mode || 'Retail', due_date, payment_method, payment_terms, notes, terms_conditions || null, totalSubtotal, totalDisc, totalVat, invoice_tax_type || 'VAT',
+       finalTotal, totalVatable, totalVatExemptSales, totalZeroRatedSales, totalVat, totalLgu, totalWht, ewtPercent, finalTotal - parseFloat(old.amount_paid), req.params.id]);
 
     if (customer_type === 'Employee' && employee_id) {
       await client.query('UPDATE employees SET grocery_credit_balance = grocery_credit_balance + $1 WHERE id = $2', [amountDue, employee_id]);
@@ -755,8 +811,13 @@ router.patch('/invoices/:id', authenticate, auditLog('Sales', 'Edit Invoice'), a
     // New journal entry
     const entryId = uuidv4();
     const entryNumber = await generateRefNumber('JE', 'journal_entries', 'entry_number');
-    const netRevenue = totalVatable + (items.filter((i:any) => i.tax_type === 'VAT Exempt').reduce((s:number,i:any)=>s+(parseFloat(i.quantity)*parseFloat(i.unit_price)),0));
-    const glCogs = totalCogs / 1.12;
+    const netRevenue = totalVatable + totalVatExemptSales + totalZeroRatedSales;
+    const editCogsGlLines = invoiceItems.map((item: any) => ({
+      product_id: item.product_id,
+      cogsGrossAmount: item.quantity * parseFloat(item.cost || 0),
+      tax_type: item.tax_type,
+    }));
+    const glCogs = !skipInvOps && totalCogs > 0 ? sumLineGlCogs(editCogsGlLines) : 0;
     const jeTotal = amountDue + glCogs;
     await client.query(`INSERT INTO journal_entries (id, entry_number, entry_date, reference_type, reference_id, description, total_debit, total_credit, created_by)
       VALUES ($1,$2,CURRENT_DATE,'Sales Invoice',$3,$4,$5,$5,$6)`, [entryId, entryNumber, req.params.id, `Sales Invoice ${old.invoice_number} (edited)`, jeTotal, req.user!.id]);
@@ -767,8 +828,22 @@ router.patch('/invoices/:id', authenticate, auditLog('Sales', 'Edit Invoice'), a
       await client.query(`INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
         VALUES ($1,$2,(SELECT id FROM chart_of_accounts WHERE account_code='1100'),$3,$4,0,'Sales Invoice',$5)`, [uuidv4(), entryId, `AR ${old.invoice_number}`, amountDue, req.params.id]);
     }
-    await client.query(`INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
-      VALUES ($1,$2,(SELECT id FROM chart_of_accounts WHERE account_code='4000'),$3,0,$4,'Sales Invoice',$5)`, [uuidv4(), entryId, `Revenue ${old.invoice_number}`, netRevenue, req.params.id]);
+    const editCategoryMap = await loadCategoryAccountsForProducts(
+      client,
+      invoiceItems.map((item: any) => item.product_id),
+    );
+    const editRevenueBuckets = aggregateByAccountCode(
+      invoiceItems.map((item: any) => ({
+        product_id: item.product_id,
+        revenueAmount: invoiceLineNetRevenue(item),
+      })),
+      editCategoryMap,
+      'revenue_account_code',
+      'revenueAmount',
+    );
+    await insertRevenueCreditLines(
+      client, entryId, editRevenueBuckets, 'Sales Invoice', req.params.id, `Revenue ${old.invoice_number}`,
+    );
     if (totalVat > 0) {
       await client.query(`INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
         VALUES ($1,$2,(SELECT id FROM chart_of_accounts WHERE account_code='2100'),$3,0,$4,'Sales Invoice',$5)`, [uuidv4(), entryId, `VAT ${old.invoice_number}`, totalVat, req.params.id]);
@@ -777,13 +852,32 @@ router.patch('/invoices/:id', authenticate, auditLog('Sales', 'Edit Invoice'), a
       await client.query(`INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
         VALUES ($1,$2,(SELECT id FROM chart_of_accounts WHERE account_code='2110'),$3,0,$4,'Sales Invoice',$5)`, [uuidv4(), entryId, `LGU Final VAT ${old.invoice_number}`, totalLgu, req.params.id]);
     }
-    if (totalCogs > 0) {
-      await client.query(`INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
-        VALUES ($1,$2,(SELECT id FROM chart_of_accounts WHERE account_code='5000'),$3,$4,0,'Sales Invoice',$5),
-               ($6,$2,(SELECT id FROM chart_of_accounts WHERE account_code='1200'),$7,0,$4,'Sales Invoice',$5)`,
-        [uuidv4(), entryId, `COGS ${old.invoice_number}`, glCogs, req.params.id, uuidv4(), `Inventory ${old.invoice_number}`]);
+    if (!skipInvOps && totalCogs > 0) {
+      const editCogsBuckets = aggregateGlCogsByAccountCode(editCogsGlLines, editCategoryMap);
+      await insertCogsInventoryLines(
+        client, entryId, editCogsBuckets, 'Sales Invoice', req.params.id, old.invoice_number,
+      );
     }
     await client.query('COMMIT');
+    auditAfter(req, auditSnapshot({
+      id: req.params.id,
+      invoice_number: old.invoice_number,
+      status: old.status,
+      customer_id,
+      customer_name,
+      total: finalTotal,
+      subtotal: totalSubtotal,
+      discount: totalDisc,
+      vat_amount: totalVat,
+      withholding_tax: totalWht,
+      ewt_rate: ewtPercent,
+      lgu_final_tax: totalLgu,
+      balance: finalTotal - parseFloat(old.amount_paid),
+      payment_method,
+      payment_terms,
+      due_date,
+      tax_type: invoice_tax_type || 'VAT',
+    }, AUDIT_FIELDS.salesInvoice));
     res.json({ id: req.params.id, invoice_number: old.invoice_number });
   } catch (error: any) { await client.query('ROLLBACK'); res.status(500).json({ error: error.message }); } finally { client.release(); }
 });
@@ -791,7 +885,7 @@ router.patch('/invoices/:id', authenticate, auditLog('Sales', 'Edit Invoice'), a
 // ==================== COLLECTION RECEIPTS ====================
 router.post('/collections', authenticate, hasUserPerm('sales.collections.create'), auditLog('Sales', 'Create Collection'), async (req: AuthRequest, res: Response) => {
   try {
-    const { customer_id, invoice_id, payment_method, reference_number, amount, notes, bank_account_id, collection_date, ewt_amount, lgu_amount, allocations, check_date, check_bank } = req.body;
+    const { customer_id, invoice_id, payment_method, reference_number, amount, notes, terms_conditions, bank_account_id, collection_date, ewt_amount, lgu_amount, allocations, check_date, check_bank } = req.body;
 
     const payDate = collection_date || new Date().toISOString().split('T')[0];
 
@@ -833,9 +927,9 @@ router.post('/collections', authenticate, hasUserPerm('sales.collections.create'
 
       // One master receipt
       await query(
-        `INSERT INTO collection_receipts (id, receipt_number, customer_id, payment_date, payment_method, reference_number, bank_account_id, amount, notes, check_date, check_bank, created_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-        [receiptId, receipt_number, customer_id, payDate, payment_method, reference_number, bank_account_id || null, totalApplied, notes, check_date || null, check_bank || null, req.user!.id]
+        `INSERT INTO collection_receipts (id, receipt_number, customer_id, payment_date, payment_method, reference_number, bank_account_id, amount, notes, terms_conditions, check_date, check_bank, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+        [receiptId, receipt_number, customer_id, payDate, payment_method, reference_number, bank_account_id || null, totalApplied, notes, terms_conditions || null, check_date || null, check_bank || null, req.user!.id]
       );
 
       // Insert allocation rows + update each invoice
@@ -960,9 +1054,15 @@ router.post('/collections', authenticate, hasUserPerm('sales.collections.create'
     const id = uuidv4();
 
     await query(
-      `INSERT INTO collection_receipts (id, receipt_number, customer_id, invoice_id, payment_date, payment_method, reference_number, bank_account_id, amount, notes, check_date, check_bank, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-      [id, receipt_number, customer_id, invoice_id, payDate, payment_method, reference_number, bank_account_id || null, appliedAmount, notes, check_date || null, check_bank || null, req.user!.id]
+      `INSERT INTO collection_receipts (id, receipt_number, customer_id, invoice_id, payment_date, payment_method, reference_number, bank_account_id, amount, notes, terms_conditions, check_date, check_bank, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+      [id, receipt_number, customer_id, invoice_id, payDate, payment_method, reference_number, bank_account_id || null, appliedAmount, notes, terms_conditions || null, check_date || null, check_bank || null, req.user!.id]
+    );
+
+    await query(
+      `INSERT INTO collection_receipt_allocations (id, receipt_id, invoice_id, applied_amount, ewt_amount, lgu_amount)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [uuidv4(), id, invoice_id, appliedAmount, ewtAmt, lguAmt]
     );
 
     const newPaid = parseFloat(inv.rows[0].amount_paid) + appliedAmount;
@@ -1053,13 +1153,13 @@ router.post('/collections', authenticate, hasUserPerm('sales.collections.create'
 });
 
 // Outstanding AR with aging
-router.get('/outstanding-ar', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/outstanding-ar', authenticate, hasUserPerm('sales.collections.view'), async (req: AuthRequest, res: Response) => {
   try {
     const result = await query(`
       SELECT si.id AS invoice_id, si.invoice_number, si.invoice_date, si.due_date, si.total,
              si.subtotal, si.discount, si.amount_paid, si.balance, si.status, si.customer_name, si.customer_id,
              si.tax_type, si.vatable_sales, si.vat_exempt_sales, si.zero_rated_sales,
-             si.vat_amount, si.lgu_final_tax, si.withholding_tax,
+             si.vat_amount, si.lgu_final_tax, si.withholding_tax, si.ewt_rate,
              c.customer_code,
              CURRENT_DATE - si.due_date AS days_overdue,
              CASE
@@ -1081,7 +1181,7 @@ router.get('/outstanding-ar', authenticate, async (req: AuthRequest, res: Respon
   }
 });
 
-router.get('/collections', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/collections', authenticate, hasUserPerm('sales.collections.view'), async (req: AuthRequest, res: Response) => {
   try {
     const result = await query(
       `SELECT cr.*, c.customer_name,
@@ -1099,7 +1199,7 @@ router.get('/collections', authenticate, async (req: AuthRequest, res: Response)
 });
 
 // Customer Statements — unpaid invoices grouped by customer
-router.get('/customer-statements', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/customer-statements', authenticate, hasUserPerm('sales.collections.view'), async (req: AuthRequest, res: Response) => {
   try {
     const search = req.query.search as string || '';
     const from = req.query.from as string || '2020-01-01';
@@ -1126,7 +1226,7 @@ router.get('/customer-statements', authenticate, async (req: AuthRequest, res: R
 });
 
 // Customer Statement Detail — invoices + payment history for one customer
-router.get('/customer-statement/:customerId', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/customer-statement/:customerId', authenticate, hasUserPerm('sales.collections.view'), async (req: AuthRequest, res: Response) => {
   try {
     const cust = await query('SELECT * FROM customers WHERE id = $1', [req.params.customerId]);
     if (cust.rows.length === 0) return res.status(404).json({ error: 'Customer not found' });
@@ -1170,13 +1270,9 @@ router.get('/customer-statement/:customerId', authenticate, async (req: AuthRequ
   }
 });
 
-// Customer Statement Print — dot-matrix
-router.get('/customer-statement/:customerId/print', async (req: AuthRequest, res: Response) => {
+// Customer Statement Print
+router.get('/customer-statement/:customerId/print', authenticate, hasUserPerm('sales.collections.print'), async (req: AuthRequest, res: Response) => {
   try {
-    const token = req.query.token as string || (req.headers.authorization || '').replace('Bearer ', '');
-    if (!token) return res.status(401).json({ error: 'Auth required' });
-    try { jwt.verify(token, config.jwtSecret); } catch { return res.status(401).json({ error: 'Invalid token' }); }
-
     const cust = await query('SELECT * FROM customers WHERE id = $1', [req.params.customerId]);
     if (cust.rows.length === 0) return res.status(404).send('Not found');
     const c = cust.rows[0];
@@ -1188,14 +1284,8 @@ router.get('/customer-statement/:customerId/print', async (req: AuthRequest, res
 
     const biz = await query('SELECT * FROM business_details WHERE id = 1');
     const b = biz.rows[0] || {};
-    const bizName = 'D METRAN TRADING';
-    const bizProp = 'Donnel M. Metran - Prop.';
-    const bizVat = 'VAT REG TIN: 418 944 134 000';
-    const bizAddress = 'New Public Market, Sta. Cruz, Zambales 2213';
 
     const totalOutstanding = invoices.rows.reduce((s: number, i: any) => s + parseFloat(i.balance), 0);
-    const fmtCurrency = (n: number) => '₱' + n.toLocaleString('en-PH', { minimumFractionDigits: 2 });
-    const fmtDate = (d: string) => d ? new Date(d).toLocaleDateString('en-PH', { year: 'numeric', month: 'short', day: 'numeric' }) : '—';
 
     const aged = { current: 0, d30: 0, d60: 0, d90: 0, over90: 0 };
     for (const inv of invoices.rows) {
@@ -1208,46 +1298,154 @@ router.get('/customer-statement/:customerId/print', async (req: AuthRequest, res
       else aged.over90 += bal;
     }
 
-    const rows = invoices.rows.map((i: any) => {
-      const days = Math.floor((new Date().getTime() - new Date(i.invoice_date).getTime()) / 86400000);
-      const daysDue = Math.floor((new Date().getTime() - new Date(i.due_date || i.invoice_date).getTime()) / 86400000);
-      return `<tr><td>${fmtDate(i.invoice_date)}</td><td>${i.invoice_number}</td><td>${i.notes || ''}</td><td class="right">${fmtCurrency(parseFloat(i.total))}</td><td class="right">${Math.max(0, daysDue)}</td><td class="right">${fmtCurrency(parseFloat(i.balance))}</td></tr>`;
+    const invoiceRows = invoices.rows.map((inv: any) => {
+      const daysDue = Math.floor((new Date().getTime() - new Date(inv.due_date || inv.invoice_date).getTime()) / 86400000);
+      return tableRow([
+        { html: fmtDate(inv.invoice_date, 'short') },
+        { html: inv.invoice_number },
+        { html: inv.notes || '—' },
+        { html: fmtCurrency(parseFloat(inv.total)), align: 'r' },
+        { html: String(Math.max(0, daysDue)), align: 'r' },
+        { html: fmtCurrency(parseFloat(inv.balance)), align: 'r' },
+      ]);
     }).join('');
 
-    const style = `*{margin:0;padding:0;box-sizing:border-box}body{font-family:"Courier New",monospace;font-size:10px;color:#111;padding:8mm 10mm;max-width:210mm;margin:0 auto}.header{display:flex;justify-content:space-between;margin-bottom:10px}.header-left h2{font-size:16px;font-weight:bold;margin:0}.header-left p{font-size:9px;margin:2px 0}.header-right{text-align:right;font-size:9px}.header-right p{margin:2px 0}.doc-title{text-align:center;border:1px dotted #444;padding:6px 0;margin:10px 0}.doc-title h2{font-size:14px;font-weight:bold;letter-spacing:6px;margin:0}table{width:100%;border-collapse:collapse;margin:8px 0}th{background:#f8f8f8;border:1px dotted #444;padding:5px 6px;font-size:9px;text-align:left;font-weight:bold}td{border:1px dotted #444;padding:4px 6px;font-size:9px}td.right{text-align:right}.aging{display:flex;gap:6px;margin:8px 0}.aging-box{flex:1;border:1px dotted #444;padding:5px;text-align:center}.aging-box .amt{font-size:11px;font-weight:bold}.aging-box .lbl{font-size:7px;text-transform:uppercase;color:#555}.total-row{text-align:right;font-size:14px;font-weight:bold;border-top:2px dotted #000;padding-top:4px;margin-top:8px}.footer{text-align:center;font-size:7px;color:#666;margin-top:12px;border-top:1px dotted #999;padding-top:4px}@media print{body{padding:4mm 6mm}}`;
-
-    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Statement - ${c.customer_name}</title><style>${style}</style></head><body>
-<div class="header">
-  <div class="header-left"><h2>Statement</h2><p>${c.customer_name || ''}</p><p>${c.address || ''}</p><p>${c.contact_person || ''}</p></div>
-  <div class="header-right"><p>${bizName}</p><p>${bizProp}</p><p>${bizVat}</p><p>${bizAddress}</p></div>
-</div>
-<div class="doc-title"><h2>STATEMENT OF ACCOUNT</h2></div>
-<p style="font-size:9px;margin-bottom:6px"><strong>Date:</strong> ${new Date().toLocaleDateString('en-PH',{year:'numeric',month:'long',day:'numeric'})}</p>
-<table>
-<thead><tr><th>Date</th><th>Invoice No.</th><th>Description</th><th style="text-align:right">Total</th><th style="text-align:right">Overdue Days</th><th style="text-align:right">Balance Due</th></tr></thead>
-<tbody>${rows || '<tr><td colspan="6" style="text-align:center">No unpaid invoices</td></tr>'}</tbody>
-</table>
-<div class="aging">
-<div class="aging-box"><div class="amt">${fmtCurrency(aged.current)}</div><div class="lbl">Current</div></div>
-<div class="aging-box"><div class="amt">${fmtCurrency(aged.d30)}</div><div class="lbl">1-30 Days</div></div>
-<div class="aging-box"><div class="amt">${fmtCurrency(aged.d60)}</div><div class="lbl">31-60 Days</div></div>
-<div class="aging-box"><div class="amt">${fmtCurrency(aged.d90)}</div><div class="lbl">61-90 Days</div></div>
-<div class="aging-box"><div class="amt">${fmtCurrency(aged.over90)}</div><div class="lbl">90+ Days</div></div>
-</div>
-<div class="total-row">Total Outstanding: ${fmtCurrency(totalOutstanding)}</div>
-<div class="footer">Printed: ${new Date().toLocaleString('en-PH')} | Statement of Account</div>
-</body></html>`;
+    const html = buildSalesEnterpriseDocument({
+      pageTitle: `Statement - ${c.customer_name}`,
+      docTitle: 'Statement of Account',
+      docMetaRows: [
+        { label: 'Statement Date', value: fmtDate(new Date(), 'short') },
+        { label: 'Unpaid Invoices', value: String(invoices.rows.length) },
+        { label: 'Customer Code', value: c.customer_code || '—' },
+        { label: 'Status', value: 'OUTSTANDING' },
+      ],
+      customerRows: buildCustomerMetaRows({
+        name: c.customer_name,
+        address: c.address,
+        tin: c.tin,
+        code: c.customer_code,
+      }),
+      detailsTitle: 'Account Summary',
+      detailsRows: [
+        { label: 'Credit Limit', value: c.credit_limit != null ? fmtCurrency(c.credit_limit) : '—' },
+        { label: 'Payment Terms', value: c.payment_terms || '—' },
+        { label: 'Contact Person', value: c.contact_person || '—' },
+        { label: 'Currency', value: String(b.currency || 'PHP') },
+      ],
+      beforeItemsHtml: renderEnterpriseSectionTitle('Outstanding Invoices'),
+      itemHeaders: [
+        { text: 'Date', align: 'left' },
+        { text: 'Invoice No.' },
+        { text: 'Description' },
+        { text: 'Total', align: 'right' },
+        { text: 'Overdue Days', align: 'right', width: '72px' },
+        { text: 'Balance Due', align: 'right', width: '88px' },
+      ],
+      itemRows: invoiceRows,
+      skipBottom: true,
+      summaryRows: [{ label: 'Total Outstanding', value: fmtCurrency(totalOutstanding), total: true }],
+      afterSummaryHtml: [
+        renderEnterpriseSectionTitle('Aging Summary'),
+        renderEnterpriseAgingRow(aged),
+        renderEnterpriseTotalBanner('Total Outstanding', fmtCurrency(totalOutstanding)),
+      ].join(''),
+      footerNote: 'Statement of Account — please remit payment for all overdue balances.',
+      biz: b,
+    });
     res.send(html);
   } catch (error: any) { res.status(500).send('<p>Error: ' + error.message + '</p>'); }
 });
 
-// Collection Receipt Print — dot-matrix
-router.get('/collection-receipt/:id/print', async (req: AuthRequest, res: Response) => {
+// Billing Statement — selected sales invoices with VAT summary (Statement of Account for billing)
+router.get('/customer-statement/:customerId/billing-statement/print', authenticate, hasUserPerm('sales.collections.print'), async (req: AuthRequest, res: Response) => {
   try {
-    const token = req.query.token as string || (req.headers.authorization || '').replace('Bearer ', '');
-    if (!token) return res.status(401).json({ error: 'Auth required' });
-    try { jwt.verify(token, config.jwtSecret); } catch { return res.status(401).json({ error: 'Invalid token' }); }
+    const cust = await query('SELECT * FROM customers WHERE id = $1', [req.params.customerId]);
+    if (cust.rows.length === 0) return res.status(404).send('Not found');
+    const c = cust.rows[0];
 
+    const rawIds = String(req.query.invoice_ids || '').split(',').map((s) => s.trim()).filter(Boolean);
+    if (rawIds.length === 0) {
+      return res.status(400).send('<p>Select at least one sales invoice for the billing statement.</p>');
+    }
+
+    const invoices = await query(
+      `SELECT * FROM sales_invoices
+       WHERE customer_id = $1 AND id = ANY($2::uuid[])
+         AND status NOT IN ('Void', 'Cancelled', 'Draft')
+       ORDER BY invoice_date ASC, invoice_number ASC`,
+      [req.params.customerId, rawIds],
+    );
+
+    if (invoices.rows.length === 0) {
+      return res.status(400).send('<p>No valid invoices found for this customer.</p>');
+    }
+    if (invoices.rows.length !== rawIds.length) {
+      return res.status(400).send('<p>One or more invoices do not belong to this customer or are not billable.</p>');
+    }
+
+    const description = String(req.query.description || '').trim();
+    const totals = computeBillingStatementTotals(invoices.rows);
+    const biz = await query('SELECT * FROM business_details WHERE id = 1');
+    const b = biz.rows[0] || {};
+
+    const invoiceRows = invoices.rows.map((inv: any) =>
+      tableRow([
+        { html: fmtDate(inv.invoice_date, 'short') },
+        { html: inv.invoice_number },
+        { html: fmtCurrency(parseFloat(inv.total)), align: 'r' },
+      ]),
+    ).join('');
+
+    const html = buildSalesEnterpriseDocument({
+      pageTitle: `Billing Statement - ${c.customer_name}`,
+      docTitle: 'Billing Statement',
+      docMetaRows: [
+        { label: 'Statement Date', value: fmtDate(new Date(), 'short') },
+        { label: 'Customer Code', value: c.customer_code || '—' },
+        { label: 'No. of Invoices', value: String(invoices.rows.length) },
+        { label: 'Document', value: 'Statement of Account' },
+      ],
+      customerRows: buildCustomerMetaRows({
+        name: c.customer_name,
+        address: c.address,
+        tin: c.tin,
+        phone: c.phone,
+        code: c.customer_code,
+      }),
+      detailsTitle: 'Billing Details',
+      detailsRows: [
+        { label: 'Payment Terms', value: c.payment_terms || '—' },
+        { label: 'Contact Person', value: c.contact_person || '—' },
+        { label: 'Currency', value: String(b.currency || 'PHP') },
+        { label: 'Total Net Amount', value: fmtCurrency(totals.netAmount) },
+      ],
+      beforeItemsHtml: renderEnterpriseSectionTitle('Sales Invoices'),
+      itemHeaders: [
+        { text: 'Date', align: 'left', width: '100px' },
+        { text: 'SI No.', align: 'left' },
+        { text: 'Amount', align: 'right', width: '120px' },
+      ],
+      itemRows: invoiceRows,
+      bottomLeftHtml: renderEnterpriseNotesBlock(
+        'Description',
+        description || 'Please find below the list of sales invoices for your account. Kindly remit payment for the total net amount due.',
+      ),
+      summaryRows: buildBillingStatementSummaryRows(totals),
+      amountInWords: totals.netAmount,
+      signatures: buildBillingStatementSignatures(b),
+      signatureCols: 3,
+      footerNote: 'Billing Statement / Statement of Account — this is a system-generated document.',
+      biz: b,
+    });
+    res.send(html);
+  } catch (error: any) {
+    res.status(500).send('<p>Error: ' + error.message + '</p>');
+  }
+});
+
+// Collection Receipt Print
+router.get('/collection-receipt/:id/print', authenticate, hasUserPerm('sales.collection-receipt.print'), async (req: AuthRequest, res: Response) => {
+  try {
     const r = await query(
       `SELECT cr.*, c.customer_name, c.customer_code, c.address as customer_address,
               ba.bank_name, ba.account_name
@@ -1261,46 +1459,460 @@ router.get('/collection-receipt/:id/print', async (req: AuthRequest, res: Respon
     const d = r.rows[0];
 
     const allocations = await query(
-      `SELECT cra.*, si.invoice_number, si.invoice_date, si.total as invoice_total, si.balance as invoice_balance
+      `SELECT cra.applied_amount, cra.ewt_amount, cra.lgu_amount,
+              si.invoice_number, si.invoice_date, si.total AS invoice_total, si.balance AS invoice_balance,
+              si.ewt_rate
        FROM collection_receipt_allocations cra
        JOIN sales_invoices si ON cra.invoice_id = si.id
-       WHERE cra.receipt_id = $1 ORDER BY si.invoice_date`,
+       WHERE cra.receipt_id = $1
+       UNION ALL
+       SELECT cr.amount AS applied_amount,
+              COALESCE((
+                SELECT SUM(jel.debit)
+                FROM journal_entries je
+                JOIN journal_entry_lines jel ON jel.entry_id = je.id
+                JOIN chart_of_accounts coa ON coa.id = jel.account_id
+                WHERE je.reference_type = 'Collection' AND je.reference_id = cr.id AND coa.account_code = '1105'
+              ), 0) AS ewt_amount,
+              COALESCE((
+                SELECT SUM(jel.debit)
+                FROM journal_entries je
+                JOIN journal_entry_lines jel ON jel.entry_id = je.id
+                JOIN chart_of_accounts coa ON coa.id = jel.account_id
+                WHERE je.reference_type = 'Collection' AND je.reference_id = cr.id AND coa.account_code = '2110'
+              ), 0) AS lgu_amount,
+              si.invoice_number, si.invoice_date, si.total AS invoice_total, si.balance AS invoice_balance,
+              si.ewt_rate
+       FROM collection_receipts cr
+       JOIN sales_invoices si ON cr.invoice_id = si.id
+       WHERE cr.id = $1 AND cr.invoice_id IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM collection_receipt_allocations x WHERE x.receipt_id = cr.id)
+       ORDER BY invoice_date`,
       [req.params.id]
     );
 
-    const bizName = 'D METRAN TRADING';
-    const fmtCurrency = (n: number) => '₱' + n.toLocaleString('en-PH', { minimumFractionDigits: 2 });
-    const fmtDate = (d: string) => d ? new Date(d).toLocaleDateString('en-PH', { year: 'numeric', month: 'short', day: 'numeric' }) : '—';
-    const total = parseFloat(d.amount) || 0;
+    const totalApplied = allocations.rows.reduce((s: number, a: any) => s + (parseFloat(a.applied_amount) || 0), 0)
+      || parseFloat(d.amount) || 0;
+    const totalEwt = allocations.rows.reduce((s: number, a: any) => s + (parseFloat(a.ewt_amount) || 0), 0);
+    const totalLgu = allocations.rows.reduce((s: number, a: any) => s + (parseFloat(a.lgu_amount) || 0), 0);
+    const cashReceived = Math.max(0, totalApplied - totalEwt - totalLgu);
 
-    const allocRows = allocations.rows.map((a: any) =>
-      `<tr><td>${a.invoice_number}</td><td>${fmtDate(a.invoice_date)}</td><td class="right">${fmtCurrency(parseFloat(a.invoice_total))}</td><td class="right">${fmtCurrency(parseFloat(a.applied_amount))}</td></tr>`
-    ).join('');
+    const biz = await query('SELECT * FROM business_details WHERE id = 1');
+    const b = biz.rows[0] || {};
 
-    const style = `*{margin:0;padding:0;box-sizing:border-box}body{font-family:"Courier New",monospace;font-size:10px;color:#111;padding:8mm 10mm;max-width:210mm;margin:0 auto}.header{text-align:center;margin-bottom:8px}.header h1{font-size:16px;font-weight:bold;letter-spacing:3px;margin:0}.header p{font-size:9px;margin:2px 0}.dot-divider{text-align:center;font-size:10px;font-weight:bold;margin:4px 0}.doc-title{text-align:center;border:1px dotted #444;padding:5px 0;margin:8px 0}.doc-title h2{font-size:13px;font-weight:bold;letter-spacing:5px;margin:0}.info{display:flex;gap:15px;margin:8px 0}.info-box{flex:1;border:1px dotted #444;padding:6px 8px}.info-box .lbl{font-size:8px;font-weight:bold;text-transform:uppercase;margin-bottom:4px}.info-box p{font-size:9px;margin:1px 0}table{width:100%;border-collapse:collapse;margin:8px 0}th{background:#f8f8f8;border:1px dotted #444;padding:4px 5px;font-size:8px;text-align:left;font-weight:bold}td{border:1px dotted #444;padding:3px 5px;font-size:8px}td.right{text-align:right}.total{text-align:right;font-size:13px;font-weight:bold;border-top:2px dotted #000;padding-top:4px;margin-top:8px}.signatures{display:flex;justify-content:space-between;margin-top:20px;gap:10px}.sig-block{text-align:center;flex:1}.sig-block .sig-line{border-bottom:1px dotted #444;height:25px;margin-bottom:3px}.sig-block .sig-label{font-size:8px;text-transform:uppercase}.footer{text-align:center;font-size:7px;color:#666;margin-top:10px;border-top:1px dotted #999;padding-top:4px}@media print{body{padding:4mm 6mm}}`;
+    const hasEwtOrLgu = totalEwt > 0 || totalLgu > 0;
+    const ewtRateLabel = allocations.rows.find((a: any) => parseFloat(a.ewt_rate) > 0)?.ewt_rate;
 
-    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>CR ${d.receipt_number}</title><style>${style}</style></head><body>
-<div class="header"><h1>${bizName}</h1><p>Donnel M. Metran - Prop. | VAT REG TIN: 418 944 134 000</p><p>New Public Market, Sta. Cruz, Zambales 2213</p></div>
-<div class="dot-divider">. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .</div>
-<div class="doc-title"><h2>COLLECTION RECEIPT</h2></div>
-<div class="info">
-<div class="info-box"><div class="lbl">Receipt Details</div><p><strong>CR #:</strong> ${d.receipt_number}</p><p><strong>Date:</strong> ${fmtDate(d.payment_date)}</p><p><strong>Method:</strong> ${d.payment_method || '—'}</p>${d.reference_number ? '<p><strong>Ref:</strong> ' + d.reference_number + '</p>' : ''}${d.check_date ? '<p><strong>Check Date:</strong> ' + fmtDate(d.check_date) + '</p>' : ''}${d.check_bank ? '<p><strong>Bank:</strong> ' + d.check_bank + '</p>' : ''}</div>
-<div class="info-box"><div class="lbl">Customer</div><p><strong>Name:</strong> ${d.customer_name || '—'}</p><p><strong>Code:</strong> ${d.customer_code || '—'}</p><p><strong>Address:</strong> ${d.customer_address || '—'}</p></div>
-</div>
-<table>
-<thead><tr><th>Invoice #</th><th>Date</th><th style="text-align:right">Invoice Total</th><th style="text-align:right">Applied</th></tr></thead>
-<tbody>${allocRows || '<tr><td colspan="4" style="text-align:center">No allocations</td></tr>'}</tbody>
-</table>
-<div class="total">Total Received: ${fmtCurrency(total)}</div>
-${d.notes ? '<div style="border:1px dotted #444;padding:5px 8px;margin:6px 0;font-size:9px"><strong>Notes:</strong> ' + d.notes + '</div>' : ''}
-<div class="signatures">
-<div class="sig-block"><div class="sig-line"></div><div class="sig-label">Prepared by</div></div>
-<div class="sig-block"><div class="sig-line"></div><div class="sig-label">Received by</div></div>
-</div>
-<div class="footer">Printed: ${new Date().toLocaleString('en-PH')} | Collection Receipt</div>
-</body></html>`;
+    const allocRows = allocations.rows.map((a: any) => {
+      const cells: { html: string; align?: 'c' | 'r' }[] = [
+        { html: a.invoice_number },
+        { html: fmtDate(a.invoice_date, 'short') },
+        { html: fmtCurrency(parseFloat(a.invoice_total)), align: 'r' },
+        { html: fmtCurrency(parseFloat(a.applied_amount)), align: 'r' },
+      ];
+      if (hasEwtOrLgu) {
+        cells.push(
+          { html: parseFloat(a.ewt_amount) > 0 ? fmtCurrency(a.ewt_amount) : '—', align: 'r' },
+          { html: parseFloat(a.lgu_amount) > 0 ? fmtCurrency(a.lgu_amount) : '—', align: 'r' },
+        );
+      }
+      return tableRow(cells);
+    }).join('');
+
+    const html = buildSalesEnterpriseDocument({
+      pageTitle: `CR ${d.receipt_number}`,
+      docTitle: 'Collection Receipt',
+      docMetaRows: [
+        { label: 'Receipt No.', value: d.receipt_number || '—' },
+        { label: 'Payment Date', value: fmtDate(d.payment_date, 'short') },
+        { label: 'Payment Method', value: d.payment_method || '—' },
+        { label: 'Status', value: String(d.status || 'Posted').toUpperCase() },
+      ],
+      customerRows: buildCustomerMetaRows({
+        name: d.customer_name,
+        address: d.customer_address,
+        code: d.customer_code,
+      }),
+      detailsTitle: 'Receipt Details',
+      detailsRows: [
+        ...(d.reference_number ? [{ label: 'Reference No.', value: d.reference_number }] : []),
+        ...(d.check_date ? [{ label: 'Check Date', value: fmtDate(d.check_date, 'short') }] : []),
+        ...(d.check_bank ? [{ label: 'Check Bank', value: d.check_bank }] : []),
+        ...(d.bank_name ? [{ label: 'Deposit Account', value: `${d.bank_name}${d.account_name ? ` (${d.account_name})` : ''}` }] : []),
+        { label: 'Currency', value: String(b.currency || 'PHP') },
+      ],
+      beforeItemsHtml: renderEnterpriseSectionTitle('Payment Allocation'),
+      itemHeaders: [
+        { text: 'Invoice #' },
+        { text: 'Date' },
+        { text: 'Invoice Total', align: 'right' },
+        { text: 'Applied', align: 'right', width: '88px' },
+        ...(hasEwtOrLgu ? [
+          { text: 'EWT', align: 'right' as const, width: '72px' },
+          { text: 'LGU 5%', align: 'right' as const, width: '72px' },
+        ] : []),
+      ],
+      itemRows: allocRows,
+      summaryRows: [
+        { label: 'Amount Applied', value: fmtCurrency(totalApplied) },
+        ...(totalEwt > 0 ? [{ label: `Less: EWT${ewtRateLabel ? ` (${parseFloat(ewtRateLabel)}%)` : ''}`, value: `-${fmtCurrency(totalEwt)}` }] : []),
+        ...(totalLgu > 0 ? [{ label: 'Less: LGU Final VAT (5%)', value: `-${fmtCurrency(totalLgu)}` }] : []),
+        { label: 'Total Received', value: fmtCurrency(cashReceived), total: true },
+      ],
+      notes: d.notes ? [{ label: 'Remarks', content: d.notes }] : [],
+      footerNote: 'Official collection receipt — acknowledge payment received.',
+      status: d.status,
+      biz: b,
+      signatures: buildEnterpriseTwoPartySignatures(b),
+      signatureCols: 2,
+    });
     res.send(html);
   } catch (error: any) { res.status(500).send('<p>Error: ' + error.message + '</p>'); }
+});
+
+// ==================== SALES RETURNS ====================
+
+router.get('/returns/copy-from-invoice/:invoiceId', authenticate, hasUserPerm('sales.sales-invoice.create'), async (req: AuthRequest, res: Response) => {
+  try {
+    const inv = await query(
+      `SELECT si.*, c.customer_name, c.customer_code,
+              e.id as emp_id, CONCAT(e.last_name, ', ', e.first_name) as employee_name
+       FROM sales_invoices si
+       LEFT JOIN customers c ON si.customer_id = c.id
+       LEFT JOIN employees e ON si.employee_id = e.id
+       WHERE si.id = $1`,
+      [req.params.invoiceId]
+    );
+    if (inv.rows.length === 0) return res.status(404).json({ error: 'Invoice not found' });
+    const invoice = inv.rows[0];
+    if (invoice.status !== 'Posted') return res.status(400).json({ error: 'Only posted invoices can be returned' });
+    const items = await query(
+      `SELECT sii.*, p.sku, p.name as product_name,
+              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
+       FROM sales_invoice_items sii
+       JOIN products p ON sii.product_id = p.id
+       WHERE sii.invoice_id = $1`,
+      [req.params.invoiceId]
+    );
+    res.json({
+      invoice_id: invoice.id,
+      invoice_number: invoice.invoice_number,
+      customer_id: invoice.customer_id,
+      customer_name: invoice.customer_type === 'Employee' ? invoice.employee_name : invoice.customer_name,
+      customer_type: invoice.customer_type || 'Customer',
+      employee_id: invoice.employee_id || null,
+      notes: '',
+      reason: '',
+      items: items.rows.map((i: any) => ({
+        invoice_item_id: i.id,
+        product_id: i.product_id,
+        product_name: i.product_name,
+        sku: i.sku,
+        unit_of_measure: i.unit_of_measure,
+        invoiced_qty: parseFloat(i.quantity),
+        quantity: parseFloat(i.quantity),
+        unit_price: parseFloat(i.unit_price),
+        line_total: parseFloat(i.total),
+        location_id: i.location_id || 1,
+        cost: parseFloat(i.cost || 0),
+      })),
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/returns', authenticate, hasUserPerm('sales.sales-invoice.view'), async (req: AuthRequest, res: Response) => {
+  try {
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 20;
+    const offset = (page - 1) * limit;
+    const total = await query('SELECT COUNT(*) FROM sales_returns');
+    const result = await query(
+      `SELECT sr.*, c.customer_name, si.invoice_number, si.customer_type,
+              CONCAT(e.last_name, ', ', e.first_name) as employee_name,
+              (SELECT COUNT(*) FROM sales_return_items WHERE return_id = sr.id) as item_count
+       FROM sales_returns sr
+       LEFT JOIN customers c ON sr.customer_id = c.id
+       LEFT JOIN sales_invoices si ON sr.invoice_id = si.id
+       LEFT JOIN employees e ON sr.employee_id = e.id
+       ORDER BY sr.created_at DESC
+       LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    );
+    res.json({ data: result.rows, total: parseInt(total.rows[0].count), page, limit });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/returns/:id', authenticate, hasUserPerm('sales.sales-invoice.view'), async (req: AuthRequest, res: Response) => {
+  try {
+    const sr = await query(
+      `SELECT sr.*, c.customer_name, c.customer_code, si.invoice_number, si.customer_type,
+              CONCAT(e.last_name, ', ', e.first_name) as employee_name, u.full_name as created_by_name
+       FROM sales_returns sr
+       LEFT JOIN customers c ON sr.customer_id = c.id
+       LEFT JOIN sales_invoices si ON sr.invoice_id = si.id
+       LEFT JOIN employees e ON sr.employee_id = e.id
+       LEFT JOIN users u ON sr.created_by = u.id
+       WHERE sr.id = $1`,
+      [req.params.id]
+    );
+    if (sr.rows.length === 0) return res.status(404).json({ error: 'Sales return not found' });
+    const items = await query(
+      `SELECT sri.*, p.sku, p.name as product_name,
+              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
+       FROM sales_return_items sri
+       JOIN products p ON sri.product_id = p.id
+       WHERE sri.return_id = $1`,
+      [req.params.id]
+    );
+    res.json({ ...sr.rows[0], items: items.rows });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/returns/:id/print', authenticate, hasUserPerm('sales.sales-invoice.print'), async (req: AuthRequest, res: Response) => {
+  try {
+    const sr = await query(
+      `SELECT sr.*, c.customer_name, c.address as customer_address, si.invoice_number, si.customer_type,
+              CONCAT(e.last_name, ', ', e.first_name) as employee_name, u.full_name as created_by_name
+       FROM sales_returns sr
+       LEFT JOIN customers c ON sr.customer_id = c.id
+       LEFT JOIN sales_invoices si ON sr.invoice_id = si.id
+       LEFT JOIN employees e ON sr.employee_id = e.id
+       LEFT JOIN users u ON sr.created_by = u.id
+       WHERE sr.id = $1`,
+      [req.params.id]
+    );
+    if (sr.rows.length === 0) return res.status(404).send('Not found');
+    const d = sr.rows[0];
+    const items = await query(
+      `SELECT sri.*, p.sku, p.name as product_name,
+              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
+       FROM sales_return_items sri
+       JOIN products p ON sri.product_id = p.id
+       WHERE sri.return_id = $1`,
+      [req.params.id]
+    );
+    const biz = await query('SELECT * FROM business_details WHERE id = 1');
+    const b = biz.rows[0] || {};
+    const partyName = d.customer_type === 'Employee' ? d.employee_name : d.customer_name;
+    const itemRows = items.rows.map((i: any, idx: number) => tableRow([
+      { html: String(idx + 1), align: 'c' },
+      { html: i.sku || '—' },
+      { html: i.product_name || '—' },
+      { html: parseFloat(i.quantity).toFixed(2), align: 'c' },
+      { html: i.unit_of_measure || 'pc', align: 'c' },
+      { html: fmtCurrency(i.unit_price), align: 'r' },
+      { html: fmtCurrency(i.total), align: 'r' },
+    ])).join('');
+
+    const html = buildSalesEnterpriseDocument({
+      pageTitle: `Sales Return ${d.return_number}`,
+      docTitle: 'Sales Return',
+      docMetaRows: [
+        { label: 'Document No.', value: d.return_number || '—' },
+        { label: 'Return Date', value: fmtDate(d.return_date, 'short') },
+        { label: 'Reference Invoice', value: d.invoice_number || '—' },
+        { label: 'Status', value: String(d.status || 'Draft').toUpperCase() },
+      ],
+      customerRows: buildCustomerMetaRows({
+        name: partyName,
+        address: d.customer_address,
+      }),
+      detailsRows: [
+        { label: 'Reason', value: d.reason || '—' },
+        { label: 'Processed By', value: d.created_by_name || '—' },
+        { label: 'Currency', value: String(b.currency || 'PHP') },
+      ],
+      itemHeaders: SALES_LINE_ITEM_HEADERS,
+      itemRows,
+      summaryRows: [{ label: 'Total Return Amount', value: fmtCurrency(d.total || 0), total: true }],
+      notes: d.notes ? [{ label: 'Remarks', content: d.notes }] : [],
+      footerNote: 'Sales return document — for inventory and AR adjustment reference.',
+      status: d.status,
+      biz: b,
+      signatures: buildEnterpriseTwoPartySignatures(b),
+      signatureCols: 2,
+    });
+    res.send(html);
+  } catch (error: any) { res.status(500).send('<p>Error: ' + error.message + '</p>'); }
+});
+
+router.post('/returns', authenticate, hasUserPerm('sales.sales-invoice.create'), auditLog('Sales', 'Create Sales Return'), async (req: AuthRequest, res: Response) => {
+  const client = await getClient();
+  try {
+    await assertPeriodNotLocked(new Date().toISOString().slice(0, 10));
+    await client.query('BEGIN');
+    const { invoice_id, customer_id, items, reason, notes, terms_conditions } = req.body;
+    if (!invoice_id) throw new AppError('Invoice is required');
+    if (!items?.length) throw new AppError('At least one item is required');
+
+    const inv = await client.query('SELECT * FROM sales_invoices WHERE id = $1', [invoice_id]);
+    if (inv.rows.length === 0) throw new AppError('Invoice not found');
+    if (inv.rows[0].status !== 'Posted') throw new AppError('Only posted invoices can be returned');
+    const sourceInvoice = inv.rows[0];
+    const isEmployee = sourceInvoice.customer_type === 'Employee';
+    const employeeId = sourceInvoice.employee_id;
+    const postReturnCogs = await invoiceHadCogsRecognized(client, {
+      id: sourceInvoice.id,
+      dn_id: sourceInvoice.dn_id,
+      so_id: sourceInvoice.so_id,
+    });
+
+    const return_number = await generateRefNumber('SR', 'sales_returns', 'return_number');
+    const id = uuidv4();
+
+    await client.query(
+      `INSERT INTO sales_returns (id, return_number, invoice_id, customer_id, employee_id, return_date, status, reason, notes, terms_conditions, total, created_by)
+       VALUES ($1, $2, $3, $4, $5, CURRENT_DATE, 'Draft', $6, $7, $8, 0, $9)`,
+      [id, return_number, invoice_id, isEmployee ? null : (customer_id || sourceInvoice.customer_id), isEmployee ? employeeId : null, reason, notes, terms_conditions || null, req.user!.id]
+    );
+
+    let totalReturn = 0;
+    let totalCogs = 0;
+    const returnGlLines: Array<{ product_id: string; revenueAmount: number; cogsGrossAmount: number; tax_type?: string }> = [];
+
+    for (const item of items) {
+      const qty = parseFloat(item.quantity);
+      if (qty <= 0) throw new AppError('Return quantity must be greater than zero');
+
+      const line = await client.query('SELECT * FROM sales_invoice_items WHERE id = $1 AND invoice_id = $2', [
+        item.invoice_item_id, invoice_id,
+      ]);
+      if (line.rows.length === 0) throw new AppError('Invalid invoice line item');
+      const invLine = line.rows[0];
+      const invoicedQty = parseFloat(invLine.quantity);
+      if (qty > invoicedQty) throw new AppError(`Return qty exceeds invoiced qty for ${invLine.description || 'item'}`);
+
+      const unitPrice = parseFloat(invLine.unit_price);
+      const lineTotal = (parseFloat(invLine.total) / invoicedQty) * qty;
+      const cost = parseFloat(invLine.cost || 0);
+      const locId = item.location_id || invLine.location_id || 1;
+      totalReturn += lineTotal;
+      totalCogs += cost * qty;
+      const productId = item.product_id || invLine.product_id;
+      const lineVat = (parseFloat(invLine.vat_amount || 0) / invoicedQty) * qty;
+      returnGlLines.push({
+        product_id: productId,
+        revenueAmount: storedInvoiceItemNetRevenue({
+          total: lineTotal,
+          vat_amount: lineVat,
+          tax_type: invLine.tax_type,
+        }),
+        cogsGrossAmount: cost * qty,
+        tax_type: invLine.tax_type,
+      });
+
+      await client.query(
+        `INSERT INTO sales_return_items (id, return_id, invoice_item_id, product_id, location_id, quantity, unit_price, total, cost)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [uuidv4(), id, item.invoice_item_id, item.product_id || invLine.product_id, locId, qty, unitPrice, lineTotal, cost]
+      );
+
+      const invRow = await client.query(
+        'SELECT * FROM inventory WHERE product_id = $1 AND location_id = $2',
+        [item.product_id || invLine.product_id, locId]
+      );
+      if (invRow.rows.length > 0) {
+        const currentQty = parseFloat(invRow.rows[0].quantity);
+        const newQty = currentQty + qty;
+        await client.query('UPDATE inventory SET quantity = $1 WHERE id = $2', [newQty, invRow.rows[0].id]);
+        await client.query(
+          `INSERT INTO inventory_ledger (id, product_id, location_id, reference_type, reference_id, transaction_type, quantity, running_quantity, unit_cost, total_cost, created_by)
+           VALUES ($1, $2, $3, 'Sales Return', $4, 'IN', $5, $6, $7, $8, $9)`,
+          [uuidv4(), item.product_id || invLine.product_id, locId, id, qty, newQty, cost, cost * qty, req.user!.id]
+        );
+      } else {
+        await client.query(
+          'INSERT INTO inventory (product_id, location_id, quantity, unit_cost) VALUES ($1, $2, $3, $4)',
+          [item.product_id || invLine.product_id, locId, qty, cost]
+        );
+        await client.query(
+          `INSERT INTO inventory_ledger (id, product_id, location_id, reference_type, reference_id, transaction_type, quantity, running_quantity, unit_cost, total_cost, created_by)
+           VALUES ($1, $2, $3, 'Sales Return', $4, 'IN', $5, $6, $7, $8, $9)`,
+          [uuidv4(), item.product_id || invLine.product_id, locId, id, qty, qty, cost, cost * qty, req.user!.id]
+        );
+      }
+    }
+
+    await client.query("UPDATE sales_returns SET status = 'Completed', total = $1 WHERE id = $2", [totalReturn, id]);
+
+    if (isEmployee && employeeId) {
+      await client.query(
+        'UPDATE employees SET grocery_credit_balance = GREATEST(grocery_credit_balance - $1, 0) WHERE id = $2',
+        [totalReturn, employeeId]
+      );
+    } else {
+      const custId = customer_id || inv.rows[0].customer_id;
+      if (custId) {
+        await client.query('UPDATE customers SET balance = GREATEST(balance - $1, 0) WHERE id = $2', [totalReturn, custId]);
+      }
+    }
+
+    await client.query(
+      'UPDATE sales_invoices SET balance = GREATEST(balance - $1, 0), amount_paid = GREATEST(amount_paid - $1, 0) WHERE id = $2',
+      [totalReturn, invoice_id]
+    );
+
+    const entryId = uuidv4();
+    const entryNumber = await generateRefNumber('JE', 'journal_entries', 'entry_number');
+    const creditAccount = isEmployee ? '1120' : '1100';
+
+    const returnCategoryMap = await loadCategoryAccountsForProducts(
+      client,
+      returnGlLines.map((l) => l.product_id),
+    );
+    const returnRevenueBuckets = aggregateByAccountCode(
+      returnGlLines,
+      returnCategoryMap,
+      'revenue_account_code',
+      'revenueAmount',
+    );
+    const returnCogsBuckets = aggregateGlCogsByAccountCode(returnGlLines, returnCategoryMap);
+    const glCogs = postReturnCogs ? sumLineGlCogs(returnGlLines) : 0;
+    const netRevenue = returnGlLines.reduce((s, l) => s + (l.revenueAmount || 0), 0);
+    const vatAmount = totalReturn - netRevenue;
+    const jeTotal = totalReturn + glCogs;
+
+    await client.query(
+      `INSERT INTO journal_entries (id, entry_number, entry_date, reference_type, reference_id, description, total_debit, total_credit, created_by)
+       VALUES ($1, $2, CURRENT_DATE, 'Sales Return', $3, $4, $5, $5, $6)`,
+      [entryId, entryNumber, id, `Sales Return ${return_number}`, jeTotal, req.user!.id]
+    );
+
+    await insertRevenueDebitLines(
+      client, entryId, returnRevenueBuckets, 'Sales Return', id, `Revenue reversal ${return_number}`,
+    );
+    if (vatAmount > 0.01) {
+      await client.query(
+        `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
+         VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '2100'), $3, $4, 0, 'Sales Return', $5)`,
+        [uuidv4(), entryId, `VAT reversal ${return_number}`, vatAmount, id]
+      );
+    }
+    await client.query(
+      `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
+       VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = $6), $3, 0, $4, 'Sales Return', $5)`,
+      [uuidv4(), entryId, `${isEmployee ? 'Employee grocery credit' : 'AR'} credit ${return_number}`, totalReturn, id, creditAccount]
+    );
+    if (postReturnCogs && glCogs > 0) {
+      await insertCogsInventoryReversalLines(
+        client, entryId, returnCogsBuckets, 'Sales Return', id, return_number,
+      );
+    }
+
+    await client.query('COMMIT');
+    res.status(201).json({ id, return_number, total: totalReturn });
+  } catch (error: any) {
+    await client.query('ROLLBACK');
+    res.status(error instanceof AppError ? error.statusCode : 500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
 });
 
 export default router;

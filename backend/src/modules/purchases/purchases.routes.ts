@@ -1,14 +1,34 @@
 import { Router, Response } from 'express';
 import { query, getClient } from '../../config/database';
-import { authenticate, AuthRequest } from '../../middleware/auth';
+import { authenticate, AuthRequest, hasUserPerm } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
 import { AppError } from '../../middleware/errorHandler';
 import { v4 as uuidv4 } from 'uuid';
-import jwt from 'jsonwebtoken';
 import { savePriceHistoryFromGR } from '../supplier-price-history/supplier-price-history.routes';
-import { config } from '../../config';
+import {
+  tableRow, fmtCurrency, fmtDate,
+} from '../../utils/printLayout';
+import {
+  buildSalesEnterpriseDocument,
+  buildSupplierMetaRows,
+  buildEnterpriseSignatures,
+  formatTaxLabel,
+  PURCHASE_REQUISITION_HEADERS,
+  PURCHASE_ORDER_HEADERS,
+  GOODS_RECEIPT_HEADERS,
+} from '../../utils/salesEnterprisePrint';
+import {
+  buildPurchaseOrderItemsFromRequest,
+  calculateGrLineAccounting,
+  normalizePurchaseCostBasis,
+} from '../../utils/purchaseTax';
+import { auditAfter, auditBefore, auditSnapshot, AUDIT_FIELDS } from '../../utils/auditHelpers';
+import { assertApprovalLimit } from '../../utils/approvalLimit';
 
 const router = Router();
+
+const poView = hasUserPerm('purchases.purchase-order.view');
+const grView = hasUserPerm('purchases.receiving-report.view');
 
 // Helper to generate reference numbers
 const generateRefNumber = async (prefix: string, table: string, column: string): Promise<string> => {
@@ -22,21 +42,21 @@ const generateRefNumber = async (prefix: string, table: string, column: string):
 };
 
 // ==================== PURCHASE REQUISITIONS ====================
-router.post('/requisitions', authenticate, async (req: AuthRequest, res: Response) => {
+router.post('/requisitions', authenticate, hasUserPerm('purchases.purchase-order.create'), async (req: AuthRequest, res: Response) => {
   try {
     const pr_number = await generateRefNumber('PR', 'purchase_requisitions', 'pr_number');
-    const { items, notes } = req.body;
+    const { items, notes, terms_conditions } = req.body;
     const id = uuidv4();
 
     await query(
-      'INSERT INTO purchase_requisitions (id, pr_number, requested_by, notes) VALUES ($1, $2, $3, $4)',
-      [id, pr_number, req.user!.id, notes]
+      'INSERT INTO purchase_requisitions (id, pr_number, requested_by, notes, terms_conditions) VALUES ($1, $2, $3, $4, $5)',
+      [id, pr_number, req.user!.id, notes, terms_conditions || null]
     );
 
     for (const item of items || []) {
       await query(
-        'INSERT INTO purchase_requisition_items (id, pr_id, product_id, quantity, estimated_cost) VALUES ($1, $2, $3, $4, $5)',
-        [uuidv4(), id, item.product_id, item.quantity, item.estimated_cost]
+        'INSERT INTO purchase_requisition_items (id, pr_id, product_id, quantity, estimated_cost, tax_type) VALUES ($1, $2, $3, $4, $5, $6)',
+        [uuidv4(), id, item.product_id, item.quantity, item.estimated_cost, item.tax_type || 'VAT']
       );
     }
 
@@ -46,11 +66,12 @@ router.post('/requisitions', authenticate, async (req: AuthRequest, res: Respons
   }
 });
 
-router.get('/requisitions', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/requisitions', authenticate, poView, async (req: AuthRequest, res: Response) => {
   try {
     const result = await query(
       `SELECT pr.*, u.full_name as requested_by_name,
-              (SELECT COUNT(*) FROM purchase_requisition_items WHERE pr_id = pr.id) as item_count
+              (SELECT COUNT(*) FROM purchase_requisition_items WHERE pr_id = pr.id) as item_count,
+              (SELECT po_number FROM purchase_orders WHERE pr_id = pr.id LIMIT 1) as linked_po_number
        FROM purchase_requisitions pr
        LEFT JOIN users u ON pr.requested_by = u.id
        ORDER BY pr.created_at DESC`
@@ -61,82 +82,283 @@ router.get('/requisitions', authenticate, async (req: AuthRequest, res: Response
   }
 });
 
-// ==================== PURCHASE ORDERS ====================
-router.post('/orders', authenticate, auditLog('Purchases', 'Create PO'), async (req: AuthRequest, res: Response) => {
+router.get('/requisitions/:id', authenticate, poView, async (req: AuthRequest, res: Response) => {
   try {
-    const po_number = await generateRefNumber('PO', 'purchase_orders', 'po_number');
-    const { supplier_id, pr_id, items, expected_date, payment_terms, notes, vat_mode } = req.body;
-    if (!supplier_id) return res.status(400).json({ error: 'Supplier is required' });
-    const id = uuidv4();
-    const vatMode = vat_mode || 'VAT Inclusive';
+    const pr = await query(
+      `SELECT pr.*, u.full_name as requested_by_name, au.full_name as approved_by_name,
+              (SELECT po_number FROM purchase_orders WHERE pr_id = pr.id LIMIT 1) as linked_po_number
+       FROM purchase_requisitions pr
+       LEFT JOIN users u ON pr.requested_by = u.id
+       LEFT JOIN users au ON pr.approved_by = au.id
+       WHERE pr.id = $1`,
+      [req.params.id]
+    );
+    if (pr.rows.length === 0) return res.status(404).json({ error: 'Requisition not found' });
+    const items = await query(
+      `SELECT pri.*, p.sku, p.name as product_name,
+              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
+       FROM purchase_requisition_items pri
+       JOIN products p ON pri.product_id = p.id
+       WHERE pri.pr_id = $1`,
+      [req.params.id]
+    );
+    res.json({ ...pr.rows[0], items: items.rows });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
-    let subtotal = 0;
-    let totalLineDiscount = 0;
+router.get('/requisitions/:id/print', authenticate, poView, async (req: AuthRequest, res: Response) => {
+  try {
+    const pr = await query(
+      `SELECT pr.*, u.full_name as requested_by_name, au.full_name as approved_by_name,
+              (SELECT po_number FROM purchase_orders WHERE pr_id = pr.id LIMIT 1) as linked_po_number
+       FROM purchase_requisitions pr
+       LEFT JOIN users u ON pr.requested_by = u.id
+       LEFT JOIN users au ON pr.approved_by = au.id
+       WHERE pr.id = $1`,
+      [req.params.id],
+    );
+    if (pr.rows.length === 0) return res.status(404).send('Not found');
+    const d = pr.rows[0];
 
-    const orderItems = (items || []).map((item: any) => {
-      const qty = parseFloat(item.quantity) || 0;
-      const unitCost = parseFloat(item.unit_cost) || 0;
-      const gross = qty * unitCost;
-      const discType = item.discount_type || '%';
-      const discVal = parseFloat(item.discount_value || '0');
+    const items = await query(
+      `SELECT pri.*, p.sku, p.name as product_name,
+              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
+       FROM purchase_requisition_items pri
+       JOIN products p ON pri.product_id = p.id
+       WHERE pri.pr_id = $1 ORDER BY pri.id`,
+      [req.params.id],
+    );
 
-      // Line discount
-      let discAmt = 0;
-      if (discType === '%') {
-        discAmt = gross * (discVal / 100);
-      } else {
-        discAmt = discVal;
-      }
-      if (discAmt > gross) discAmt = gross; // prevent negative
-      const netLineTotal = gross - discAmt;
-      const netUnitCost = qty > 0 ? netLineTotal / qty : unitCost;
+    const biz = await query('SELECT * FROM business_details WHERE id = 1');
+    const b = biz.rows[0] || {};
 
-      subtotal += gross;
-      totalLineDiscount += discAmt;
+    const itemRows = items.rows.map((row: any, idx: number) => {
+      const lineTotal = parseFloat(row.quantity) * parseFloat(row.estimated_cost || 0);
+      const taxLabel = formatTaxLabel(row.tax_type);
+      return tableRow([
+        { html: String(idx + 1), align: 'c' },
+        { html: row.sku || '—', align: 'c' },
+        { html: row.product_name || '—' },
+        { html: row.unit_of_measure || 'pc', align: 'c' },
+        { html: String(parseFloat(row.quantity)), align: 'c' },
+        { html: fmtCurrency(row.estimated_cost), align: 'r' },
+        { html: taxLabel, align: 'c' },
+        { html: fmtCurrency(lineTotal), align: 'r' },
+      ]);
+    }).join('');
 
-      return {
-        product_id: item.product_id, variant_id: item.variant_id, location_id: item.location_id,
-        quantity: qty, unit_cost: unitCost,
-        discount_type: discType, discount_value: discVal, discount_amount: Math.round(discAmt * 100) / 100,
-        net_unit_cost: Math.round(netUnitCost * 100) / 100,
-        net_total: Math.round(netLineTotal * 100) / 100,
-      };
+    const estTotal = items.rows.reduce(
+      (s: number, r: any) => s + parseFloat(r.quantity) * parseFloat(r.estimated_cost || 0),
+      0,
+    );
+    const totalQty = items.rows.reduce((s: number, r: any) => s + parseFloat(r.quantity), 0);
+
+    const summaryRows = [
+      { label: 'Total Items', value: String(items.rows.length) },
+      { label: 'Total Quantity', value: String(totalQty) },
+      { label: 'ESTIMATED TOTAL', value: fmtCurrency(estTotal), total: true },
+    ];
+
+    const html = buildSalesEnterpriseDocument({
+      pageTitle: `Purchase Requisition ${d.pr_number}`,
+      docTitle: 'Purchase Requisition',
+      docMetaRows: [
+        { label: 'Document No.', value: d.pr_number || '—' },
+        { label: 'Document Date', value: fmtDate(d.created_at, 'short') },
+        { label: 'Requested By', value: d.requested_by_name || '—' },
+        { label: 'Status', value: String(d.status || 'Draft').toUpperCase() },
+      ],
+      partySectionTitle: 'Requisition Details',
+      customerRows: [
+        { label: 'Requested By', value: d.requested_by_name || '—' },
+        ...(d.approved_by_name ? [{ label: 'Approved By', value: d.approved_by_name }] : []),
+        ...(d.linked_po_number ? [{ label: 'Linked PO', value: d.linked_po_number }] : []),
+      ],
+      detailsTitle: 'Purpose / Notes',
+      detailsRows: [{ label: 'Notes', value: d.notes?.trim() || '—' }],
+      itemHeaders: PURCHASE_REQUISITION_HEADERS,
+      itemRows,
+      summaryRows,
+      amountInWords: estTotal,
+      notes: [{
+        label: 'Terms & Conditions',
+        content: d.terms_conditions?.trim() || 'Items requested for replenishment or operational use. Final pricing and supplier selection subject to purchase order approval.',
+      }],
+      footerNote: 'System-generated purchase requisition.',
+      status: d.status,
+      biz: b,
+      signatures: [
+        { label: 'Prepared By', name: d.requested_by_name || undefined },
+        'Reviewed By',
+        { label: 'Approved By', name: d.approved_by_name || undefined },
+      ],
+      signatureCols: 3,
     });
+    res.send(html);
+  } catch (error: any) {
+    res.status(500).send('<p>Error: ' + error.message + '</p>');
+  }
+});
 
-    const netSubtotal = subtotal - totalLineDiscount;
+router.patch('/requisitions/:id/approve', authenticate, hasUserPerm('purchases.purchase-order.edit'), async (req: AuthRequest, res: Response) => {
+  try {
+    const pr = await query('SELECT * FROM purchase_requisitions WHERE id = $1', [req.params.id]);
+    if (pr.rows.length === 0) return res.status(404).json({ error: 'Requisition not found' });
+    if (!['Draft', 'Pending'].includes(pr.rows[0].status)) {
+      return res.status(400).json({ error: 'Only draft or pending requisitions can be approved' });
+    }
+    const est = await query(
+      `SELECT COALESCE(SUM(pri.quantity * COALESCE(pri.estimated_cost, p.cost, 0)), 0) AS total
+       FROM purchase_requisition_items pri
+       LEFT JOIN products p ON p.id = pri.product_id
+       WHERE pri.pr_id = $1`,
+      [req.params.id],
+    );
+    await assertApprovalLimit(req, parseFloat(est.rows[0]?.total || 0), 'purchase requisition');
+    await query(
+      "UPDATE purchase_requisitions SET status = 'Approved', approved_by = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+      [req.user!.id, req.params.id]
+    );
+    res.json({ message: 'Requisition approved' });
+  } catch (error: any) {
+    if (error instanceof AppError) return res.status(error.statusCode).json({ error: error.message });
+    res.status(500).json({ error: error.message });
+  }
+});
 
-    // VAT computation based on mode
-    let vatAmount = 0;
-    let vatableAmount = netSubtotal;
-    let netTotal: number;
-
-    if (vatMode === 'VAT Inclusive') {
-      vatableAmount = netSubtotal / 1.12;
-      vatAmount = netSubtotal - vatableAmount;
-      netTotal = netSubtotal; // total = VAT-inclusive amount, no extra VAT added
-    } else if (vatMode === 'VAT Exclusive') {
-      vatAmount = netSubtotal * 0.12;
-      netTotal = netSubtotal + vatAmount;
-    } else {
-      // VAT Exempt or Zero Rated
-      vatAmount = 0;
-      netTotal = netSubtotal;
+router.post('/requisitions/generate-from-low-stock', authenticate, hasUserPerm('purchases.purchase-order.create'), async (req: AuthRequest, res: Response) => {
+  try {
+    const lowStock = await query(
+      `SELECT p.id as product_id, p.sku, p.name, p.reorder_level, p.cost,
+              COALESCE(SUM(i.quantity), 0) as total_qty
+       FROM products p
+       JOIN inventory i ON p.id = i.product_id
+       WHERE p.is_active = true AND p.reorder_level > 0
+       GROUP BY p.id, p.sku, p.name, p.reorder_level, p.cost
+       HAVING COALESCE(SUM(i.quantity), 0) <= p.reorder_level
+       ORDER BY p.name`
+    );
+    if (lowStock.rows.length === 0) {
+      return res.status(400).json({ error: 'No low-stock products found' });
     }
 
+    const pr_number = await generateRefNumber('PR', 'purchase_requisitions', 'pr_number');
+    const id = uuidv4();
+    const notes = req.body.notes || 'Auto-generated from low stock alert';
+
     await query(
-      `INSERT INTO purchase_orders (id, po_number, supplier_id, pr_id, status, order_date, expected_date, payment_terms, notes, subtotal, discount, tax, vat_mode, vat_amount, vatable_amount, total, created_by)
-       VALUES ($1, $2, $3, $4, 'Draft', CURRENT_DATE, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
-      [id, po_number, supplier_id, pr_id, expected_date || null, payment_terms, notes,
-       subtotal, totalLineDiscount, vatAmount, vatMode, vatAmount, vatableAmount, netTotal, req.user!.id]
+      'INSERT INTO purchase_requisitions (id, pr_number, requested_by, notes, status) VALUES ($1, $2, $3, $4, $5)',
+      [id, pr_number, req.user!.id, notes, 'Draft']
+    );
+
+    let itemCount = 0;
+    for (const row of lowStock.rows) {
+      const reorder = parseFloat(row.reorder_level);
+      const onHand = parseFloat(row.total_qty);
+      const orderQty = Math.max(reorder - onHand, reorder * 0.5);
+      if (orderQty <= 0) continue;
+      await query(
+        'INSERT INTO purchase_requisition_items (id, pr_id, product_id, quantity, estimated_cost, tax_type) VALUES ($1, $2, $3, $4, $5, $6)',
+        [uuidv4(), id, row.product_id, Math.ceil(orderQty), row.cost || 0, 'VAT']
+      );
+      itemCount++;
+    }
+
+    if (itemCount === 0) {
+      await query('DELETE FROM purchase_requisitions WHERE id = $1', [id]);
+      return res.status(400).json({ error: 'No replenishment quantities calculated' });
+    }
+
+    res.status(201).json({ id, pr_number, item_count: itemCount });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.patch('/requisitions/:id/cancel', authenticate, hasUserPerm('purchases.purchase-order.edit'), async (req: AuthRequest, res: Response) => {
+  try {
+    const pr = await query('SELECT * FROM purchase_requisitions WHERE id = $1', [req.params.id]);
+    if (pr.rows.length === 0) return res.status(404).json({ error: 'Requisition not found' });
+    if (pr.rows[0].status === 'Cancelled') return res.status(400).json({ error: 'Already cancelled' });
+    if (pr.rows[0].status === 'Approved') {
+      const linked = await query('SELECT id FROM purchase_orders WHERE pr_id = $1 LIMIT 1', [req.params.id]);
+      if (linked.rows.length > 0) return res.status(400).json({ error: 'Cannot cancel — PO already created from this requisition' });
+    }
+    await query(
+      "UPDATE purchase_requisitions SET status = 'Cancelled', updated_at = CURRENT_TIMESTAMP WHERE id = $1",
+      [req.params.id]
+    );
+    res.json({ message: 'Requisition cancelled' });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/requisitions/:id/copy-to-po', authenticate, hasUserPerm('purchases.purchase-order.create'), async (req: AuthRequest, res: Response) => {
+  try {
+    const pr = await query('SELECT * FROM purchase_requisitions WHERE id = $1', [req.params.id]);
+    if (pr.rows.length === 0) return res.status(404).json({ error: 'Requisition not found' });
+    if (pr.rows[0].status !== 'Approved') {
+      return res.status(400).json({ error: 'Requisition must be approved before creating a PO' });
+    }
+    const existingPo = await query('SELECT po_number FROM purchase_orders WHERE pr_id = $1 LIMIT 1', [req.params.id]);
+    if (existingPo.rows.length > 0) {
+      return res.status(400).json({ error: `PO ${existingPo.rows[0].po_number} already exists for this requisition` });
+    }
+    const items = await query(
+      `SELECT pri.*, p.sku, p.name as product_name,
+              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
+       FROM purchase_requisition_items pri
+       JOIN products p ON pri.product_id = p.id
+       WHERE pri.pr_id = $1`,
+      [req.params.id]
+    );
+    res.json({
+      pr_id: pr.rows[0].id,
+      pr_number: pr.rows[0].pr_number,
+      notes: pr.rows[0].notes || '',
+      items: items.rows.map((i: any) => ({
+        product_id: i.product_id,
+        product_name: i.product_name,
+        sku: i.sku,
+        quantity: parseFloat(i.quantity),
+        unit_cost: parseFloat(i.estimated_cost || 0),
+        unit_of_measure: i.unit_of_measure,
+        tax_type: i.tax_type || 'VAT',
+      })),
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== PURCHASE ORDERS ====================
+router.post('/orders', authenticate, hasUserPerm('purchases.purchase-order.create'), auditLog('Purchases', 'Create PO'), async (req: AuthRequest, res: Response) => {
+  try {
+    const po_number = await generateRefNumber('PO', 'purchase_orders', 'po_number');
+    const { supplier_id, pr_id, items, expected_date, payment_terms, notes, terms_conditions, vat_mode } = req.body;
+    if (!supplier_id) return res.status(400).json({ error: 'Supplier is required' });
+    const id = uuidv4();
+    const costBasis = normalizePurchaseCostBasis(vat_mode);
+
+    const { orderItems, subtotal, totalLineDiscount, totals } = buildPurchaseOrderItemsFromRequest(items || [], costBasis);
+
+    await query(
+      `INSERT INTO purchase_orders (id, po_number, supplier_id, pr_id, status, order_date, expected_date, payment_terms, notes, terms_conditions, subtotal, discount, tax, vat_mode, vat_amount, vatable_amount, total, created_by)
+       VALUES ($1, $2, $3, $4, 'Draft', CURRENT_DATE, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+      [id, po_number, supplier_id, pr_id, expected_date || null, payment_terms, notes, terms_conditions || null,
+       subtotal, totalLineDiscount, totals.vat, costBasis, totals.vat, totals.vatable, totals.total, req.user!.id]
     );
 
     for (const item of orderItems) {
       await query(
-        `INSERT INTO purchase_order_items (id, po_id, product_id, quantity, unit_cost, discount_type, discount_value, discount_amount, net_unit_cost, net_total, total_cost)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        `INSERT INTO purchase_order_items (id, po_id, product_id, quantity, unit_cost, discount_type, discount_value, discount_amount, net_unit_cost, net_total, total_cost, tax_type)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
         [uuidv4(), id, item.product_id, item.quantity, item.unit_cost,
          item.discount_type, item.discount_value, item.discount_amount,
-         item.net_unit_cost, item.net_total, item.net_total]
+         item.net_unit_cost, item.net_total, item.net_total, item.tax_type]
       );
     }
 
@@ -146,7 +368,7 @@ router.post('/orders', authenticate, auditLog('Purchases', 'Create PO'), async (
   }
 });
 
-router.get('/orders', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/orders', authenticate, poView, async (req: AuthRequest, res: Response) => {
   try {
     const status = req.query.status as string;
     const supplier_id = req.query.supplier_id as string;
@@ -180,7 +402,7 @@ router.get('/orders', authenticate, async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.get('/orders/:id', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/orders/:id', authenticate, poView, async (req: AuthRequest, res: Response) => {
   try {
     const po = await query(
       `SELECT po.*, s.supplier_name, s.supplier_code, u.full_name as created_by_name
@@ -193,7 +415,8 @@ router.get('/orders/:id', authenticate, async (req: AuthRequest, res: Response) 
     if (po.rows.length === 0) return res.status(404).json({ error: 'PO not found' });
 
     const items = await query(
-      `SELECT poi.*, p.sku, p.name as product_name
+      `SELECT poi.*, p.sku, p.name as product_name,
+              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
        FROM purchase_order_items poi
        JOIN products p ON poi.product_id = p.id
        WHERE poi.po_id = $1`,
@@ -207,119 +430,91 @@ router.get('/orders/:id', authenticate, async (req: AuthRequest, res: Response) 
 });
 
 // Send PO (change status to Sent)
-router.patch('/orders/:id/send', authenticate, async (req: AuthRequest, res: Response) => {
+router.patch('/orders/:id/send', authenticate, hasUserPerm('purchases.purchase-order.edit'), async (req: AuthRequest, res: Response) => {
   try {
-    const existing = await query('SELECT id FROM purchase_orders WHERE id = $1', [req.params.id]);
+    const existing = await query('SELECT id, total FROM purchase_orders WHERE id = $1', [req.params.id]);
     if (existing.rows.length === 0) return res.status(404).json({ error: 'Purchase order not found' });
+    await assertApprovalLimit(req, parseFloat(existing.rows[0].total || 0), 'purchase order');
     await query("UPDATE purchase_orders SET status = 'Sent', updated_at = CURRENT_TIMESTAMP WHERE id = $1", [req.params.id]);
     res.json({ message: 'PO sent' });
   } catch (error: any) {
+    if (error instanceof AppError) return res.status(error.statusCode).json({ error: error.message });
     res.status(500).json({ error: error.message });
   }
 });
 
 // Edit Draft PO
-router.put('/orders/:id', authenticate, auditLog('Purchases', 'Update PO'), async (req: AuthRequest, res: Response) => {
+router.put('/orders/:id', authenticate, hasUserPerm('purchases.purchase-order.edit'), auditLog('Purchases', 'Update PO'), async (req: AuthRequest, res: Response) => {
   try {
     const po = await query('SELECT * FROM purchase_orders WHERE id = $1', [req.params.id]);
     if (po.rows.length === 0) return res.status(404).json({ error: 'PO not found' });
     if (po.rows[0].status !== 'Draft') return res.status(400).json({ error: 'Only draft POs can be edited' });
+    auditBefore(req, auditSnapshot(po.rows[0], AUDIT_FIELDS.purchaseOrder));
 
-    const { supplier_id, items, expected_date, payment_terms, notes, vat_mode } = req.body;
+    const { supplier_id, items, expected_date, payment_terms, notes, terms_conditions, vat_mode } = req.body;
     if (!supplier_id) return res.status(400).json({ error: 'Supplier is required' });
-    const vatMode = vat_mode || 'VAT Inclusive';
+    const costBasis = normalizePurchaseCostBasis(vat_mode);
 
-    let subtotal = 0;
-    let totalLineDiscount = 0;
-
-    const orderItems = (items || []).map((item: any) => {
-      const qty = parseFloat(item.quantity) || 0;
-      const unitCost = parseFloat(item.unit_cost) || 0;
-      const gross = qty * unitCost;
-      const discType = item.discount_type || '%';
-      const discVal = parseFloat(item.discount_value || '0');
-      let discAmt = 0;
-      if (discType === '%') discAmt = gross * (discVal / 100);
-      else discAmt = discVal;
-      if (discAmt > gross) discAmt = gross;
-      const netLineTotal = gross - discAmt;
-      const netUnitCost = qty > 0 ? netLineTotal / qty : unitCost;
-      subtotal += gross;
-      totalLineDiscount += discAmt;
-      return {
-        product_id: item.product_id, quantity: qty, unit_cost: unitCost,
-        discount_type: discType, discount_value: discVal, discount_amount: Math.round(discAmt * 100) / 100,
-        net_unit_cost: Math.round(netUnitCost * 100) / 100,
-        net_total: Math.round(netLineTotal * 100) / 100,
-      };
-    });
-
-    const netSubtotal = subtotal - totalLineDiscount;
-    let vatAmount = 0;
-    let vatableAmount = netSubtotal;
-    let netTotal: number;
-
-    if (vatMode === 'VAT Inclusive') {
-      vatableAmount = netSubtotal / 1.12;
-      vatAmount = netSubtotal - vatableAmount;
-      netTotal = netSubtotal;
-    } else if (vatMode === 'VAT Exclusive') {
-      vatAmount = netSubtotal * 0.12;
-      netTotal = netSubtotal + vatAmount;
-    } else {
-      vatAmount = 0;
-      netTotal = netSubtotal;
-    }
+    const { orderItems, subtotal, totalLineDiscount, totals } = buildPurchaseOrderItemsFromRequest(items || [], costBasis);
 
     await query(
-      `UPDATE purchase_orders SET supplier_id = $1, expected_date = $2, payment_terms = $3, notes = $4,
-        subtotal = $5, discount = $6, tax = $7, vat_mode = $8, vat_amount = $9, vatable_amount = $10, total = $11,
-        updated_at = CURRENT_TIMESTAMP WHERE id = $12`,
-      [supplier_id, expected_date || null, payment_terms, notes,
-       subtotal, totalLineDiscount, vatAmount, vatMode, vatAmount, vatableAmount, netTotal, req.params.id]
+      `UPDATE purchase_orders SET supplier_id = $1, expected_date = $2, payment_terms = $3, notes = $4, terms_conditions = $5,
+        subtotal = $6, discount = $7, tax = $8, vat_mode = $9, vat_amount = $10, vatable_amount = $11, total = $12,
+        updated_at = CURRENT_TIMESTAMP WHERE id = $13`,
+      [supplier_id, expected_date || null, payment_terms, notes, terms_conditions || null,
+       subtotal, totalLineDiscount, totals.vat, costBasis, totals.vat, totals.vatable, totals.total, req.params.id]
     );
 
     // Delete old items and re-insert
     await query('DELETE FROM purchase_order_items WHERE po_id = $1', [req.params.id]);
     for (const item of orderItems) {
       await query(
-        `INSERT INTO purchase_order_items (id, po_id, product_id, quantity, unit_cost, discount_type, discount_value, discount_amount, net_unit_cost, net_total, total_cost)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        `INSERT INTO purchase_order_items (id, po_id, product_id, quantity, unit_cost, discount_type, discount_value, discount_amount, net_unit_cost, net_total, total_cost, tax_type)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
         [uuidv4(), req.params.id, item.product_id, item.quantity, item.unit_cost,
          item.discount_type, item.discount_value, item.discount_amount,
-         item.net_unit_cost, item.net_total, item.net_total]
+         item.net_unit_cost, item.net_total, item.net_total, item.tax_type]
       );
     }
 
-    res.json({ message: 'PO updated' });
+    auditAfter(req, auditSnapshot({
+      id: req.params.id,
+      po_number: po.rows[0].po_number,
+      status: po.rows[0].status,
+      supplier_id,
+      subtotal,
+      discount: totalLineDiscount,
+      tax: totals.vat,
+      vat_amount: totals.vat,
+      total: totals.total,
+      vat_mode: costBasis,
+    }, AUDIT_FIELDS.purchaseOrder));
+    res.json({ message: 'PO updated', id: req.params.id, po_number: po.rows[0].po_number });
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
 // ==================== GOODS RECEIPT ====================
-router.post('/receipts', authenticate, auditLog('Purchases', 'Goods Receipt'), async (req: AuthRequest, res: Response) => {
+router.post('/receipts', authenticate, hasUserPerm('purchases.receiving-report.create'), auditLog('Purchases', 'Goods Receipt'), async (req: AuthRequest, res: Response) => {
   const client = await getClient();
   try {
     await client.query('BEGIN');
     const gr_number = await generateRefNumber('GR', 'goods_receipts', 'gr_number');
-    const { po_id, supplier_id, location_id, items, notes, supplier_invoice_number } = req.body;
+    const { po_id, supplier_id, location_id, items, notes, terms_conditions, supplier_invoice_number } = req.body;
     if (!location_id) throw new AppError('Location ID is required');
     const id = uuidv4();
 
     await client.query(
-      `INSERT INTO goods_receipts (id, gr_number, po_id, supplier_id, location_id, received_date, notes, supplier_invoice_number, created_by)
-       VALUES ($1, $2, $3, $4, $5, CURRENT_DATE, $6, $7, $8)`,
-      [id, gr_number, po_id, supplier_id, location_id, notes, supplier_invoice_number || null, req.user!.id]
+      `INSERT INTO goods_receipts (id, gr_number, po_id, supplier_id, location_id, received_date, notes, terms_conditions, supplier_invoice_number, created_by)
+       VALUES ($1, $2, $3, $4, $5, CURRENT_DATE, $6, $7, $8, $9)`,
+      [id, gr_number, po_id, supplier_id, location_id, notes, terms_conditions || null, supplier_invoice_number || null, req.user!.id]
     );
 
     for (const item of items || []) {
       const batchId = uuidv4();
       const discAmt = parseFloat(item.discount_amount || '0');
       const netUnitCost = parseFloat(item.net_unit_cost || item.unit_cost || '0');
-      // Inventory stores VAT-inclusive discounted cost for operational GP
-      // GL journal entry strips VAT separately for accounting
       const totalCost = parseFloat(item.quantity) * netUnitCost;
 
-      // Create batch
       await client.query(
         `INSERT INTO batches (id, product_id, location_id, batch_number, supplier_batch, manufacturing_date, expiry_date, quantity, unit_cost)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
@@ -327,14 +522,12 @@ router.post('/receipts', authenticate, auditLog('Purchases', 'Goods Receipt'), a
          item.manufacturing_date, item.expiry_date, item.quantity, netUnitCost]
       );
 
-      // Add to goods receipt items
       await client.query(
         `INSERT INTO goods_receipt_items (id, gr_id, po_item_id, product_id, batch_id, quantity, unit_cost, discount_amount, net_unit_cost, total_cost, expiry_date, batch_number)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
         [uuidv4(), id, item.po_item_id, item.product_id, batchId, item.quantity, item.unit_cost, discAmt, netUnitCost, totalCost, item.expiry_date, item.batch_number]
       );
 
-      // Update inventory using discounted net cost
       const inventory = await client.query(
         'SELECT * FROM inventory WHERE product_id = $1 AND location_id = $2',
         [item.product_id, location_id]
@@ -345,7 +538,6 @@ router.post('/receipts', authenticate, auditLog('Purchases', 'Goods Receipt'), a
         const currentCost = parseFloat(inventory.rows[0].unit_cost);
         const newQty = currentQty + parseFloat(item.quantity);
 
-        // Moving average cost using net (discounted) cost
         const totalValue = (currentCost * currentQty) + (netUnitCost * parseFloat(item.quantity));
         const newAvgCost = newQty > 0 ? totalValue / newQty : 0;
 
@@ -360,7 +552,6 @@ router.post('/receipts', authenticate, auditLog('Purchases', 'Goods Receipt'), a
         );
       }
 
-      // Inventory ledger entry
       const currentQty = inventory.rows.length > 0 ? parseFloat(inventory.rows[0].quantity) : 0;
       const newRunningQty = currentQty + parseFloat(item.quantity);
       await client.query(
@@ -451,22 +642,26 @@ router.post('/receipts', authenticate, auditLog('Purchases', 'Goods Receipt'), a
     // Update goods receipt status
     await client.query("UPDATE goods_receipts SET status = 'Completed' WHERE id = $1", [id]);
 
-    // Create Accounts Payable journal entry
-    const totalAmount = items.reduce((sum: number, i: any) => sum + (parseFloat(i.quantity) * parseFloat(i.net_unit_cost || i.unit_cost || '0')), 0);
-    const totalGross = items.reduce((sum: number, i: any) => sum + (parseFloat(i.quantity) * parseFloat(i.unit_cost || '0')), 0);
-    const totalDiscount = totalGross - totalAmount;
-
-    // Fetch PO vat_mode for correct accounting
-    let poVatMode = 'VAT Inclusive';
-    let inputVatAmt = 0;
-    let netInventoryCost = totalAmount;
+    // Create Accounts Payable journal entry (per-line tax from PO items)
+    let poCostBasis = normalizePurchaseCostBasis('VAT Inclusive');
+    const taxTypeByPoItem: Record<string, string> = {};
     if (po_id) {
-      const po = await client.query('SELECT vat_mode, vat_amount FROM purchase_orders WHERE id = $1', [po_id]);
-      if (po.rows.length > 0 && po.rows[0].vat_mode === 'VAT Inclusive') {
-        poVatMode = 'VAT Inclusive';
-        netInventoryCost = totalAmount / 1.12;
-        inputVatAmt = totalAmount - netInventoryCost;
-      }
+      const po = await client.query('SELECT vat_mode FROM purchase_orders WHERE id = $1', [po_id]);
+      if (po.rows.length > 0) poCostBasis = normalizePurchaseCostBasis(po.rows[0].vat_mode);
+      const poItems = await client.query('SELECT id, tax_type FROM purchase_order_items WHERE po_id = $1', [po_id]);
+      for (const row of poItems.rows) taxTypeByPoItem[row.id] = row.tax_type || 'VAT';
+    }
+
+    let netInventoryCost = 0;
+    let inputVatAmt = 0;
+    let apTotal = 0;
+    for (const item of items || []) {
+      const lineAmount = parseFloat(item.quantity) * parseFloat(item.net_unit_cost || item.unit_cost || '0');
+      const taxType = taxTypeByPoItem[item.po_item_id] || 'VAT';
+      const acct = calculateGrLineAccounting(lineAmount, taxType, poCostBasis);
+      netInventoryCost += acct.inventoryDebit;
+      inputVatAmt += acct.inputVat;
+      apTotal += acct.apCredit;
     }
 
     const apEntryId = uuidv4();
@@ -475,36 +670,33 @@ router.post('/receipts', authenticate, auditLog('Purchases', 'Goods Receipt'), a
     await client.query(
       `INSERT INTO journal_entries (id, entry_number, entry_date, reference_type, reference_id, description, total_debit, total_credit, created_by)
        VALUES ($1, $2, CURRENT_DATE, 'Goods Receipt', $3, $4, $5, $5, $6)`,
-      [apEntryId, apEntryNumber, id, `AP from GR ${gr_number}`, totalAmount, req.user!.id]
+      [apEntryId, apEntryNumber, id, `AP from GR ${gr_number}`, apTotal, req.user!.id]
     );
 
-    if (poVatMode === 'VAT Inclusive' && inputVatAmt > 0) {
-      // Debit Inventory at net of VAT cost
+    if (inputVatAmt > 0) {
       await client.query(
         `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
          VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '1200'), $3, $4, 0, 'Goods Receipt', $5)`,
         [uuidv4(), apEntryId, `Inventory (net) ${gr_number}`, netInventoryCost, id]
       );
-      // Debit Input VAT
       await client.query(
         `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
          VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '1106'), $3, $4, 0, 'Goods Receipt', $5)`,
         [uuidv4(), apEntryId, `Input VAT ${gr_number}`, inputVatAmt, id]
       );
     } else {
-      // Debit Inventory at gross/net cost
       await client.query(
         `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
          VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '1200'), $3, $4, 0, 'Goods Receipt', $5)`,
-        [uuidv4(), apEntryId, `Inventory ${gr_number}`, totalAmount, id]
+        [uuidv4(), apEntryId, `Inventory ${gr_number}`, netInventoryCost, id]
       );
     }
 
-    // Credit Accounts Payable at net cost
+    // Credit Accounts Payable
     await client.query(
       `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
        VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '2000'), $3, 0, $4, 'Goods Receipt', $5)`,
-      [uuidv4(), apEntryId, `AP from ${gr_number}`, totalAmount, id]
+      [uuidv4(), apEntryId, `AP from ${gr_number}`, apTotal, id]
     );
 
     // Note: Supplier balance is updated when APV is posted, not here
@@ -519,60 +711,324 @@ router.post('/receipts', authenticate, auditLog('Purchases', 'Goods Receipt'), a
   }
 });
 
-router.get('/receipts', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/receipts', authenticate, grView, async (req: AuthRequest, res: Response) => {
   try {
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 20;
+    const offset = (page - 1) * limit;
+    const supplier_id = req.query.supplier_id as string;
+    const po_id = req.query.po_id as string;
+
+    const where: string[] = [];
+    const params: any[] = [];
+    let pi = 1;
+
+    if (supplier_id) { where.push(`gr.supplier_id = $${pi}`); params.push(supplier_id); pi++; }
+    if (po_id) { where.push(`gr.po_id = $${pi}`); params.push(po_id); pi++; }
+
+    const whereClause = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
+
+    const total = await query(`SELECT COUNT(*) FROM goods_receipts gr ${whereClause}`, params);
+
     const result = await query(
-      `SELECT gr.*, s.supplier_name, l.name as location_name
+      `SELECT gr.*, s.supplier_name, l.name as location_name, po.po_number,
+              u.full_name as created_by_name,
+              (SELECT COUNT(*) FROM goods_receipt_items WHERE gr_id = gr.id) as item_count,
+              (SELECT COALESCE(SUM(total_cost), 0) FROM goods_receipt_items WHERE gr_id = gr.id) as total_amount
        FROM goods_receipts gr
        LEFT JOIN suppliers s ON gr.supplier_id = s.id
        LEFT JOIN locations l ON gr.location_id = l.id
-       ORDER BY gr.created_at DESC`
+       LEFT JOIN purchase_orders po ON gr.po_id = po.id
+       LEFT JOIN users u ON gr.created_by = u.id
+       ${whereClause}
+       ORDER BY gr.created_at DESC
+       LIMIT $${pi} OFFSET $${pi + 1}`,
+      [...params, limit, offset]
     );
-    res.json(result.rows);
+    res.json({ data: result.rows, total: parseInt(total.rows[0].count), page, limit });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 });
 
+router.get('/receipts/:id', authenticate, grView, async (req: AuthRequest, res: Response) => {
+  try {
+    const gr = await query(
+      `SELECT gr.*, s.supplier_name, s.supplier_code, s.tin as supplier_tin, s.address as supplier_address,
+              l.name as location_name, po.po_number, po.vat_mode,
+              u.full_name as created_by_name
+       FROM goods_receipts gr
+       LEFT JOIN suppliers s ON gr.supplier_id = s.id
+       LEFT JOIN locations l ON gr.location_id = l.id
+       LEFT JOIN purchase_orders po ON gr.po_id = po.id
+       LEFT JOIN users u ON gr.created_by = u.id
+       WHERE gr.id = $1`,
+      [req.params.id]
+    );
+    if (gr.rows.length === 0) return res.status(404).json({ error: 'Goods receipt not found' });
+
+    const items = await query(
+      `SELECT gri.*, p.sku, p.name as product_name, COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
+       FROM goods_receipt_items gri
+       JOIN products p ON gri.product_id = p.id
+       WHERE gri.gr_id = $1 ORDER BY gri.id`,
+      [req.params.id]
+    );
+
+    const totalAmount = items.rows.reduce((s: number, i: any) => s + parseFloat(i.total_cost || 0), 0);
+    res.json({ ...gr.rows[0], items: items.rows, total_amount: totalAmount });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/receipts/:id/print', authenticate, hasUserPerm('purchases.receiving-report.print'), async (req: AuthRequest, res: Response) => {
+  try {
+    const gr = await query(
+      `SELECT gr.*, s.supplier_name, s.supplier_code, s.tin as supplier_tin, s.address as supplier_address,
+              l.name as location_name, po.po_number, po.vat_mode,
+              u.full_name as created_by_name
+       FROM goods_receipts gr
+       LEFT JOIN suppliers s ON gr.supplier_id = s.id
+       LEFT JOIN locations l ON gr.location_id = l.id
+       LEFT JOIN purchase_orders po ON gr.po_id = po.id
+       LEFT JOIN users u ON gr.created_by = u.id
+       WHERE gr.id = $1`,
+      [req.params.id]
+    );
+    if (gr.rows.length === 0) return res.status(404).send('Not found');
+    const d = gr.rows[0];
+
+    const items = await query(
+      `SELECT gri.*, p.sku, p.name as product_name, COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
+       FROM goods_receipt_items gri
+       JOIN products p ON gri.product_id = p.id
+       WHERE gri.gr_id = $1 ORDER BY gri.id`,
+      [req.params.id]
+    );
+
+    const biz = await query('SELECT * FROM business_details WHERE id = 1');
+    const b = biz.rows[0] || {};
+
+    const totalQty = items.rows.reduce((s: number, r: any) => s + parseFloat(r.quantity || 0), 0);
+    const totalAmount = items.rows.reduce((s: number, r: any) => s + parseFloat(r.total_cost || 0), 0);
+
+    const itemRows = items.rows.map((row: any, idx: number) => tableRow([
+      { html: String(idx + 1), align: 'c' },
+      { html: row.product_name || '—' },
+      { html: String(parseFloat(row.quantity)), align: 'c' },
+      { html: row.unit_of_measure || 'pc', align: 'c' },
+      { html: row.batch_number || '—', align: 'c' },
+      { html: row.expiry_date ? fmtDate(row.expiry_date, 'short') : '—', align: 'c' },
+      { html: fmtCurrency(row.net_unit_cost || row.unit_cost), align: 'r' },
+      { html: fmtCurrency(row.total_cost), align: 'r' },
+    ])).join('');
+
+    const summaryRows = [
+      { label: 'Total Items', value: String(items.rows.length) },
+      { label: 'Total Quantity', value: String(totalQty) },
+      { label: 'TOTAL RECEIVED', value: fmtCurrency(totalAmount), total: true },
+    ];
+
+    res.send(buildSalesEnterpriseDocument({
+      pageTitle: `Goods Receipt ${d.gr_number}`,
+      docTitle: 'Goods Receipt',
+      docMetaRows: [
+        { label: 'Document No.', value: d.gr_number || '—' },
+        { label: 'Received Date', value: fmtDate(d.received_date, 'short') },
+        { label: 'Location', value: d.location_name || '—' },
+        { label: 'Status', value: String(d.status || 'Draft').toUpperCase() },
+      ],
+      partySectionTitle: 'Supplier Information',
+      customerRows: buildSupplierMetaRows({
+        name: d.supplier_name,
+        code: d.supplier_code,
+        address: d.supplier_address,
+        tin: d.supplier_tin,
+      }),
+      detailsTitle: 'Receipt Details',
+      detailsRows: [
+        ...(d.po_number ? [{ label: 'PO Reference', value: d.po_number }] : []),
+        ...(d.supplier_invoice_number ? [{ label: 'Supplier Invoice', value: d.supplier_invoice_number }] : []),
+        ...(d.created_by_name ? [{ label: 'Received By', value: d.created_by_name }] : []),
+      ],
+      itemHeaders: GOODS_RECEIPT_HEADERS,
+      itemRows,
+      summaryRows,
+      amountInWords: totalAmount,
+      notes: [{ label: 'Remarks', content: d.notes || 'Goods received and checked against purchase order.' }],
+      footerNote: 'System-generated goods receipt.',
+      status: d.status,
+      biz: b,
+      signatures: buildEnterpriseSignatures(b),
+    }));
+  } catch (error: any) { res.status(500).send('<p>Error: ' + error.message + '</p>'); }
+});
+
 // ==================== PURCHASE RETURNS ====================
-router.post('/returns', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/returns', authenticate, grView, async (req: AuthRequest, res: Response) => {
+  try {
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 20;
+    const offset = (page - 1) * limit;
+    const total = await query('SELECT COUNT(*) FROM purchase_returns');
+    const result = await query(
+      `SELECT pr.*, s.supplier_name,
+              (SELECT COUNT(*) FROM purchase_return_items WHERE return_id = pr.id) as item_count
+       FROM purchase_returns pr
+       LEFT JOIN suppliers s ON pr.supplier_id = s.id
+       ORDER BY pr.created_at DESC
+       LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    );
+    res.json({ data: result.rows, total: parseInt(total.rows[0].count), page, limit });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/returns/:id', authenticate, grView, async (req: AuthRequest, res: Response) => {
+  try {
+    const pret = await query(
+      `SELECT pr.*, s.supplier_name, s.supplier_code, u.full_name as created_by_name
+       FROM purchase_returns pr
+       LEFT JOIN suppliers s ON pr.supplier_id = s.id
+       LEFT JOIN users u ON pr.created_by = u.id
+       WHERE pr.id = $1`,
+      [req.params.id]
+    );
+    if (pret.rows.length === 0) return res.status(404).json({ error: 'Purchase return not found' });
+    const items = await query(
+      `SELECT pri.*, p.sku, p.name as product_name,
+              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure,
+              l.name as location_name
+       FROM purchase_return_items pri
+       JOIN products p ON pri.product_id = p.id
+       LEFT JOIN locations l ON pri.location_id = l.id
+       WHERE pri.return_id = $1`,
+      [req.params.id]
+    );
+    res.json({ ...pret.rows[0], items: items.rows });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/returns/:id/print', authenticate, hasUserPerm('purchases.receiving-report.print'), async (req: AuthRequest, res: Response) => {
+  try {
+    const pret = await query(
+      `SELECT pr.*, s.supplier_name, s.supplier_code, s.address as supplier_address, u.full_name as created_by_name
+       FROM purchase_returns pr
+       LEFT JOIN suppliers s ON pr.supplier_id = s.id
+       LEFT JOIN users u ON pr.created_by = u.id
+       WHERE pr.id = $1`,
+      [req.params.id]
+    );
+    if (pret.rows.length === 0) return res.status(404).send('Not found');
+    const d = pret.rows[0];
+    const items = await query(
+      `SELECT pri.*, p.sku, p.name as product_name,
+              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
+       FROM purchase_return_items pri
+       JOIN products p ON pri.product_id = p.id
+       WHERE pri.return_id = $1`,
+      [req.params.id]
+    );
+    const biz = await query('SELECT * FROM business_details WHERE id = 1');
+    const b = biz.rows[0] || {};
+    const itemRows = items.rows.map((i: any) => tableRow([
+      { html: i.sku || '—' },
+      { html: i.product_name || '—' },
+      { html: i.unit_of_measure || 'pc', align: 'c' },
+      { html: parseFloat(i.quantity).toFixed(2), align: 'c' },
+      { html: fmtCurrency(i.net_unit_cost || i.unit_cost), align: 'r' },
+      { html: fmtCurrency(i.total_cost), align: 'r' },
+    ])).join('');
+    const totalReturn = parseFloat(d.total || 0);
+    res.send(buildSalesEnterpriseDocument({
+      pageTitle: `Purchase Return ${d.pr_number}`,
+      docTitle: 'Purchase Return',
+      docMetaRows: [
+        { label: 'Document No.', value: d.pr_number || '—' },
+        { label: 'Return Date', value: fmtDate(d.return_date, 'short') },
+        { label: 'Status', value: String(d.status || 'Draft').toUpperCase() },
+      ],
+      partySectionTitle: 'Supplier Information',
+      customerRows: buildSupplierMetaRows({ name: d.supplier_name, code: d.supplier_code, address: d.supplier_address }),
+      detailsTitle: 'Return Details',
+      detailsRows: [
+        { label: 'Reason', value: d.reason || '—' },
+        { label: 'Prepared By', value: d.created_by_name || '—' },
+      ],
+      itemHeaders: [
+        { text: 'Item Code', align: 'left', width: '72px' },
+        { text: 'Description', align: 'left' },
+        { text: 'UOM', align: 'center', width: '40px' },
+        { text: 'Qty', align: 'center', width: '44px' },
+        { text: 'Unit Cost', align: 'right', width: '76px' },
+        { text: 'Amount', align: 'right', width: '80px' },
+      ],
+      itemRows,
+      summaryRows: [{ label: 'TOTAL RETURN', value: fmtCurrency(totalReturn), total: true }],
+      amountInWords: totalReturn,
+      notes: d.notes ? [{ label: 'Remarks', content: d.notes }] : [],
+      footerNote: 'System-generated purchase return.',
+      status: d.status,
+      biz: b,
+      signatures: buildEnterpriseSignatures(b),
+      signatureCols: 2,
+    }));
+  } catch (error: any) { res.status(500).send('<p>Error: ' + error.message + '</p>'); }
+});
+
+router.post('/returns', authenticate, hasUserPerm('purchases.receiving-report.edit'), async (req: AuthRequest, res: Response) => {
   const client = await getClient();
   try {
     await client.query('BEGIN');
     const pr_number = await generateRefNumber('PRET', 'purchase_returns', 'pr_number');
-    const { supplier_id, items, reason, notes } = req.body;
+    const { supplier_id, items, reason, notes, terms_conditions } = req.body;
     const id = uuidv4();
 
     await client.query(
-      `INSERT INTO purchase_returns (id, pr_number, supplier_id, return_date, status, reason, notes, created_by)
-       VALUES ($1, $2, $3, CURRENT_DATE, 'Draft', $4, $5, $6)`,
-      [id, pr_number, supplier_id, reason, notes, req.user!.id]
+      `INSERT INTO purchase_returns (id, pr_number, supplier_id, return_date, status, reason, notes, terms_conditions, created_by)
+       VALUES ($1, $2, $3, CURRENT_DATE, 'Draft', $4, $5, $6, $7)`,
+      [id, pr_number, supplier_id, reason, notes, terms_conditions || null, req.user!.id]
     );
 
     let totalReturn = 0;
     for (const item of items || []) {
       const netCost = parseFloat(item.net_unit_cost || item.unit_cost || '0');
-      const total = parseFloat(item.quantity) * netCost;
+      const qty = parseFloat(item.quantity);
+      const total = qty * netCost;
       totalReturn += total;
+
+      await client.query(
+        `INSERT INTO purchase_return_items (id, return_id, product_id, location_id, batch_id, quantity, unit_cost, net_unit_cost, total_cost)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [uuidv4(), id, item.product_id, item.location_id || 1, item.batch_id || null,
+         qty, parseFloat(item.unit_cost || netCost), netCost, total]
+      );
 
       // Deduct from inventory
       const inventory = await client.query(
         'SELECT * FROM inventory WHERE product_id = $1 AND location_id = $2',
         [item.product_id, item.location_id || 1]
       );
-      if (inventory.rows.length > 0) {
-        const newQty = parseFloat(inventory.rows[0].quantity) - parseFloat(item.quantity);
-        if (newQty < 0) throw new AppError('Negative inventory not allowed for return');
-        await client.query('UPDATE inventory SET quantity = $1 WHERE id = $2', [newQty, inventory.rows[0].id]);
-
-        // Inventory ledger entry
-        await client.query(
-          `INSERT INTO inventory_ledger (id, product_id, location_id, reference_type, reference_id, transaction_type, quantity, running_quantity, unit_cost, total_cost, created_by)
-           VALUES ($1, $2, $3, 'Purchase Return', $4, 'OUT', $5, $6, $7, $8, $9)`,
-          [uuidv4(), item.product_id, item.location_id || 1, id, parseFloat(item.quantity), newQty,
-           netCost, total, req.user!.id]
-        );
+      if (inventory.rows.length === 0) {
+        throw new AppError('No inventory record for this product at the selected location');
       }
+      const currentQty = parseFloat(inventory.rows[0].quantity);
+      const newQty = currentQty - qty;
+      if (newQty < 0) throw new AppError('Return quantity exceeds available stock');
+      await client.query('UPDATE inventory SET quantity = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [newQty, inventory.rows[0].id]);
+
+      // Inventory ledger entry
+      await client.query(
+        `INSERT INTO inventory_ledger (id, product_id, location_id, reference_type, reference_id, transaction_type, quantity, running_quantity, unit_cost, total_cost, created_by)
+         VALUES ($1, $2, $3, 'Purchase Return', $4, 'OUT', $5, $6, $7, $8, $9)`,
+        [uuidv4(), item.product_id, item.location_id || 1, id, qty, newQty,
+         netCost, total, req.user!.id]
+      );
 
       // Deduct from batch
       if (item.batch_id) {
@@ -580,7 +1036,7 @@ router.post('/returns', authenticate, async (req: AuthRequest, res: Response) =>
       }
     }
 
-    await client.query("UPDATE purchase_returns SET status = 'Completed' WHERE id = $1", [id]);
+    await client.query("UPDATE purchase_returns SET status = 'Completed', total = $1 WHERE id = $2", [totalReturn, id]);
 
     // Update supplier balance
     if (supplier_id) {
@@ -621,12 +1077,8 @@ router.post('/returns', authenticate, async (req: AuthRequest, res: Response) =>
 });
 
 // Printable Purchase Order
-router.get('/orders/:id/print', async (req: AuthRequest, res: Response) => {
+router.get('/orders/:id/print', authenticate, hasUserPerm('purchases.purchase-order.print'), async (req: AuthRequest, res: Response) => {
   try {
-    const token = req.query.token as string || (req.headers.authorization || '').replace('Bearer ', '');
-    if (!token) return res.status(401).json({ error: 'Authentication required' });
-    try { jwt.verify(token, config.jwtSecret); } catch { return res.status(401).json({ error: 'Invalid token' }); }
-
     const po = await query(
       `SELECT po.*, s.supplier_name, s.supplier_code, s.contact_person, s.phone as contact_number, s.tin as supplier_tin, s.address as supplier_address, u.full_name as created_by_name
        FROM purchase_orders po
@@ -639,25 +1091,26 @@ router.get('/orders/:id/print', async (req: AuthRequest, res: Response) => {
     const d = po.rows[0];
 
     const items = await query(
-      `SELECT poi.*, p.sku, p.name as product_name, p.unit_of_measure
+      `SELECT poi.*, p.sku, p.name as product_name,
+              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
        FROM purchase_order_items poi
        JOIN products p ON poi.product_id = p.id
        WHERE poi.po_id = $1 ORDER BY poi.id`,
       [req.params.id]
     );
 
-    const fc = (val: any) => { const n = parseFloat(val); return isNaN(n) ? '0.00' : n.toLocaleString('en-PH', { minimumFractionDigits: 2 }); };
-
-    const itemRows = items.rows.map((row: any, idx: number) => `
-      <tr>
-        <td style="padding:4px 6px;font-size:10px">${row.product_name || '-'}</td>
-        <td style="padding:4px 6px;font-size:10px;text-align:center">${parseFloat(row.quantity)}</td>
-        <td style="padding:4px 6px;font-size:10px;text-align:center">${row.unit_of_measure || '-'}</td>
-        <td style="padding:4px 6px;font-size:10px;text-align:right">${fc(row.unit_cost)}</td>
-        <td style="padding:4px 6px;font-size:10px;text-align:right">${fc(row.discount_amount || 0)}</td>
-        <td style="padding:4px 6px;font-size:10px;text-align:right">${fc(row.net_total || row.total_cost)}</td>
-      </tr>
-    `).join('');
+    const itemRows = items.rows.map((row: any) => {
+      const taxLabel = formatTaxLabel(row.tax_type);
+      return tableRow([
+        { html: row.product_name || '—' },
+        { html: String(parseFloat(row.quantity)), align: 'c' },
+        { html: row.unit_of_measure || 'pc', align: 'c' },
+        { html: fmtCurrency(row.unit_cost), align: 'r' },
+        { html: taxLabel, align: 'c' },
+        { html: fmtCurrency(row.discount_amount || 0), align: 'r' },
+        { html: fmtCurrency(row.net_total || row.total_cost), align: 'r' },
+      ]);
+    }).join('');
 
     const grossTotal = parseFloat(d.subtotal) || 0;
     const discountAmt = parseFloat(d.discount) || 0;
@@ -665,129 +1118,73 @@ router.get('/orders/:id/print', async (req: AuthRequest, res: Response) => {
     const vatAmt = parseFloat(d.vat_amount) || 0;
     const total = parseFloat(d.total) || 0;
     const totalQty = items.rows.reduce((s: number, r: any) => s + parseFloat(r.quantity), 0);
+    let vatExemptAmt = 0;
+    let zeroRatedAmt = 0;
+    for (const row of items.rows) {
+      const net = parseFloat(row.net_total || row.total_cost || 0);
+      if (row.tax_type === 'VAT Exempt') vatExemptAmt += net;
+      else if (row.tax_type === 'Zero Rated') zeroRatedAmt += net;
+    }
 
     const biz = await query('SELECT * FROM business_details WHERE id = 1');
     const b = biz.rows[0] || {};
 
-    const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Purchase Order ${d.po_number}</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:'Courier New',monospace;font-size:10px;color:#111;padding:8mm 10mm;max-width:210mm;margin:0 auto;letter-spacing:0.2px;text-rendering:optimizeSpeed}
-.company-header{text-align:center;margin-bottom:8px}
-.company-header h1{font-size:18px;font-weight:bold;letter-spacing:4px;margin:0}
-.company-header .tagline{font-size:9px;color:#111;margin:3px 0}
-.company-header .info{font-size:8px;color:#111;margin:2px 0}
-.dot-divider{text-align:center;font-size:11px;font-weight:bold;margin:4px 0;letter-spacing:1px}
-.dot-divider-thin{text-align:center;font-size:10px;color:#444;margin:2px 0;letter-spacing:1px}
-.doc-title{text-align:center;border:1px dotted #444;padding:6px 0;margin:8px 0}
-.doc-title h2{font-size:14px;font-weight:bold;letter-spacing:6px;margin:0}
-.doc-title .sub{font-size:9px;color:#333}
-.details{display:flex;gap:20px;margin:10px 0}
-.details-left{flex:1;border:1px dotted #444;padding:8px 10px}
-.details-right{flex:1;border:1px dotted #444;padding:8px 10px}
-.details-left .label,.details-right .label{font-size:9px;font-weight:bold;text-transform:uppercase;margin-bottom:5px}
-.details p{font-size:9px;margin:2px 0}
-.items-table{width:100%;border-collapse:collapse;margin:10px 0}
-.items-table th{background:#f8f8f8;border:1px dotted #444;padding:5px 6px;font-size:9px;text-align:left;font-weight:bold}
-.items-table td{border:1px dotted #444;padding:4px 6px;font-size:9px}
-.computation{display:flex;justify-content:flex-end;margin:10px 0}
-.comp-table{width:260px;border-collapse:collapse}
-.comp-table td{padding:3px 8px;font-size:9px}
-.comp-table td:last-child{text-align:right}
-.comp-table .total-row{border-top:2px dotted #000;font-size:12px;font-weight:bold}
-.terms-sect{display:flex;gap:20px;margin:12px 0}
-.terms-left,.terms-right{flex:1;border:1px dotted #444;padding:8px 10px}
-.terms-sect h4{font-size:9px;font-weight:bold;text-transform:uppercase;margin-bottom:4px}
-.terms-sect p{font-size:8px;line-height:1.4;color:#111}
-.signatures{display:flex;justify-content:space-between;margin-top:28px;gap:10px}
-.sig-block{text-align:center;flex:1}
-.sig-block .sig-line{border-bottom:1px solid #000;height:34px;margin-bottom:4px}
-.sig-block .sig-label{font-size:8px;color:#222}
-.footer-note{text-align:center;font-size:7px;color:#666;margin-top:14px}
-@media print{body{padding:5mm 8mm;font-size:10px}}
-</style></head><body>
+    const summaryRows = [
+      { label: 'Total Items', value: String(items.rows.length) },
+      { label: 'Total Quantity', value: String(totalQty) },
+      { label: 'Trade Subtotal', value: fmtCurrency(grossTotal) },
+      ...(discountAmt > 0 ? [{ label: 'Less Discount', value: fmtCurrency(discountAmt) }] : []),
+      ...(vatableAmt > 0 ? [{ label: 'VATable Purchase', value: fmtCurrency(vatableAmt) }] : []),
+      ...(vatExemptAmt > 0 ? [{ label: 'VAT Exempt', value: fmtCurrency(vatExemptAmt) }] : []),
+      ...(zeroRatedAmt > 0 ? [{ label: 'Zero Rated', value: fmtCurrency(zeroRatedAmt) }] : []),
+      ...(vatAmt > 0 ? [{ label: 'Input VAT (12%)', value: fmtCurrency(vatAmt) }] : []),
+      { label: 'TOTAL PO AMOUNT', value: fmtCurrency(total), total: true },
+    ];
 
-<div class="company-header">
-  <h1>${b.business_name || 'D METRAN TRADING'}</h1>
-  <div class="tagline">${b.trade_name || 'General Merchandise &amp; Integrated Trade Distribution'}</div>
-  <div class="info">${b.address || ''}${b.city ? ', ' + b.city : ''} | Tel: ${b.telephone_number || b.mobile_number || ''} | Email: ${b.email_address || ''}</div>
-  <div class="info">TIN: ${b.tin_number || '123-456-789-000'} | ${b.vat_type || 'VAT Registered'}</div>
-</div>
-<div class="dot-divider">================================================</div>
-<div class="dot-divider-thin">------------------------------------------------</div>
-
-<div class="doc-title">
-  <h2>PURCHASE ORDER</h2>
-  <div class="sub">Document No: ${d.po_number}</div>
-</div>
-
-<div class="details">
-  <div class="details-left">
-    <div class="label">Supplier Account</div>
-    <p><strong>Name:</strong> ${d.supplier_name || '-'}</p>
-    ${d.supplier_code ? `<p><strong>Supplier Code:</strong> ${d.supplier_code}</p>` : ''}
-    ${d.supplier_address ? `<p><strong>Address:</strong> ${d.supplier_address}</p>` : ''}
-    ${d.supplier_tin ? `<p><strong>TIN:</strong> ${d.supplier_tin}</p>` : ''}
-    ${d.contact_person ? `<p><strong>Contact:</strong> ${d.contact_person}</p>` : ''}
-    ${d.contact_number ? `<p><strong>Phone:</strong> ${d.contact_number}</p>` : ''}
-  </div>
-  <div class="details-right">
-    <div class="label">Purchase Order Details</div>
-    <p><strong>PO Number:</strong> ${d.po_number}</p>
-    <p><strong>Order Date:</strong> ${new Date(d.order_date).toLocaleDateString('en-PH', {year:'numeric', month:'long', day:'numeric'})}</p>
-    ${d.expected_date ? `<p><strong>Expected Delivery:</strong> ${new Date(d.expected_date).toLocaleDateString('en-PH', {year:'numeric', month:'long', day:'numeric'})}</p>` : ''}
-    ${d.payment_terms ? `<p><strong>Payment Terms:</strong> ${d.payment_terms}</p>` : ''}
-    <p><strong>VAT Mode:</strong> ${d.vat_mode || 'N/A'}</p>
-    <p><strong>Status:</strong> ${d.status}</p>
-  </div>
-</div>
-
-<table class="items-table">
-  <thead><tr>
-    <th>Item Description</th>
-    <th style="width:55px;text-align:center">Qty</th>
-    <th style="width:50px;text-align:center">UOM</th>
-    <th style="width:80px;text-align:right">Unit Cost</th>
-    <th style="width:70px;text-align:right">Discount</th>
-    <th style="width:90px;text-align:right">Line Total</th>
-  </tr></thead>
-  <tbody>${itemRows}</tbody>
-</table>
-
-<div class="computation">
-  <table class="comp-table">
-    <tr><td>Total Items:</td><td>${items.rows.length}</td></tr>
-    <tr><td>Total Quantity:</td><td>${totalQty}</td></tr>
-    <tr><td>Trade Subtotal:</td><td>₱${fc(grossTotal)}</td></tr>
-    ${discountAmt > 0 ? `<tr><td>Less Discount:</td><td>₱${fc(discountAmt)}</td></tr>` : ''}
-    <tr><td>VATable Purchase:</td><td>₱${fc(vatableAmt)}</td></tr>
-    <tr><td>Input VAT (12%):</td><td>₱${fc(vatAmt)}</td></tr>
-    <tr class="total-row"><td>TOTAL PO AMOUNT:</td><td>₱${fc(total)}</td></tr>
-  </table>
-</div>
-
-<div class="terms-sect">
-  <div class="terms-left">
-    <h4>PURCHASE TERMS &amp; SUPPLIER INSTRUCTIONS</h4>
-    <p>Please deliver the ordered goods according to the quantities, unit cost, and delivery schedule stated in this Purchase Order. Any shortage, damaged item, wrong item, or expired item shall be subject to return or adjustment.</p>
-  </div>
-  <div class="terms-right">
-    <h4>RECEIVING &amp; INVENTORY CONDITIONS</h4>
-    <p>All received items must be checked against this Purchase Order. Batch number, expiry date, quantity received, and receiving location must be recorded before inventory is updated.</p>
-  </div>
-</div>
-
-<div class="signatures">
-  <div class="sig-block"><div class="sig-line"></div><div class="sig-label">Prepared by<br>PURCHASING STAFF</div></div>
-  <div class="sig-block"><div class="sig-line"></div><div class="sig-label">Checked by<br>INVENTORY / WAREHOUSE</div></div>
-  <div class="sig-block"><div class="sig-line"></div><div class="sig-label">Approved by<br>M. METRAN (PROPRIETOR)</div></div>
-</div>
-
-<div class="footer-note">
-  Printed: ${new Date().toLocaleString('en-PH')} | This is a computer-generated document
-</div>
-
-</body></html>`;
+    const html = buildSalesEnterpriseDocument({
+      pageTitle: `Purchase Order ${d.po_number}`,
+      docTitle: 'Purchase Order',
+      docMetaRows: [
+        { label: 'Document No.', value: d.po_number || '—' },
+        { label: 'Order Date', value: fmtDate(d.order_date, 'short') },
+        ...(d.expected_date ? [{ label: 'Expected Delivery', value: fmtDate(d.expected_date, 'short') }] : []),
+        { label: 'Status', value: String(d.status || 'Draft').toUpperCase() },
+      ],
+      partySectionTitle: 'Supplier Information',
+      customerRows: buildSupplierMetaRows({
+        name: d.supplier_name,
+        code: d.supplier_code,
+        address: d.supplier_address,
+        tin: d.supplier_tin,
+        contact: d.contact_person,
+        phone: d.contact_number,
+      }),
+      detailsTitle: 'Purchase Order Details',
+      detailsRows: [
+        ...(d.payment_terms ? [{ label: 'Payment Terms', value: d.payment_terms }] : []),
+        { label: 'Cost Basis', value: normalizePurchaseCostBasis(d.vat_mode) },
+        ...(d.created_by_name ? [{ label: 'Prepared By', value: d.created_by_name }] : []),
+      ],
+      itemHeaders: PURCHASE_ORDER_HEADERS,
+      itemRows,
+      summaryRows,
+      amountInWords: total,
+      notes: [
+        {
+          label: 'Purchase Terms & Supplier Instructions',
+          content: d.terms_conditions?.trim() || 'Please deliver the ordered goods according to the quantities, unit cost, and delivery schedule stated in this Purchase Order.',
+        },
+        {
+          label: 'Receiving & Inventory Conditions',
+          content: d.notes?.trim() || 'All received items must be checked against this Purchase Order. Batch number, expiry date, quantity received, and receiving location must be recorded before inventory is updated.',
+        },
+      ],
+      footerNote: 'System-generated purchase order.',
+      status: d.status,
+      biz: b,
+      signatures: buildEnterpriseSignatures(b),
+      signatureCols: 3,
+    });
     res.send(html);
   } catch (error: any) { res.status(500).send('<p>Error: ' + error.message + '</p>'); }
 });

@@ -1,0 +1,45 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-d_metran_erp}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    volumes:
+      - erp_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-d_metran_erp}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  erp:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - '${ERP_PORT:-5000}:5000'
+    environment:
+      NODE_ENV: production
+      PORT: 5000
+      SERVE_FRONTEND: 'true'
+      FRONTEND_DIST: /app/frontend/dist
+      TRUST_PROXY: 'true'
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-24h}
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-d_metran_erp}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      UPLOAD_DIR: /app/uploads
+    volumes:
+      - erp_uploads:/app/uploads
+
+volumes:
+  erp_pg_data:
+  erp_uploads:

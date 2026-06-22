@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import ModalOverlay from '../../components/ModalOverlay';
 import api from '../../lib/api';
 import { formatCurrency, formatDate } from '../../lib/utils';
 import ProductAutocomplete from '../../components/ProductAutocomplete';
@@ -7,7 +8,7 @@ import toast from 'react-hot-toast';
 
 const LOCATIONS = [{ id: 1, name: 'Store' }, { id: 2, name: 'Warehouse' }];
 
-export default function ProductionOrders() {
+export default function ProductionOrders({ embedded = false }: { embedded?: boolean }) {
   const [orders, setOrders] = useState<any[]>([]);
   const [products, setProducts] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
@@ -19,6 +20,9 @@ export default function ProductionOrders() {
   const [totalPages, setTotalPages] = useState(1);
   const [total, setTotal] = useState(0);
 
+  const [boms, setBoms] = useState<any[]>([]);
+  const [selectedBom, setSelectedBom] = useState('');
+  const [bomQty, setBomQty] = useState(1);
   const [form, setForm] = useState({
     po_date: new Date().toISOString().split('T')[0],
     source_location_id: 1,
@@ -31,6 +35,7 @@ export default function ProductionOrders() {
   useEffect(() => {
     loadOrders();
     api.get('/products?limit=500').then(r => setProducts(r.data.data || [])).catch(() => {});
+    api.get('/production/boms').then(r => setBoms(r.data || [])).catch(() => {});
   }, []);
 
   const loadOrders = () => {
@@ -68,6 +73,22 @@ export default function ProductionOrders() {
   const totalInputCost = form.inputs.reduce((s, inp) => s + (parseFloat(inp.quantity) || 0) * (parseFloat(inp.unit_cost) || 0), 0);
   const totalOutputQty = form.outputs.reduce((s, out) => s + (parseFloat(out.quantity) || 0), 0);
   const outputUnitCost = totalOutputQty > 0 ? totalInputCost / totalOutputQty : 0;
+
+  const loadBom = async () => {
+    if (!selectedBom) { toast.error('Select a BOM'); return; }
+    try {
+      const r = await api.get(`/production/boms/${selectedBom}/load?qty=${bomQty}`);
+      setForm(f => ({
+        ...f,
+        inputs: r.data.inputs || [],
+        outputs: r.data.outputs || [],
+        notes: f.notes || `Loaded from ${r.data.bom?.bom_code || 'BOM'}`,
+      }));
+      toast.success('BOM loaded');
+    } catch {
+      toast.error('Failed to load BOM');
+    }
+  };
 
   const save = async () => {
     if (!form.source_location_id || !form.destination_location_id) { toast.error('Select locations'); return; }
@@ -156,6 +177,22 @@ export default function ProductionOrders() {
               <input type="text" value={form.notes} onChange={e => setForm({ ...form, notes: e.target.value })} className="w-full px-3 py-2 border rounded-lg text-sm" />
             </div>
           </div>
+          {boms.length > 0 && (
+            <div className="mt-3 flex flex-wrap items-end gap-2 pt-3 border-t">
+              <div className="flex-1 min-w-[200px]">
+                <label className="block text-xs font-medium text-gray-600 mb-1">Load from BOM</label>
+                <select value={selectedBom} onChange={e => setSelectedBom(e.target.value)} className="w-full px-3 py-2 border rounded-lg text-sm">
+                  <option value="">Select recipe…</option>
+                  {boms.map(b => <option key={b.id} value={b.id}>{b.bom_code} — {b.name}</option>)}
+                </select>
+              </div>
+              <div className="w-24">
+                <label className="block text-xs font-medium text-gray-600 mb-1">Output Qty</label>
+                <input type="number" min={0.01} step={0.01} value={bomQty} onChange={e => setBomQty(parseFloat(e.target.value) || 1)} className="w-full px-3 py-2 border rounded-lg text-sm" />
+              </div>
+              <button type="button" onClick={loadBom} className="px-3 py-2 bg-blue-700 text-white rounded-lg text-sm hover:bg-blue-800">Load BOM</button>
+            </div>
+          )}
         </div>
 
         {/* Input Materials */}
@@ -292,8 +329,8 @@ export default function ProductionOrders() {
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold text-gray-900">Production Orders</h1>
+      <div className={`flex items-center ${embedded ? 'justify-end' : 'justify-between'}`}>
+        {!embedded && <h1 className="text-2xl font-bold text-gray-900">Production Orders</h1>}
         <button onClick={() => setCreating(true)} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700">+ Create Order</button>
       </div>
       <div className="flex gap-2 flex-wrap">
@@ -342,8 +379,8 @@ export default function ProductionOrders() {
       </div>
 
       {previewId && (
-        <div className="modal-overlay" onClick={() => setPreviewId(null)}>
-          <div className="modal-content max-w-4xl" onClick={e => e.stopPropagation()} style={{ height: '90vh' }}>
+        <ModalOverlay onClose={() => setPreviewId(null)}>
+          <div className="modal-content max-w-4xl" style={{ height: '90vh' }}>
             <div className="flex justify-between items-center p-3 border-b">
               <h2 className="font-semibold">Production Order Preview</h2>
               <div className="flex gap-2">
@@ -353,7 +390,7 @@ export default function ProductionOrders() {
             </div>
             <iframe src={'/api/production/' + previewId + '/print'} className="w-full flex-1 border-0" style={{ height: 'calc(100% - 50px)' }} />
           </div>
-        </div>
+        </ModalOverlay>
       )}
     </div>
   );

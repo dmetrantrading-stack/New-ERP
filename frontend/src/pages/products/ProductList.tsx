@@ -1,11 +1,63 @@
 import React, { useState, useEffect } from 'react';
+import ModalOverlay from '../../components/ModalOverlay';
 import api from '../../lib/api';
 import { formatCurrency, generateBarcode } from '../../lib/utils';
-import { Plus, Search, Edit2, Eye, Download, Upload, ToggleLeft, Barcode, Trash2, FileText, X } from 'lucide-react';
+import { validateProductForm, isOnlyReorderLevelChanged } from '../../lib/productsUtils';
+import { useAuth } from '../../store/auth';
+import { Plus, Search, Edit2, Eye, Download, Upload, ToggleLeft, Barcode, Trash2, FileText, X, Loader2, Package, TrendingUp, Printer } from 'lucide-react';
 import Pagination from '../../components/Pagination';
 import toast from 'react-hot-toast';
 
-export default function ProductList() {
+function DetailSection({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div className="rounded-xl border border-gray-200 bg-white overflow-hidden">
+      <div className="px-4 py-2 bg-gray-50 border-b border-gray-100 text-xs font-semibold uppercase tracking-wide text-gray-500">{title}</div>
+      <div className="p-4 space-y-3">{children}</div>
+    </div>
+  );
+}
+
+function DetailRow({ label, value, mono = false, highlight = false }: { label: string; value: React.ReactNode; mono?: boolean; highlight?: boolean }) {
+  return (
+    <div className="flex items-start justify-between gap-4 text-sm">
+      <span className="text-gray-500 shrink-0">{label}</span>
+      <span className={`text-right ${mono ? 'font-mono text-xs' : ''} ${highlight ? 'font-semibold text-gray-900' : 'text-gray-800'}`}>{value}</span>
+    </div>
+  );
+}
+
+function MetricCard({ label, value, sub, tone = 'gray' }: { label: string; value: string; sub?: string; tone?: 'gray' | 'green' | 'red' | 'blue' | 'purple' }) {
+  const tones: Record<string, string> = {
+    gray: 'bg-gray-50 border-gray-200 text-gray-800',
+    green: 'bg-green-50 border-green-200 text-green-800',
+    red: 'bg-red-50 border-red-200 text-red-800',
+    blue: 'bg-blue-50 border-blue-200 text-blue-800',
+    purple: 'bg-purple-50 border-purple-200 text-purple-800',
+  };
+  return (
+    <div className={`rounded-xl border p-3 ${tones[tone]}`}>
+      <p className="text-[10px] font-semibold uppercase tracking-wide opacity-70">{label}</p>
+      <p className="text-lg font-bold mt-0.5 truncate">{value}</p>
+      {sub && <p className="text-xs opacity-70 mt-0.5 truncate">{sub}</p>}
+    </div>
+  );
+}
+
+const EMPTY_FORM = {
+  name: '', barcode: '', category_id: '', brand_id: '', unit_of_measure: 'pc', description: '',
+  cost: 0, retail_price: 0, wholesale_price: 0, distributor_price: 0, reorder_level: 0, tax_type: 'VAT', price_type: 'VAT Inclusive',
+  retail_markup: 0, wholesale_markup: 0, distributor_markup: 0,
+  has_chilled_variant: false, chilled_price: 0,
+  _manualRetail: false, _manualWholesale: false, _manualDistributor: false,
+};
+
+export default function ProductList({ embedded = false, onChanged }: { embedded?: boolean; onChanged?: () => void }) {
+  const { hasPerm, hasAnyPerm } = useAuth();
+  const showPriceType = hasAnyPerm(['pos.view', 'pos.write']);
+  const canCreate = hasPerm('inventory.inventory.create');
+  const canEdit = hasPerm('inventory.inventory.edit');
+  const canExport = hasPerm('inventory.inventory.export');
+  const readOnly = !canCreate && !canEdit;
   const [products, setProducts] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
@@ -32,12 +84,8 @@ export default function ProductList() {
   const [phFilterSupplier, setPhFilterSupplier] = useState('');
   const [phDateFrom, setPhDateFrom] = useState('');
   const [phDateTo, setPhDateTo] = useState('');
-  const [form, setForm] = useState<any>({
-    name: '', barcode: '', category_id: '', brand_id: '', unit_of_measure: 'pc', description: '',
-    cost: 0, retail_price: 0, wholesale_price: 0, distributor_price: 0, reorder_level: 0, tax_type: 'VAT', price_type: 'VAT Inclusive',
-    retail_markup: 0, wholesale_markup: 0, distributor_markup: 0,
-    has_chilled_variant: false, chilled_price: 0
-  });
+  const [saving, setSaving] = useState(false);
+  const [form, setForm] = useState<any>({ ...EMPTY_FORM });
 
   // Auto-calculate prices when cost or markup changes
   useEffect(() => {
@@ -59,7 +107,7 @@ export default function ProductList() {
   const loadProducts = () => {
     setLoading(true);
     api.get(`/products?search=${search}&is_active=${statusFilter}&page=${page}&limit=${limit}`)
-      .then((res) => { setProducts(res.data.data); setTotal(res.data.total); })
+      .then((res) => { setProducts(res.data.data); setTotal(res.data.total); onChanged?.(); })
       .catch(console.error).finally(() => setLoading(false));
   };
 
@@ -70,8 +118,14 @@ export default function ProductList() {
     api.get('/brands/all').then((res) => setBrands(res.data)).catch(console.error);
   }, []);
 
-  const openCreate = () => { setEditProduct(null); setForm({ name: '', barcode: '', category_id: '', brand_id: '', unit_of_measure: 'pc', description: '', cost: 0, retail_price: 0, wholesale_price: 0, distributor_price: 0, reorder_level: 0, tax_type: 'VAT', price_type: 'VAT Inclusive', retail_markup: 0, wholesale_markup: 0, distributor_markup: 0, has_chilled_variant: false, chilled_price: 0 }); setShowModal(true); };
+  const openCreate = () => {
+    if (!canCreate) { toast.error('You do not have permission to add products'); return; }
+    setEditProduct(null);
+    setForm({ ...EMPTY_FORM });
+    setShowModal(true);
+  };
   const openEdit = (p: any) => {
+    if (!canEdit) { toast.error('You do not have permission to edit products'); return; }
     const cost = parseFloat(p.cost) || 0;
     setEditProduct(p);
     setForm({
@@ -79,16 +133,28 @@ export default function ProductList() {
       retail_markup: cost > 0 ? Math.round(((parseFloat(p.retail_price) || 0) / cost - 1) * 100 * 100) / 100 : 0,
       wholesale_markup: cost > 0 ? Math.round(((parseFloat(p.wholesale_price) || 0) / cost - 1) * 100 * 100) / 100 : 0,
       distributor_markup: cost > 0 ? Math.round(((parseFloat(p.distributor_price) || 0) / cost - 1) * 100 * 100) / 100 : 0,
+      _manualRetail: false,
+      _manualWholesale: false,
+      _manualDistributor: false,
     });
     setShowModal(true);
   };
 
   const handleSave = async () => {
-    if (!form.name) { toast.error('Product name is required'); return; }
+    if (saving) return;
+    if (editProduct && !canEdit) { toast.error('You do not have permission to edit products'); return; }
+    if (!editProduct && !canCreate) { toast.error('You do not have permission to add products'); return; }
+
+    const validationError = validateProductForm(form);
+    if (validationError) { toast.error(validationError); return; }
+
+    setSaving(true);
     try {
       const payload = { ...form };
       delete payload._manualRetail; delete payload._manualWholesale; delete payload._manualDistributor;
       delete payload.retail_markup; delete payload.wholesale_markup; delete payload.distributor_markup;
+      payload.name = String(payload.name).trim();
+      payload.barcode = String(payload.barcode || '').trim();
       payload.category_id = payload.category_id || null;
       payload.brand_id = payload.brand_id || null;
       payload.cost = parseFloat(payload.cost) || 0;
@@ -99,8 +165,13 @@ export default function ProductList() {
       payload.chilled_price = parseFloat(payload.chilled_price) || 0;
       payload.has_chilled_variant = Boolean(payload.has_chilled_variant);
       if (editProduct) {
-        await api.put(`/products/${editProduct.id}`, payload);
-        toast.success('Product updated');
+        if (isOnlyReorderLevelChanged(editProduct, payload)) {
+          await api.patch(`/products/${editProduct.id}/reorder-level`, { reorder_level: payload.reorder_level });
+          toast.success('Reorder level updated');
+        } else {
+          await api.put(`/products/${editProduct.id}`, payload);
+          toast.success('Product updated');
+        }
       } else {
         await api.post('/products', payload);
         toast.success('Product created');
@@ -108,13 +179,16 @@ export default function ProductList() {
       setShowModal(false);
       loadProducts();
     } catch (err: any) { toast.error(err.response?.data?.error || 'Error saving product'); }
+    finally { setSaving(false); }
   };
 
   const toggleStatus = async (id: string) => {
-    try { await api.patch(`/products/${id}/toggle`); loadProducts(); toast.success('Status toggled'); } catch (err: any) { toast.error('Error toggling product'); }
+    if (!canEdit) { toast.error('You do not have permission to edit products'); return; }
+    try { await api.patch(`/products/${id}/toggle`); loadProducts(); toast.success('Status toggled'); } catch (err: any) { toast.error(err.response?.data?.error || 'Error toggling product'); }
   };
 
   const deleteProduct = async (id: string) => {
+    if (!canEdit) { toast.error('You do not have permission to delete products'); return; }
     if (!window.confirm('Are you sure you want to delete this product? This cannot be undone.')) return;
     try { await api.delete(`/products/${id}`); loadProducts(); toast.success('Product deleted'); } catch (err: any) { toast.error(err.response?.data?.error || 'Error deleting product'); }
   };
@@ -168,8 +242,19 @@ export default function ProductList() {
       ]);
       setPriceHistory(histRes.data);
       setPriceComparison(compRes.data);
-    } catch (err: any) { toast.error('Failed to load price history'); }
+    } catch (err: any) {
+      toast.error(err.response?.data?.error || 'Failed to load price history');
+    }
     setPhLoading(false);
+  };
+
+  const prefetchPriceSummary = async (productId: string) => {
+    try {
+      const compRes = await api.get(`/supplier-price-history/product/${productId}/comparison`);
+      setPriceComparison(compRes.data);
+    } catch {
+      /* optional teaser on overview */
+    }
   };
 
   const openDetail = (product: any) => {
@@ -178,6 +263,29 @@ export default function ProductList() {
     setShowDetail(true);
     setPriceHistory([]);
     setPriceComparison(null);
+    setPhFilterSupplier('');
+    setPhDateFrom('');
+    setPhDateTo('');
+    prefetchPriceSummary(product.id);
+  };
+
+  const openDetailWithHistory = (product: any) => {
+    setDetailProduct(product);
+    setDetailTab('price-history');
+    setShowDetail(true);
+    setPriceHistory([]);
+    setPriceComparison(null);
+    setPhFilterSupplier('');
+    setPhDateFrom('');
+    setPhDateTo('');
+    loadPriceHistory(product.id);
+  };
+
+  const switchDetailTab = (tab: 'details' | 'price-history') => {
+    setDetailTab(tab);
+    if (tab === 'price-history' && detailProduct && !phLoading && priceHistory.length === 0 && !priceComparison) {
+      loadPriceHistory(detailProduct.id);
+    }
   };
 
   const handleGenerateBarcode = () => {
@@ -189,20 +297,32 @@ export default function ProductList() {
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold text-gray-900">Products</h1>
+      {readOnly && (
+        <div className="px-4 py-2 bg-amber-50 border border-amber-200 rounded-lg text-amber-900 text-xs">
+          Read-only mode — you can view products but cannot add or edit. Contact an administrator for catalog access.
+        </div>
+      )}
+
+      <div className={`flex items-center ${embedded ? 'justify-end' : 'justify-between'}`}>
+        {!embedded && <h1 className="text-2xl font-bold text-gray-900">Products</h1>}
         <div className="flex gap-2">
-          <button onClick={() => setShowImportModal(true)} className="flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50"><Upload size={16} /> Import</button>
-          <div className="relative">
-            <button onClick={() => setShowExportDropdown(!showExportDropdown)} className="flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50"><Download size={16} /> Export</button>
-            {showExportDropdown && (
-              <div className="absolute right-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-lg z-10 w-40">
-                <button onClick={() => exportProducts('csv')} className="w-full text-left px-4 py-2.5 text-sm hover:bg-gray-50 border-b border-gray-100">Export as CSV</button>
-                <button onClick={() => exportProducts('xlsx')} className="w-full text-left px-4 py-2.5 text-sm hover:bg-gray-50">Export as Excel</button>
-              </div>
-            )}
-          </div>
-          <button onClick={openCreate} className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700"><Plus size={16} /> Add Product</button>
+          {canEdit && (
+            <button onClick={() => setShowImportModal(true)} className="flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50"><Upload size={16} /> Import</button>
+          )}
+          {canExport && (
+            <div className="relative">
+              <button onClick={() => setShowExportDropdown(!showExportDropdown)} className="flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50"><Download size={16} /> Export</button>
+              {showExportDropdown && (
+                <div className="absolute right-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-lg z-10 w-40">
+                  <button onClick={() => exportProducts('csv')} className="w-full text-left px-4 py-2.5 text-sm hover:bg-gray-50 border-b border-gray-100">Export as CSV</button>
+                  <button onClick={() => exportProducts('xlsx')} className="w-full text-left px-4 py-2.5 text-sm hover:bg-gray-50">Export as Excel</button>
+                </div>
+              )}
+            </div>
+          )}
+          {canCreate && (
+            <button onClick={openCreate} className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700"><Plus size={16} /> Add Product</button>
+          )}
         </div>
       </div>
 
@@ -227,7 +347,7 @@ export default function ProductList() {
           <table className="data-table">
             <thead>
               <tr>
-                <th>SKU</th><th>Name</th><th>Category</th><th>Cost</th><th>Retail</th><th>Wholesale</th><th>Stock</th><th>Status</th><th className="w-24">Actions</th>
+                <th>SKU</th><th>Name</th><th>Category</th><th>Cost</th><th>Retail</th><th>Wholesale</th><th>Stock</th><th>Status</th><th className="w-32">Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -238,7 +358,11 @@ export default function ProductList() {
               ) : products.map((p) => (
                 <tr key={p.id}>
                   <td className="font-mono text-xs">{p.sku}</td>
-                  <td className="font-medium">{p.name}</td>
+                  <td>
+                    <button type="button" onClick={() => openDetail(p)} className="font-medium text-left hover:text-blue-600 hover:underline">
+                      {p.name}
+                    </button>
+                  </td>
                   <td>{p.category_name || '-'}</td>
                   <td>{formatCurrency(p.cost)}</td>
                   <td>{formatCurrency(p.retail_price)}</td>
@@ -247,10 +371,15 @@ export default function ProductList() {
                   <td><span className={`px-2 py-1 text-xs rounded-full ${p.is_active ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{p.is_active ? 'Active' : 'Inactive'}</span></td>
                   <td>
                     <div className="flex gap-1">
-                      <button onClick={() => openDetail(p)} className="p-1.5 hover:bg-gray-50 rounded" title="View Details"><Eye size={15} /></button>
-                      <button onClick={() => openEdit(p)} className="p-1.5 hover:bg-blue-50 rounded text-blue-600"><Edit2 size={15} /></button>
-                      <button onClick={() => toggleStatus(p.id)} className="p-1.5 hover:bg-gray-50 rounded"><ToggleLeft size={15} /></button>
-                      <button onClick={() => deleteProduct(p.id)} className="p-1.5 hover:bg-red-50 rounded text-red-500"><Trash2 size={15} /></button>
+                      <button onClick={() => openDetail(p)} className="p-1.5 hover:bg-gray-50 rounded" title="View product"><Eye size={15} /></button>
+                      <button onClick={() => openDetailWithHistory(p)} className="p-1.5 hover:bg-amber-50 rounded text-amber-700" title="Supplier price history"><FileText size={15} /></button>
+                      {canEdit && (
+                        <>
+                          <button onClick={() => openEdit(p)} className="p-1.5 hover:bg-blue-50 rounded text-blue-600" title="Edit"><Edit2 size={15} /></button>
+                          <button onClick={() => toggleStatus(p.id)} className="p-1.5 hover:bg-gray-50 rounded" title="Toggle status"><ToggleLeft size={15} /></button>
+                          <button onClick={() => deleteProduct(p.id)} className="p-1.5 hover:bg-red-50 rounded text-red-500" title="Delete"><Trash2 size={15} /></button>
+                        </>
+                      )}
                     </div>
                   </td>
                 </tr>
@@ -263,15 +392,16 @@ export default function ProductList() {
 
       {/* Modal */}
       {showModal && (
-        <div className="modal-overlay" onClick={() => setShowModal(false)}>
-          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+        <ModalOverlay onClose={() => !saving && setShowModal(false)}>
+          <div className="modal-content">
             <div className="p-6">
               <h2 className="text-lg font-semibold mb-4">{editProduct ? 'Edit Product' : 'Add Product'}</h2>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div className="md:col-span-2">
                   <label className="block text-sm font-medium mb-1">Product Name *</label>
                   <input type="text" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })}
-                    className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
+                    disabled={saving || (editProduct ? !canEdit : !canCreate)}
+                    className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none disabled:bg-gray-50" />
                 </div>
                 <div className="md:col-span-2">
                   <label className="block text-sm font-medium mb-1">Description</label>
@@ -373,14 +503,17 @@ export default function ProductList() {
                     <option value="Zero Rated">Zero Rated</option><option value="LGU 5% Final VAT">LGU 5% Final VAT</option>
                   </select>
                 </div>
-                <div>
-                  <label className="block text-sm font-medium mb-1">Price Type</label>
-                  <select value={form.price_type} onChange={(e) => setForm({ ...form, price_type: e.target.value })}
-                    className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
-                    <option value="VAT Inclusive">VAT Inclusive</option>
-                    <option value="VAT Exclusive">VAT Exclusive</option>
-                  </select>
-                </div>
+                {showPriceType && (
+                  <div>
+                    <label className="block text-sm font-medium mb-1">Price Type</label>
+                    <select value={form.price_type} onChange={(e) => setForm({ ...form, price_type: e.target.value })}
+                      className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
+                      <option value="VAT Inclusive">VAT Inclusive</option>
+                      <option value="VAT Exclusive">VAT Exclusive</option>
+                    </select>
+                    <p className="text-xs text-gray-500 mt-1">Whether retail price includes 12% VAT — used by POS only.</p>
+                  </div>
+                )}
                 <div className="col-span-2 border rounded-lg p-3 bg-blue-50/50">
                   <label className="flex items-center gap-2 cursor-pointer mb-2">
                     <input type="checkbox" checked={form.has_chilled_variant} onChange={(e) => setForm({ ...form, has_chilled_variant: e.target.checked })}
@@ -389,26 +522,34 @@ export default function ProductList() {
                   </label>
                   {form.has_chilled_variant && (
                     <div className="mt-2">
-                      <label className="block text-xs text-gray-500 mb-1">Chilled Selling Price (Retail only)</label>
-                      <input type="number" step="0.01" value={form.chilled_price} onChange={(e) => setForm({ ...form, chilled_price: e.target.value })}
-                        className="w-full max-w-xs px-3 py-2 border rounded-lg text-sm font-medium text-cyan-700 focus:ring-2 focus:ring-blue-500 outline-none" />
+                      <label className="block text-xs text-gray-500 mb-1">Chilled Selling Price (Retail only) *</label>
+                      <input type="number" step="0.01" min="0" value={form.chilled_price} onChange={(e) => setForm({ ...form, chilled_price: e.target.value })}
+                        disabled={saving}
+                        className="w-full max-w-xs px-3 py-2 border rounded-lg text-sm font-medium text-cyan-700 focus:ring-2 focus:ring-blue-500 outline-none disabled:bg-gray-50" />
                     </div>
                   )}
                 </div>
               </div>
               <div className="flex justify-end gap-3 mt-6">
-                <button onClick={() => setShowModal(false)} className="px-4 py-2 border rounded-lg text-sm hover:bg-gray-50">Cancel</button>
-                <button onClick={handleSave} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700">Save</button>
+                <button onClick={() => setShowModal(false)} disabled={saving} className="px-4 py-2 border rounded-lg text-sm hover:bg-gray-50 disabled:opacity-50">Cancel</button>
+                <button
+                  onClick={handleSave}
+                  disabled={saving || (editProduct ? !canEdit : !canCreate)}
+                  className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700 disabled:opacity-50"
+                >
+                  {saving && <Loader2 size={16} className="animate-spin" />}
+                  {saving ? 'Saving...' : 'Save'}
+                </button>
               </div>
             </div>
           </div>
-        </div>
+        </ModalOverlay>
       )}
 
       {/* Import modal */}
       {showImportModal && (
-        <div className="modal-overlay" onClick={() => { setShowImportModal(false); setImportFile(null); setImportPreview(null); setImportResult(null); }}>
-          <div className="modal-content max-w-4xl" onClick={(e) => e.stopPropagation()}>
+        <ModalOverlay onClose={() => { setShowImportModal(false); setImportFile(null); setImportPreview(null); setImportResult(null); }}>
+          <div className="modal-content max-w-4xl">
             <div className="p-6">
               <div className="flex items-center justify-between mb-4">
                 <h2 className="text-lg font-semibold">Import Products</h2>
@@ -539,200 +680,321 @@ export default function ProductList() {
               )}
             </div>
           </div>
-        </div>
+        </ModalOverlay>
       )}
 
       {/* Product Detail Modal */}
       {showDetail && detailProduct && (
-        <div className="modal-overlay" onClick={() => setShowDetail(false)}>
-          <div className="modal-content max-w-5xl" onClick={(e) => e.stopPropagation()}>
-            <div className="p-6">
-              <div className="flex items-center justify-between mb-4">
-                <h2 className="text-lg font-semibold">{detailProduct.name}</h2>
-                <div className="flex items-center gap-2">
-                  <span className={`px-2 py-1 text-xs rounded-full ${detailProduct.is_active ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{detailProduct.is_active ? 'Active' : 'Inactive'}</span>
-                  <button onClick={() => setShowDetail(false)} className="p-1 hover:bg-gray-100 rounded"><X size={18} /></button>
+        <ModalOverlay onClose={() => setShowDetail(false)}>
+          <div className="modal-content max-w-6xl">
+            {/* Header */}
+            <div className="px-6 py-4 border-b border-gray-200 bg-gray-50">
+              <div className="flex items-start justify-between gap-4">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <Package size={18} className="text-blue-600 shrink-0" />
+                    <h2 className="text-lg font-semibold text-gray-900 truncate">{detailProduct.name}</h2>
+                    <span className={`px-2 py-0.5 text-xs rounded-full ${detailProduct.is_active ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                      {detailProduct.is_active ? 'Active' : 'Inactive'}
+                    </span>
+                  </div>
+                  <p className="text-xs text-gray-500 mt-1 font-mono">
+                    {detailProduct.sku}
+                    {detailProduct.category_name ? ` · ${detailProduct.category_name}` : ''}
+                    {detailProduct.brand_name ? ` · ${detailProduct.brand_name}` : ''}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  {canEdit && (
+                    <button
+                      type="button"
+                      onClick={() => { setShowDetail(false); openEdit(detailProduct); }}
+                      className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold rounded-lg border border-gray-200 bg-white hover:bg-gray-50"
+                    >
+                      <Edit2 size={14} /> Edit
+                    </button>
+                  )}
+                  <button type="button" onClick={() => setShowDetail(false)} className="p-1.5 hover:bg-gray-200 rounded-lg"><X size={18} /></button>
                 </div>
               </div>
 
-              {/* Tabs */}
-              <div className="flex border-b border-gray-200 mb-4">
-                <button onClick={() => setDetailTab('details')}
-                  className={`px-4 py-2 text-sm font-medium border-b-2 ${detailTab === 'details' ? 'border-blue-600 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700'}`}>Product Details</button>
-                <button onClick={() => { setDetailTab('price-history'); loadPriceHistory(detailProduct.id); }}
-                  className={`px-4 py-2 text-sm font-medium border-b-2 ${detailTab === 'price-history' ? 'border-blue-600 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700'}`}>Supplier Price History</button>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-4">
+                <MetricCard label="Cost" value={formatCurrency(detailProduct.cost)} tone="blue" />
+                <MetricCard label="Retail" value={formatCurrency(detailProduct.retail_price)} />
+                <MetricCard label="Wholesale" value={formatCurrency(detailProduct.wholesale_price)} />
+                <MetricCard label="Stock" value={`${detailProduct.store_stock || 0} / ${detailProduct.warehouse_stock || 0}`} sub="Store / Warehouse" tone="purple" />
               </div>
+            </div>
 
+            {/* Tab bar */}
+            <div className="px-6 pt-3 border-b border-gray-200 bg-white">
+              <div className="flex gap-1">
+                <button
+                  type="button"
+                  onClick={() => switchDetailTab('details')}
+                  className={`inline-flex items-center gap-1.5 px-4 py-2 text-sm font-semibold rounded-t-lg border-b-2 -mb-px ${
+                    detailTab === 'details' ? 'border-blue-600 text-blue-700 bg-blue-50/50' : 'border-transparent text-gray-500 hover:text-gray-700'
+                  }`}
+                >
+                  <Package size={15} /> Overview
+                </button>
+                <button
+                  type="button"
+                  onClick={() => switchDetailTab('price-history')}
+                  className={`inline-flex items-center gap-1.5 px-4 py-2 text-sm font-semibold rounded-t-lg border-b-2 -mb-px ${
+                    detailTab === 'price-history' ? 'border-amber-600 text-amber-700 bg-amber-50/50' : 'border-transparent text-gray-500 hover:text-gray-700'
+                  }`}
+                >
+                  <TrendingUp size={15} /> Supplier Price History
+                  {priceHistory.length > 0 && (
+                    <span className="ml-1 px-1.5 py-0.5 text-[10px] rounded-full bg-amber-100 text-amber-800">{priceHistory.length}</span>
+                  )}
+                </button>
+              </div>
+            </div>
+
+            <div className="p-6 max-h-[calc(85vh-14rem)] overflow-y-auto">
               {detailTab === 'details' && (
-                <div className="grid grid-cols-2 gap-4 text-sm">
-                  <div><span className="text-gray-500">SKU:</span> <span className="font-mono ml-2">{detailProduct.sku}</span></div>
-                  <div><span className="text-gray-500">Barcode:</span> <span className="font-mono ml-2">{detailProduct.barcode || '-'}</span></div>
-                  <div><span className="text-gray-500">Category:</span> <span className="ml-2">{detailProduct.category_name || '-'}</span></div>
-                  <div><span className="text-gray-500">Brand:</span> <span className="ml-2">{detailProduct.brand_name || '-'}</span></div>
-                  <div><span className="text-gray-500">Unit of Measure:</span> <span className="ml-2">{detailProduct.unit_of_measure}</span></div>
-                  <div><span className="text-gray-500">Cost:</span> <span className="ml-2 font-semibold">{formatCurrency(detailProduct.cost)}</span></div>
-                  <div><span className="text-gray-500">Retail Price:</span> <span className="ml-2">{formatCurrency(detailProduct.retail_price)}</span></div>
-                  <div><span className="text-gray-500">Wholesale Price:</span> <span className="ml-2">{formatCurrency(detailProduct.wholesale_price)}</span></div>
-                  <div><span className="text-gray-500">Distributor Price:</span> <span className="ml-2">{formatCurrency(detailProduct.distributor_price)}</span></div>
-                  <div><span className="text-gray-500">Reorder Level:</span> <span className="ml-2">{detailProduct.reorder_level}</span></div>
-                  <div><span className="text-gray-500">Tax Type:</span> <span className="ml-2">{detailProduct.tax_type}</span></div>
-                  <div><span className="text-gray-500">Price Type:</span> <span className="ml-2">{detailProduct.price_type}</span></div>
-                  {detailProduct.description && <div className="col-span-2"><span className="text-gray-500">Description:</span> <span className="ml-2">{detailProduct.description}</span></div>}
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                  <DetailSection title="Identification">
+                    <DetailRow label="SKU" value={detailProduct.sku} mono />
+                    <DetailRow label="Barcode" value={detailProduct.barcode || '—'} mono />
+                    <DetailRow label="Category" value={detailProduct.category_name || '—'} />
+                    <DetailRow label="Brand" value={detailProduct.brand_name || '—'} />
+                    <DetailRow label="Unit of Measure" value={detailProduct.unit_of_measure || '—'} />
+                    {detailProduct.description && (
+                      <div className="pt-2 border-t border-gray-100">
+                        <p className="text-xs text-gray-500 mb-1">Description</p>
+                        <p className="text-sm text-gray-800">{detailProduct.description}</p>
+                      </div>
+                    )}
+                  </DetailSection>
+
+                  <DetailSection title="Selling Prices">
+                    <DetailRow label="Retail" value={formatCurrency(detailProduct.retail_price)} highlight />
+                    <DetailRow label="Wholesale" value={formatCurrency(detailProduct.wholesale_price)} />
+                    <DetailRow label="Distributor" value={formatCurrency(detailProduct.distributor_price)} />
+                    {detailProduct.has_chilled_variant && (
+                      <DetailRow label="Chilled Price" value={formatCurrency(detailProduct.chilled_price)} />
+                    )}
+                    <DetailRow label="Cost (current)" value={formatCurrency(detailProduct.cost)} highlight />
+                  </DetailSection>
+
+                  <DetailSection title="Tax & Reorder">
+                    <DetailRow label="Tax Type" value={detailProduct.tax_type || '—'} />
+                    {showPriceType && (
+                      <DetailRow label="Price Type" value={detailProduct.price_type || '—'} />
+                    )}
+                    <DetailRow label="Reorder Level" value={String(detailProduct.reorder_level ?? 0)} />
+                  </DetailSection>
+
+                  <DetailSection title="Supplier Costs">
+                    <p className="text-xs text-gray-500">
+                      Purchase cost history from posted Goods Receipts. Switch to the Supplier Price History tab for full ledger and supplier comparison.
+                    </p>
+                    {priceComparison?.stats?.last_purchase_price > 0 ? (
+                      <>
+                        <DetailRow label="Last GR cost" value={formatCurrency(priceComparison.stats.last_purchase_price)} highlight />
+                        <DetailRow label="Cheapest supplier" value={priceComparison.stats.cheapest_supplier || '—'} />
+                        <DetailRow label="Cheapest cost" value={formatCurrency(priceComparison.stats.cheapest_price)} />
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => switchDetailTab('price-history')}
+                        className="w-full mt-1 px-3 py-2 text-sm font-medium text-amber-800 bg-amber-50 border border-amber-200 rounded-lg hover:bg-amber-100"
+                      >
+                        View supplier price history →
+                      </button>
+                    )}
+                  </DetailSection>
                 </div>
               )}
 
               {detailTab === 'price-history' && (
                 <div className="space-y-4">
-                  {/* Price Comparison Summary Cards */}
-                  {priceComparison && priceComparison.stats && (
-                    <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-                      <div className="bg-green-50 border border-green-200 rounded-lg p-3">
-                        <p className="text-xs text-green-700 uppercase font-semibold">Cheapest Supplier</p>
-                        <p className="text-lg font-bold text-green-800">{priceComparison.stats.cheapest_supplier || '-'}</p>
-                        <p className="text-sm text-green-600">{formatCurrency(priceComparison.stats.cheapest_price)}</p>
-                      </div>
-                      <div className="bg-red-50 border border-red-200 rounded-lg p-3">
-                        <p className="text-xs text-red-700 uppercase font-semibold">Highest Supplier</p>
-                        <p className="text-lg font-bold text-red-800">{priceComparison.stats.most_expensive_supplier || '-'}</p>
-                        <p className="text-sm text-red-600">{formatCurrency(priceComparison.stats.highest_price)}</p>
-                      </div>
-                      <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
-                        <p className="text-xs text-blue-700 uppercase font-semibold">Average Cost</p>
-                        <p className="text-lg font-bold text-blue-800">{formatCurrency(priceComparison.stats.avg_cost)}</p>
-                        <p className="text-sm text-blue-600">{priceComparison.stats.supplier_count} supplier(s)</p>
-                      </div>
-                      <div className="bg-gray-50 border border-gray-200 rounded-lg p-3">
-                        <p className="text-xs text-gray-700 uppercase font-semibold">Current Product Cost</p>
-                        <p className="text-lg font-bold text-gray-800">{formatCurrency(priceComparison.stats.current_cost)}</p>
-                        <p className="text-sm text-gray-600">Last purchase: {formatCurrency(priceComparison.stats.last_purchase_price)}</p>
-                      </div>
-                      <div className="bg-purple-50 border border-purple-200 rounded-lg p-3">
-                        <p className="text-xs text-purple-700 uppercase font-semibold">Last Purchase Price</p>
-                        <p className="text-lg font-bold text-purple-800">{formatCurrency(priceComparison.stats.last_purchase_price)}</p>
-                        <p className="text-sm text-purple-600">on last GR</p>
-                      </div>
+                  <p className="text-xs text-gray-600 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2">
+                    Records are created when you <strong>post a Goods Receipt (RR)</strong>. This tracks supplier unit cost only — not retail/wholesale selling prices.
+                  </p>
+
+                  {phLoading ? (
+                    <div className="flex items-center justify-center py-16 text-sm text-gray-400 gap-2">
+                      <Loader2 size={18} className="animate-spin" /> Loading price history…
                     </div>
+                  ) : (
+                    <>
+                      {priceComparison?.stats && (
+                        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                          <MetricCard
+                            label="Cheapest"
+                            value={formatCurrency(priceComparison.stats.cheapest_price)}
+                            sub={priceComparison.stats.cheapest_supplier || 'No data'}
+                            tone="green"
+                          />
+                          <MetricCard
+                            label="Highest"
+                            value={formatCurrency(priceComparison.stats.highest_price)}
+                            sub={priceComparison.stats.most_expensive_supplier || 'No data'}
+                            tone="red"
+                          />
+                          <MetricCard
+                            label="Average / Suppliers"
+                            value={formatCurrency(priceComparison.stats.avg_cost)}
+                            sub={`${priceComparison.stats.supplier_count || 0} supplier(s)`}
+                            tone="blue"
+                          />
+                          <MetricCard
+                            label="Current vs Last GR"
+                            value={formatCurrency(priceComparison.stats.current_cost)}
+                            sub={`Last GR: ${formatCurrency(priceComparison.stats.last_purchase_price)}`}
+                            tone="purple"
+                          />
+                        </div>
+                      )}
+
+                      {priceComparison?.suppliers?.length > 0 && (
+                        <div className="rounded-xl border border-gray-200 overflow-hidden">
+                          <div className="px-4 py-2.5 bg-gray-50 border-b border-gray-100 flex items-center justify-between">
+                            <span className="text-sm font-semibold text-gray-700">Supplier Comparison</span>
+                            <span className="text-xs text-gray-400">{priceComparison.suppliers.length} supplier(s)</span>
+                          </div>
+                          <div className="overflow-x-auto">
+                            <table className="w-full text-sm">
+                              <thead>
+                                <tr className="bg-gray-50 text-xs uppercase text-gray-500">
+                                  <th className="px-4 py-2 text-left">Supplier</th>
+                                  <th className="px-4 py-2 text-right">Latest</th>
+                                  <th className="px-4 py-2 text-right">Previous</th>
+                                  <th className="px-4 py-2 text-right">Change</th>
+                                  <th className="px-4 py-2 text-center">Trend</th>
+                                  <th className="px-4 py-2 text-left">Last RR</th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-gray-100">
+                                {priceComparison.suppliers.map((s: any) => (
+                                  <tr key={s.supplier_id} className={s.is_best_price ? 'bg-green-50/60' : 'hover:bg-gray-50'}>
+                                    <td className="px-4 py-2.5 font-medium">
+                                      {s.supplier_name}
+                                      {s.is_best_price && <span className="ml-2 text-[10px] font-semibold text-green-700 uppercase">Best</span>}
+                                    </td>
+                                    <td className="px-4 py-2.5 text-right font-semibold">{formatCurrency(s.latest_cost)}</td>
+                                    <td className="px-4 py-2.5 text-right text-gray-500">{formatCurrency(s.previous_cost)}</td>
+                                    <td className={`px-4 py-2.5 text-right ${s.price_difference > 0 ? 'text-red-600' : s.price_difference < 0 ? 'text-green-600' : ''}`}>
+                                      {s.price_difference > 0 ? '+' : ''}{formatCurrency(s.price_difference)}
+                                    </td>
+                                    <td className="px-4 py-2.5 text-center">
+                                      <span className={`px-2 py-0.5 text-xs rounded-full ${
+                                        s.trend === 'Increased' ? 'bg-red-100 text-red-700' :
+                                        s.trend === 'Decreased' ? 'bg-green-100 text-green-700' :
+                                        'bg-gray-100 text-gray-600'
+                                      }`}>{s.trend}</span>
+                                    </td>
+                                    <td className="px-4 py-2.5 text-xs text-gray-600">
+                                      {s.gr_number || s.po_number || '—'}
+                                      {s.last_purchase_date && <span className="block text-gray-400">{new Date(s.last_purchase_date).toLocaleDateString()}</span>}
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="rounded-xl border border-gray-200 overflow-hidden">
+                        <div className="px-4 py-3 bg-gray-50 border-b border-gray-100 space-y-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="text-sm font-semibold text-gray-700">Receipt Ledger ({priceHistory.length})</span>
+                            <div className="flex flex-wrap gap-2">
+                              <button
+                                type="button"
+                                onClick={() => { const token = localStorage.getItem('token'); window.open(`/api/supplier-price-history/report?product_id=${detailProduct.id}&format=csv&token=${token}`, '_blank'); }}
+                                className="inline-flex items-center gap-1 px-2.5 py-1.5 border rounded-lg text-xs hover:bg-white bg-white"
+                              >
+                                <Download size={13} /> CSV
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => { const token = localStorage.getItem('token'); window.open(`/api/supplier-price-history/report?product_id=${detailProduct.id}&format=xlsx&token=${token}`, '_blank'); }}
+                                className="inline-flex items-center gap-1 px-2.5 py-1.5 border rounded-lg text-xs hover:bg-white bg-white"
+                              >
+                                <Download size={13} /> Excel
+                              </button>
+                              <button type="button" onClick={() => window.print()} className="inline-flex items-center gap-1 px-2.5 py-1.5 border rounded-lg text-xs hover:bg-white bg-white">
+                                <Printer size={13} /> Print
+                              </button>
+                            </div>
+                          </div>
+                          <div className="flex flex-wrap items-end gap-2">
+                            <div>
+                              <label className="block text-[10px] text-gray-500 mb-0.5">Supplier</label>
+                              <input type="text" placeholder="Search supplier…" value={phFilterSupplier} onChange={(e) => setPhFilterSupplier(e.target.value)}
+                                className="px-2.5 py-1.5 border rounded-lg text-sm w-40" />
+                            </div>
+                            <div>
+                              <label className="block text-[10px] text-gray-500 mb-0.5">From</label>
+                              <input type="date" value={phDateFrom} onChange={(e) => setPhDateFrom(e.target.value)} className="px-2 py-1.5 border rounded-lg text-sm" />
+                            </div>
+                            <div>
+                              <label className="block text-[10px] text-gray-500 mb-0.5">To</label>
+                              <input type="date" value={phDateTo} onChange={(e) => setPhDateTo(e.target.value)} className="px-2 py-1.5 border rounded-lg text-sm" />
+                            </div>
+                            <button type="button" onClick={() => loadPriceHistory(detailProduct.id)} className="px-3 py-1.5 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700">Apply</button>
+                          </div>
+                        </div>
+                        <div className="overflow-x-auto max-h-80 overflow-y-auto">
+                          <table className="w-full text-sm">
+                            <thead className="bg-gray-50 sticky top-0 text-xs uppercase text-gray-500">
+                              <tr>
+                                <th className="px-3 py-2 text-left">Date</th>
+                                <th className="px-3 py-2 text-left">Supplier</th>
+                                <th className="px-3 py-2 text-left">RR #</th>
+                                <th className="px-3 py-2 text-left">PO #</th>
+                                <th className="px-3 py-2 text-right">Qty</th>
+                                <th className="px-3 py-2 text-right">Unit Cost</th>
+                                <th className="px-3 py-2 text-right">Change</th>
+                                <th className="px-3 py-2 text-left hidden lg:table-cell">Location</th>
+                                <th className="px-3 py-2 text-left hidden xl:table-cell">Batch / Expiry</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-gray-100">
+                              {priceHistory.length === 0 ? (
+                                <tr>
+                                  <td colSpan={9} className="text-center py-12 text-gray-400">
+                                    <TrendingUp size={28} className="mx-auto mb-2 opacity-30" />
+                                    <p className="font-medium text-gray-500">No supplier price history yet</p>
+                                    <p className="text-xs mt-1">Post a Goods Receipt containing this product to record the first entry.</p>
+                                  </td>
+                                </tr>
+                              ) : priceHistory.map((h: any) => (
+                                <tr key={h.id} className="hover:bg-amber-50/30">
+                                  <td className="px-3 py-2 text-xs whitespace-nowrap">{h.received_date ? new Date(h.received_date).toLocaleDateString() : '—'}</td>
+                                  <td className="px-3 py-2 font-medium">{h.supplier_name}</td>
+                                  <td className="px-3 py-2 font-mono text-xs">{h.gr_number || '—'}</td>
+                                  <td className="px-3 py-2 font-mono text-xs">{h.po_number || '—'}</td>
+                                  <td className="px-3 py-2 text-right">{h.quantity_received} {h.uom}</td>
+                                  <td className="px-3 py-2 text-right font-semibold">{formatCurrency(h.unit_cost)}</td>
+                                  <td className={`px-3 py-2 text-right ${h.price_difference > 0 ? 'text-red-600' : h.price_difference < 0 ? 'text-green-600' : 'text-gray-400'}`}>
+                                    {h.price_difference > 0 ? '+' : ''}{formatCurrency(h.price_difference)}
+                                  </td>
+                                  <td className="px-3 py-2 text-xs hidden lg:table-cell">{h.location_name || h.location_name_ref || '—'}</td>
+                                  <td className="px-3 py-2 text-xs hidden xl:table-cell">
+                                    {h.batch_number || '—'}
+                                    {h.expiry_date && <span className="block text-gray-400">Exp {new Date(h.expiry_date).toLocaleDateString()}</span>}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    </>
                   )}
-
-                  {/* Supplier Price Comparison */}
-                  {priceComparison?.suppliers?.length > 0 && (
-                    <div className="border border-gray-200 rounded-lg overflow-hidden">
-                      <div className="px-4 py-2 bg-gray-50 border-b border-gray-200 font-semibold text-sm text-gray-700">Supplier Price Comparison</div>
-                      <table className="w-full text-sm">
-                        <thead className="bg-gray-50">
-                          <tr>
-                            <th className="px-4 py-2 text-left font-semibold text-gray-500">Supplier</th>
-                            <th className="px-4 py-2 text-right font-semibold text-gray-500">Latest Cost</th>
-                            <th className="px-4 py-2 text-right font-semibold text-gray-500">Previous Cost</th>
-                            <th className="px-4 py-2 text-right font-semibold text-gray-500">Difference</th>
-                            <th className="px-4 py-2 text-center font-semibold text-gray-500">Trend</th>
-                            <th className="px-4 py-2 text-left font-semibold text-gray-500">Last Purchase</th>
-                            <th className="px-4 py-2 text-left font-semibold text-gray-500">PO#</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-gray-100">
-                          {priceComparison.suppliers.map((s: any) => (
-                            <tr key={s.supplier_id} className={`${s.is_best_price ? 'bg-green-50' : 'hover:bg-gray-50'}`}>
-                              <td className="px-4 py-2 font-medium">{s.supplier_name} {s.is_best_price && <span className="text-green-600 text-xs font-semibold">(Best Price)</span>}</td>
-                              <td className="px-4 py-2 text-right font-semibold">{formatCurrency(s.latest_cost)}</td>
-                              <td className="px-4 py-2 text-right">{formatCurrency(s.previous_cost)}</td>
-                              <td className={`px-4 py-2 text-right ${s.price_difference > 0 ? 'text-red-600' : s.price_difference < 0 ? 'text-green-600' : ''}`}>
-                                {s.price_difference > 0 ? '+' : ''}{formatCurrency(s.price_difference)}
-                              </td>
-                              <td className="px-4 py-2 text-center">
-                                <span className={`px-2 py-0.5 text-xs rounded-full ${
-                                  s.trend === 'Increased' ? 'bg-red-100 text-red-700' :
-                                  s.trend === 'Decreased' ? 'bg-green-100 text-green-700' :
-                                  'bg-gray-100 text-gray-600'
-                                }`}>{s.trend}</span>
-                              </td>
-                              <td className="px-4 py-2">{s.last_purchase_date ? new Date(s.last_purchase_date).toLocaleDateString() : '-'}</td>
-                              <td className="px-4 py-2 font-mono text-xs">{s.po_number || '-'}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-
-                  {/* Filters */}
-                  <div className="flex flex-wrap items-center gap-3 p-4 bg-gray-50 rounded-lg border border-gray-200">
-                    <input type="text" placeholder="Filter by supplier..." value={phFilterSupplier}
-                      onChange={(e) => setPhFilterSupplier(e.target.value)} className="px-3 py-1.5 border rounded text-sm w-48" />
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs text-gray-500">From:</span>
-                      <input type="date" value={phDateFrom} onChange={(e) => setPhDateFrom(e.target.value)} className="px-2 py-1.5 border rounded text-sm" />
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs text-gray-500">To:</span>
-                      <input type="date" value={phDateTo} onChange={(e) => setPhDateTo(e.target.value)} className="px-2 py-1.5 border rounded text-sm" />
-                    </div>
-                    <button onClick={() => loadPriceHistory(detailProduct.id)} className="px-3 py-1.5 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">Apply</button>
-                    <div className="flex-1" />
-                    <button onClick={() => { const token = localStorage.getItem('token'); window.open(`/api/supplier-price-history/report?product_id=${detailProduct.id}&format=csv&token=${token}`, '_blank'); }}
-                      className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50">Export CSV</button>
-                    <button onClick={() => { const token = localStorage.getItem('token'); window.open(`/api/supplier-price-history/report?product_id=${detailProduct.id}&format=xlsx&token=${token}`, '_blank'); }}
-                      className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50">Export Excel</button>
-                    <button onClick={() => window.print()} className="px-3 py-1.5 border rounded text-sm hover:bg-gray-50">Print Report</button>
-                  </div>
-
-                  {/* Price History Table */}
-                  <div className="border border-gray-200 rounded-lg overflow-hidden">
-                    <div className="px-4 py-2 bg-gray-50 border-b border-gray-200 font-semibold text-sm text-gray-700">
-                      Price History Records ({priceHistory.length})
-                    </div>
-                    <div className="overflow-x-auto max-h-96 overflow-y-auto">
-                      <table className="w-full text-sm">
-                        <thead className="bg-gray-50 sticky top-0">
-                          <tr>
-                            <th className="px-3 py-2 text-left font-semibold text-gray-500">Supplier</th>
-                            <th className="px-3 py-2 text-right font-semibold text-gray-500">Unit Cost</th>
-                            <th className="px-3 py-2 text-right font-semibold text-gray-500">Prev Cost</th>
-                            <th className="px-3 py-2 text-right font-semibold text-gray-500">Diff</th>
-                            <th className="px-3 py-2 text-right font-semibold text-gray-500">Qty</th>
-                            <th className="px-3 py-2 text-left font-semibold text-gray-500">UOM</th>
-                            <th className="px-3 py-2 text-left font-semibold text-gray-500">Date</th>
-                            <th className="px-3 py-2 text-left font-semibold text-gray-500">PO#</th>
-                            <th className="px-3 py-2 text-left font-semibold text-gray-500">RR#</th>
-                            <th className="px-3 py-2 text-left font-semibold text-gray-500">Location</th>
-                            <th className="px-3 py-2 text-left font-semibold text-gray-500">Batch#</th>
-                            <th className="px-3 py-2 text-left font-semibold text-gray-500">Expiry</th>
-                            <th className="px-3 py-2 text-left font-semibold text-gray-500">Remarks</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-gray-100">
-                          {phLoading ? (
-                            <tr><td colSpan={13} className="text-center py-8 text-gray-400">Loading...</td></tr>
-                          ) : priceHistory.length === 0 ? (
-                            <tr><td colSpan={13} className="text-center py-8 text-gray-400">No price history records</td></tr>
-                          ) : priceHistory.map((h: any) => (
-                            <tr key={h.id} className="hover:bg-gray-50">
-                              <td className="px-3 py-2 font-medium">{h.supplier_name}</td>
-                              <td className="px-3 py-2 text-right font-semibold">{formatCurrency(h.unit_cost)}</td>
-                              <td className="px-3 py-2 text-right text-gray-500">{formatCurrency(h.previous_cost)}</td>
-                              <td className={`px-3 py-2 text-right ${h.price_difference > 0 ? 'text-red-600' : h.price_difference < 0 ? 'text-green-600' : 'text-gray-400'}`}>
-                                {h.price_difference > 0 ? '+' : ''}{formatCurrency(h.price_difference)}
-                              </td>
-                              <td className="px-3 py-2 text-right">{h.quantity_received}</td>
-                              <td className="px-3 py-2">{h.uom}</td>
-                              <td className="px-3 py-2 text-xs">{h.received_date ? new Date(h.received_date).toLocaleDateString() : '-'}</td>
-                              <td className="px-3 py-2 font-mono text-xs">{h.po_number || '-'}</td>
-                              <td className="px-3 py-2 font-mono text-xs">{h.gr_number || '-'}</td>
-                              <td className="px-3 py-2">{h.location_name || h.location_name_ref || '-'}</td>
-                              <td className="px-3 py-2 font-mono text-xs">{h.batch_number || '-'}</td>
-                              <td className="px-3 py-2 text-xs">{h.expiry_date ? new Date(h.expiry_date).toLocaleDateString() : '-'}</td>
-                              <td className="px-3 py-2 text-xs text-gray-500">{h.remarks || '-'}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
                 </div>
               )}
             </div>
           </div>
-        </div>
+        </ModalOverlay>
       )}
     </div>
   );

@@ -1,7 +1,9 @@
 import React, { useState, useEffect } from 'react';
+import ModalOverlay from '../../components/ModalOverlay';
 import api from '../../lib/api';
-import { formatCurrency } from '../../lib/utils';
-import { Plus, Edit2, Search, Trash2, Upload, Download, FileText, X } from 'lucide-react';
+import { formatCurrency, parseNumericField } from '../../lib/utils';
+import NumericInput from '../../components/NumericInput';
+import { Plus, Edit2, Search, Trash2, Upload, Download, FileText, X, Tag } from 'lucide-react';
 import Pagination from '../../components/Pagination';
 import toast from 'react-hot-toast';
 
@@ -11,7 +13,7 @@ export default function CustomerList() {
   const [search, setSearch] = useState('');
   const [showModal, setShowModal] = useState(false);
   const [editCustomer, setEditCustomer] = useState<any>(null);
-  const [form, setForm] = useState<any>({ customer_name: '', contact_person: '', address: '', phone: '', email: '', customer_type: 'Retail', credit_limit: 0, payment_terms: '', tax_type: 'VAT', tin: '' });
+  const [form, setForm] = useState<any>({ customer_name: '', contact_person: '', address: '', phone: '', email: '', customer_type: 'Retail', default_price_mode: '', credit_limit: '', payment_terms: '', tax_type: 'VAT', tin: '' });
   const [page, setPage] = useState(1);
   const [total, setTotal] = useState(0);
   const limit = 20;
@@ -21,11 +23,15 @@ export default function CustomerList() {
   const [importResult, setImportResult] = useState<any>(null);
   const [importPreview, setImportPreview] = useState<any>(null);
   const [showExportDropdown, setShowExportDropdown] = useState(false);
+  const [priceCustomer, setPriceCustomer] = useState<any>(null);
+  const [priceRows, setPriceRows] = useState<any[]>([]);
+  const [priceProducts, setPriceProducts] = useState<any[]>([]);
+  const [priceSaving, setPriceSaving] = useState(false);
 
   useEffect(() => { setPage(1); }, [search]);
   useEffect(() => { api.get(`/customers?search=${search}&page=${page}&limit=${limit}`).then((r) => { setCustomers(r.data.data); setTotal(r.data.total); }).catch((err) => toast.error(err.response?.data?.error || 'Failed to load data')).finally(() => setLoading(false)); }, [search, page]);
 
-  const openCreate = () => { setEditCustomer(null); setForm({ customer_name: '', contact_person: '', address: '', phone: '', email: '', customer_type: 'Retail', credit_limit: 0, payment_terms: '', tax_type: 'VAT', tin: '' }); setShowModal(true); };
+  const openCreate = () => { setEditCustomer(null); setForm({ customer_name: '', contact_person: '', address: '', phone: '', email: '', customer_type: 'Retail', default_price_mode: '', credit_limit: '', payment_terms: '', tax_type: 'VAT', tin: '' }); setShowModal(true); };
   const openEdit = (c: any) => { setEditCustomer(c); setForm(c); setShowModal(true); };
 
   const handleDelete = async (id: string) => {
@@ -37,11 +43,44 @@ export default function CustomerList() {
   const handleSave = async () => {
     if (!form.customer_name) { toast.error('Customer name is required'); return; }
     try {
-      if (editCustomer) { await api.put(`/customers/${editCustomer.id}`, form); toast.success('Updated'); }
-      else { await api.post('/customers', form); toast.success('Created'); }
+      if (editCustomer) { await api.put(`/customers/${editCustomer.id}`, { ...form, credit_limit: parseNumericField(form.credit_limit), default_price_mode: form.default_price_mode || null }); toast.success('Updated'); }
+      else { await api.post('/customers', { ...form, credit_limit: parseNumericField(form.credit_limit), default_price_mode: form.default_price_mode || null }); toast.success('Created'); }
       setShowModal(false);
       const res = await api.get(`/customers?search=${search}&page=${page}&limit=${limit}`); setCustomers(res.data.data); setTotal(res.data.total);
     } catch (err: any) { toast.error(err.response?.data?.error || 'Error'); }
+  };
+
+  const openPriceList = async (c: any) => {
+    setPriceCustomer(c);
+    try {
+      const [prices, prods] = await Promise.all([
+        api.get(`/customers/${c.id}/prices`),
+        api.get('/products?limit=500'),
+      ]);
+      setPriceRows(prices.data || []);
+      setPriceProducts(prods.data.data || []);
+    } catch {
+      toast.error('Failed to load prices');
+    }
+  };
+
+  const addPriceRow = () => {
+    setPriceRows((rows) => [...rows, { product_id: '', unit_price: '', effective_from: '', effective_to: '' }]);
+  };
+
+  const savePrices = async () => {
+    if (!priceCustomer) return;
+    setPriceSaving(true);
+    try {
+      const prices = priceRows.filter((r) => r.product_id && r.unit_price !== '');
+      await api.put(`/customers/${priceCustomer.id}/prices`, { prices });
+      toast.success('Prices saved');
+      setPriceCustomer(null);
+    } catch (err: any) {
+      toast.error(err.response?.data?.error || 'Save failed');
+    } finally {
+      setPriceSaving(false);
+    }
   };
 
   const exportCustomers = (format: string) => {
@@ -133,6 +172,7 @@ export default function CustomerList() {
                 <td><span className={`px-2 py-1 text-xs rounded-full ${c.is_active ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{c.is_active ? 'Active' : 'Inactive'}</span></td>
                   <td>
                     <div className="flex gap-1">
+                      <button onClick={() => openPriceList(c)} title="Price list" className="p-1.5 hover:bg-purple-50 rounded text-purple-600"><Tag size={15} /></button>
                       <button onClick={() => openEdit(c)} className="p-1.5 hover:bg-blue-50 rounded text-blue-600"><Edit2 size={15} /></button>
                       <button onClick={() => handleDelete(c.id)} className="p-1.5 hover:bg-red-50 rounded text-red-600"><Trash2 size={15} /></button>
                     </div>
@@ -145,8 +185,8 @@ export default function CustomerList() {
       </div>
       {/* Import modal */}
       {showImportModal && (
-        <div className="modal-overlay" onClick={() => { setShowImportModal(false); setImportFile(null); setImportPreview(null); setImportResult(null); }}>
-          <div className="modal-content max-w-4xl" onClick={(e) => e.stopPropagation()}>
+        <ModalOverlay onClose={() => { setShowImportModal(false); setImportFile(null); setImportPreview(null); setImportResult(null); }}>
+          <div className="modal-content max-w-4xl">
             <div className="p-6">
               <div className="flex items-center justify-between mb-4">
                 <h2 className="text-lg font-semibold">Import Customers</h2>
@@ -274,12 +314,12 @@ export default function CustomerList() {
               )}
             </div>
           </div>
-        </div>
+        </ModalOverlay>
       )}
 
       {showModal && (
-        <div className="modal-overlay" onClick={() => setShowModal(false)}>
-          <div className="modal-content max-w-lg" onClick={(e) => e.stopPropagation()}>
+        <ModalOverlay onClose={() => setShowModal(false)}>
+          <div className="modal-content max-w-lg">
             <div className="p-6">
               <h2 className="text-lg font-semibold mb-4">{editCustomer ? 'Edit Customer' : 'Add Customer'}</h2>
               <div className="grid grid-cols-2 gap-3">
@@ -302,6 +342,16 @@ export default function CustomerList() {
                     <option value="Corporate">Corporate</option><option value="Mining">Mining</option><option value="Resort">Resort</option>
                     <option value="Distributor">Distributor</option>
                   </select></div>
+                <div><label className="block text-sm font-medium mb-1">Default Price Mode</label>
+                  <select value={form.default_price_mode || ''} onChange={(e) => setForm({ ...form, default_price_mode: e.target.value })}
+                    className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
+                    <option value="">Auto (from segment)</option>
+                    <option value="Retail">Retail</option>
+                    <option value="Wholesale">Wholesale</option>
+                    <option value="Distributor">Distributor</option>
+                  </select>
+                  <p className="text-[10px] text-gray-400 mt-0.5">LGU / Mining / Corporate default to Wholesale when blank.</p>
+                </div>
                 <div><label className="block text-sm font-medium mb-1">Tax Type</label>
                   <select value={form.tax_type} onChange={(e) => setForm({ ...form, tax_type: e.target.value })}
                     className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
@@ -316,7 +366,7 @@ export default function CustomerList() {
                     <option value="45">45 Days</option><option value="60">60 Days</option><option value="90">90 Days</option>
                   </select></div>
                 <div><label className="block text-sm font-medium mb-1">Credit Limit</label>
-                  <input type="number" value={form.credit_limit} onChange={(e) => setForm({ ...form, credit_limit: parseFloat(e.target.value) || 0 })}
+                  <NumericInput value={form.credit_limit} onValueChange={(credit_limit) => setForm({ ...form, credit_limit })}
                     className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" /></div>
                 <div><label className="block text-sm font-medium mb-1">TIN</label>
                   <input type="text" value={form.tin} onChange={(e) => setForm({ ...form, tin: e.target.value })}
@@ -328,7 +378,54 @@ export default function CustomerList() {
               </div>
             </div>
           </div>
-        </div>
+        </ModalOverlay>
+      )}
+      {priceCustomer && (
+        <ModalOverlay onClose={() => setPriceCustomer(null)}>
+          <div className="modal-content max-w-3xl">
+            <div className="p-6">
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-lg font-semibold">Price List — {priceCustomer.customer_name}</h2>
+                <button onClick={() => setPriceCustomer(null)} className="p-1 hover:bg-gray-100 rounded"><X size={18} /></button>
+              </div>
+              <p className="text-xs text-gray-500 mb-3">Custom prices override retail/wholesale on sales invoices for this customer.</p>
+              <div className="max-h-96 overflow-auto border rounded-lg mb-3">
+                <table className="w-full text-sm">
+                  <thead className="bg-gray-50 sticky top-0">
+                    <tr>
+                      <th className="text-left px-3 py-2">Product</th>
+                      <th className="text-right px-3 py-2 w-32">Unit Price</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {priceRows.map((row, i) => (
+                      <tr key={i} className="border-t">
+                        <td className="px-3 py-2">
+                          <select className="w-full border rounded px-2 py-1 text-sm" value={row.product_id}
+                            onChange={(e) => { const rows = [...priceRows]; rows[i] = { ...rows[i], product_id: e.target.value }; setPriceRows(rows); }}>
+                            <option value="">Select product</option>
+                            {priceProducts.map((p) => <option key={p.id} value={p.id}>{p.sku} — {p.name}</option>)}
+                          </select>
+                        </td>
+                        <td className="px-3 py-2">
+                          <NumericInput value={row.unit_price} onValueChange={(v) => { const rows = [...priceRows]; rows[i] = { ...rows[i], unit_price: v }; setPriceRows(rows); }}
+                            className="w-full border rounded px-2 py-1 text-sm text-right" />
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="flex justify-between">
+                <button onClick={addPriceRow} className="text-sm text-blue-600">+ Add price</button>
+                <div className="flex gap-2">
+                  <button onClick={() => setPriceCustomer(null)} className="px-4 py-2 border rounded-lg text-sm">Cancel</button>
+                  <button onClick={savePrices} disabled={priceSaving} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700">{priceSaving ? 'Saving…' : 'Save Prices'}</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </ModalOverlay>
       )}
     </div>
   );

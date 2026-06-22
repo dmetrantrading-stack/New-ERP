@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
+import ModalOverlay from '../../components/ModalOverlay';
 import { useNavigate } from 'react-router-dom';
 import api from '../../lib/api';
 import { formatCurrency, formatDate } from '../../lib/utils';
-import { Plus, Edit2, Search, Trash2, FileText, X, Upload, Download } from 'lucide-react';
+import { Plus, Edit2, Search, Trash2, FileText, X, Upload, Download, Package } from 'lucide-react';
 import Pagination from '../../components/Pagination';
 import toast from 'react-hot-toast';
 
@@ -101,6 +102,10 @@ export default function SupplierList() {
     navigate(`/purchases?supplier=${supplierId}`);
   };
 
+  const viewCatalog = (supplierId: number) => {
+    navigate(`/suppliers/${supplierId}/catalog`);
+  };
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
@@ -155,6 +160,7 @@ export default function SupplierList() {
                 <td><span className={`px-2 py-1 text-xs rounded-full ${s.is_active ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{s.is_active ? 'Active' : 'Inactive'}</span></td>
                 <td>
                   <div className="flex gap-1">
+                    <button onClick={() => viewCatalog(s.id)} className="p-1.5 hover:bg-amber-50 rounded text-amber-700" title="Low Stock Catalog"><Package size={15} /></button>
                     <button onClick={() => viewLedger(s.id)} className="p-1.5 hover:bg-purple-50 rounded text-purple-600" title="View Ledger"><FileText size={15} /></button>
                     <button onClick={() => openEdit(s)} className="p-1.5 hover:bg-blue-50 rounded text-blue-600"><Edit2 size={15} /></button>
                     <button onClick={() => handleDelete(s.id)} className="p-1.5 hover:bg-red-50 rounded text-red-600"><Trash2 size={15} /></button>
@@ -169,8 +175,8 @@ export default function SupplierList() {
       </div>
 
       {showModal && (
-        <div className="modal-overlay" onClick={() => setShowModal(false)}>
-          <div className="modal-content max-w-md" onClick={(e) => e.stopPropagation()}>
+        <ModalOverlay onClose={() => setShowModal(false)}>
+          <div className="modal-content max-w-md">
             <div className="p-6">
               <h2 className="text-lg font-semibold mb-4">{editSupplier ? 'Edit Supplier' : 'Add Supplier'}</h2>
               <div className="grid grid-cols-2 gap-3">
@@ -199,13 +205,13 @@ export default function SupplierList() {
               </div>
             </div>
           </div>
-        </div>
+        </ModalOverlay>
       )}
 
       {/* Import modal */}
       {showImportModal && (
-        <div className="modal-overlay" onClick={() => { setShowImportModal(false); setImportFile(null); setImportPreview(null); setImportResult(null); }}>
-          <div className="modal-content max-w-4xl" onClick={(e) => e.stopPropagation()}>
+        <ModalOverlay onClose={() => { setShowImportModal(false); setImportFile(null); setImportPreview(null); setImportResult(null); }}>
+          <div className="modal-content max-w-4xl">
             <div className="p-6">
               <div className="flex items-center justify-between mb-4">
                 <h2 className="text-lg font-semibold">Import Suppliers</h2>
@@ -333,13 +339,13 @@ export default function SupplierList() {
               )}
             </div>
           </div>
-        </div>
+        </ModalOverlay>
       )}
 
       {/* Supplier Ledger Modal */}
       {showLedger && ledgerData && (
-        <div className="modal-overlay" onClick={() => setShowLedger(false)}>
-          <div className="modal-content max-w-4xl" onClick={(e) => e.stopPropagation()}>
+        <ModalOverlay onClose={() => setShowLedger(false)}>
+          <div className="modal-content max-w-4xl">
             <div className="p-6">
               <div className="flex items-center justify-between mb-4">
                 <div>
@@ -379,7 +385,7 @@ export default function SupplierList() {
               </div>
             </div>
           </div>
-        </div>
+        </ModalOverlay>
       )}
     </div>
   );

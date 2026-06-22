@@ -1,10 +1,12 @@
 import { Router, Response } from 'express';
 import { query } from '../../config/database';
-import { authenticate, AuthRequest } from '../../middleware/auth';
+import { authenticate, AuthRequest, hasUserPerm } from '../../middleware/auth';
+import { getArAgingReport } from '../../utils/financeAging';
+import { ACCOUNTS_LIST_SQL, computeAccountBalance } from '../../utils/bankCashBalance';
 
 const router = Router();
 
-router.get('/', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/', authenticate, hasUserPerm('dashboard.view'), async (req: AuthRequest, res: Response) => {
   try {
     // Daily sales (DB-native date, no timezone issues)
     const dailySales = await query(
@@ -116,7 +118,7 @@ router.get('/', authenticate, async (req: AuthRequest, res: Response) => {
 });
 
 // Executive Dashboard
-router.get('/executive', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/executive', authenticate, hasUserPerm('dashboard.view'), async (req: AuthRequest, res: Response) => {
   try {
     const today = new Date().toISOString().split('T')[0];
 
@@ -135,21 +137,21 @@ router.get('/executive', authenticate, async (req: AuthRequest, res: Response) =
     const ar = await query(`SELECT COALESCE(SUM(balance),0) as total FROM sales_invoices WHERE status IN ('Posted','Partial','Overdue') AND balance > 0`);
     const arTotal = parseFloat(ar.rows[0].total);
 
-    // AP
-    const ap = await query(`SELECT COALESCE(SUM(balance),0) as total FROM ap_vouchers WHERE status IN ('Posted','Partially Paid') AND balance > 0`);
+    // AP — use amount_paid (authoritative) rather than stale balance column
+    const ap = await query(
+      `SELECT COALESCE(SUM(a.total_amount - COALESCE(a.amount_paid, 0)), 0) as total
+       FROM ap_vouchers a
+       WHERE a.status IN ('Posted', 'Partially Paid')
+         AND a.total_amount > COALESCE(a.amount_paid, 0)`
+    );
     const apTotal = parseFloat(ap.rows[0].total);
 
-    // Bank & Cash (sum of all active account balances computed from transactions)
-    const bankCash = await query(`SELECT COALESCE(SUM(computed_balance),0) as total FROM (
-      SELECT ba.id, ba.account_type,
-        CASE WHEN ba.account_type = 'Cash on Hand' THEN
-          COALESCE((SELECT SUM(CASE WHEN ct.transaction_type = 'Cash In' THEN ct.amount ELSE -ct.amount END) FROM cash_transactions ct WHERE (ct.status IS NULL OR ct.status != 'Void')), 0)
-        ELSE
-          COALESCE((SELECT SUM(CASE WHEN bt.transaction_type = 'Deposit' THEN bt.amount ELSE -bt.amount END) FROM bank_transactions bt WHERE bt.bank_account_id = ba.id), 0)
-        END as computed_balance
-      FROM bank_accounts ba WHERE ba.is_active = true
-    ) sub`);
-    const bankCashTotal = parseFloat(bankCash.rows[0].total);
+    // Bank & Cash — match /bank-cash/accounts computed_balance logic
+    const bankCashRows = await query(ACCOUNTS_LIST_SQL);
+    const bankCashTotal = bankCashRows.rows.reduce(
+      (sum: number, row: any) => sum + computeAccountBalance(row),
+      0,
+    );
 
     // Net Profit = Sales - COGS - Expenses (this month)
     const sales = parseFloat(monthPos.rows[0].total) + parseFloat(monthSi.rows[0].total);
@@ -160,18 +162,8 @@ router.get('/executive', authenticate, async (req: AuthRequest, res: Response) =
     const expenses = parseFloat(exp.rows[0].total);
     const netProfit = sales - cogs - expenses;
 
-    // Aging Receivables
-    const aging = await query(
-      `SELECT
-        COALESCE(SUM(CASE WHEN si.due_date >= CURRENT_DATE OR si.due_date IS NULL THEN si.balance ELSE 0 END), 0) as current,
-        COALESCE(SUM(CASE WHEN si.due_date < CURRENT_DATE AND si.due_date >= CURRENT_DATE - 30 THEN si.balance ELSE 0 END), 0) as d30,
-        COALESCE(SUM(CASE WHEN si.due_date < CURRENT_DATE - 30 AND si.due_date >= CURRENT_DATE - 60 THEN si.balance ELSE 0 END), 0) as d60,
-        COALESCE(SUM(CASE WHEN si.due_date < CURRENT_DATE - 60 AND si.due_date >= CURRENT_DATE - 90 THEN si.balance ELSE 0 END), 0) as d90,
-        COALESCE(SUM(CASE WHEN si.due_date < CURRENT_DATE - 90 THEN si.balance ELSE 0 END), 0) as over90,
-        COALESCE(SUM(si.balance), 0) as total
-       FROM sales_invoices si
-       WHERE si.status IN ('Posted','Partial','Overdue') AND si.balance > 0`
-    );
+    // AR aging — shared report (consistent with Accounting / Collections)
+    const arAging = await getArAgingReport();
 
     // Recent Collections (last 10)
     const recentCol = await query(
@@ -200,7 +192,11 @@ router.get('/executive', authenticate, async (req: AuthRequest, res: Response) =
       accounts_payable: { total: apTotal },
       bank_cash: { total: bankCashTotal },
       net_profit: { sales, cogs, expenses, net: netProfit },
-      aging_receivables: aging.rows[0],
+      aging_receivables: {
+        buckets: arAging.buckets,
+        total: arAging.total_outstanding,
+        count: arAging.count,
+      },
       recent_collections: recentCol.rows,
       recent_payments: recentPay.rows,
     });
@@ -210,7 +206,7 @@ router.get('/executive', authenticate, async (req: AuthRequest, res: Response) =
 });
 
 // Sales chart by month
-router.get('/sales-chart', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/sales-chart', authenticate, hasUserPerm('dashboard.view'), async (req: AuthRequest, res: Response) => {
   try {
     const year = parseInt(req.query.year as string) || new Date().getFullYear();
     const result = await query(

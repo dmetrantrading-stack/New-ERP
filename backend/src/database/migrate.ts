@@ -1,4 +1,5 @@
 import { query, getClient } from '../config/database';
+import { ensureCategoryGlAccounts } from '../utils/chartOfAccountsBalance';
 
 const migrate = async () => {
   const client = await getClient();
@@ -218,6 +219,48 @@ const migrate = async () => {
       )
     `);
 
+    // ==================== CUSTOMERS ====================
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS customers (
+        id SERIAL PRIMARY KEY,
+        customer_code VARCHAR(50) UNIQUE NOT NULL,
+        customer_name VARCHAR(255) NOT NULL,
+        contact_person VARCHAR(255),
+        address TEXT,
+        phone VARCHAR(50),
+        email VARCHAR(255),
+        customer_type VARCHAR(50) CHECK (customer_type IN ('Retail', 'Wholesale', 'LGU', 'Corporate', 'Mining', 'Resort', 'Distributor')),
+        credit_limit DECIMAL(15,2) DEFAULT 0,
+        payment_terms VARCHAR(100),
+        tax_type VARCHAR(50) DEFAULT 'VAT',
+        tin VARCHAR(50),
+        is_active BOOLEAN DEFAULT true,
+        balance DECIMAL(15,2) DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // ==================== SUPPLIERS ====================
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS suppliers (
+        id SERIAL PRIMARY KEY,
+        supplier_code VARCHAR(50) UNIQUE NOT NULL,
+        supplier_name VARCHAR(255) NOT NULL,
+        contact_person VARCHAR(255),
+        address TEXT,
+        phone VARCHAR(50),
+        email VARCHAR(255),
+        payment_terms VARCHAR(100),
+        tin VARCHAR(50),
+        default_discount_percent DECIMAL(5,2) DEFAULT 0,
+        balance DECIMAL(15,2) DEFAULT 0,
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
     // ==================== PURCHASES ====================
     await client.query(`
       CREATE TABLE IF NOT EXISTS purchase_requisitions (
@@ -383,48 +426,6 @@ const migrate = async () => {
       )
     `);
 
-    // ==================== CUSTOMERS ====================
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS customers (
-        id SERIAL PRIMARY KEY,
-        customer_code VARCHAR(50) UNIQUE NOT NULL,
-        customer_name VARCHAR(255) NOT NULL,
-        contact_person VARCHAR(255),
-        address TEXT,
-        phone VARCHAR(50),
-        email VARCHAR(255),
-        customer_type VARCHAR(50) CHECK (customer_type IN ('Retail', 'Wholesale', 'LGU', 'Corporate', 'Mining', 'Resort', 'Distributor')),
-        credit_limit DECIMAL(15,2) DEFAULT 0,
-        payment_terms VARCHAR(100),
-        tax_type VARCHAR(50) DEFAULT 'VAT',
-        tin VARCHAR(50),
-        is_active BOOLEAN DEFAULT true,
-        balance DECIMAL(15,2) DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
-    // ==================== SUPPLIERS ====================
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS suppliers (
-        id SERIAL PRIMARY KEY,
-        supplier_code VARCHAR(50) UNIQUE NOT NULL,
-        supplier_name VARCHAR(255) NOT NULL,
-        contact_person VARCHAR(255),
-        address TEXT,
-        phone VARCHAR(50),
-        email VARCHAR(255),
-        payment_terms VARCHAR(100),
-        tin VARCHAR(50),
-        default_discount_percent DECIMAL(5,2) DEFAULT 0,
-        balance DECIMAL(15,2) DEFAULT 0,
-        is_active BOOLEAN DEFAULT true,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
     // ==================== SALES ====================
     await client.query(`
       CREATE TABLE IF NOT EXISTS sales_quotations (
@@ -527,6 +528,7 @@ const migrate = async () => {
     await client.query(`ALTER TABLE sales_invoices ADD COLUMN IF NOT EXISTS vat_amount DECIMAL(15,2) DEFAULT 0`);
     await client.query(`ALTER TABLE sales_invoices ADD COLUMN IF NOT EXISTS lgu_final_tax DECIMAL(15,2) DEFAULT 0`);
     await client.query(`ALTER TABLE sales_invoices ADD COLUMN IF NOT EXISTS withholding_tax DECIMAL(15,2) DEFAULT 0`);
+    await client.query(`ALTER TABLE sales_invoices ADD COLUMN IF NOT EXISTS ewt_rate DECIMAL(5,2) DEFAULT 0`);
 
     // Update status constraint to include 'Deducted' (for payroll/employee deductions)
     await client.query(`ALTER TABLE sales_invoices DROP CONSTRAINT IF EXISTS sales_invoices_status_check`);
@@ -617,6 +619,36 @@ const migrate = async () => {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS sales_return_items (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        return_id UUID REFERENCES sales_returns(id) ON DELETE CASCADE,
+        invoice_item_id UUID REFERENCES sales_invoice_items(id),
+        product_id UUID REFERENCES products(id),
+        location_id INTEGER REFERENCES locations(id),
+        quantity DECIMAL(15,4) NOT NULL,
+        unit_price DECIMAL(15,4) DEFAULT 0,
+        total DECIMAL(15,2) DEFAULT 0,
+        cost DECIMAL(15,4) DEFAULT 0
+      )
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS purchase_return_items (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        return_id UUID REFERENCES purchase_returns(id) ON DELETE CASCADE,
+        product_id UUID REFERENCES products(id),
+        location_id INTEGER REFERENCES locations(id),
+        batch_id UUID REFERENCES batches(id),
+        quantity DECIMAL(15,4) NOT NULL,
+        unit_cost DECIMAL(15,4) DEFAULT 0,
+        net_unit_cost DECIMAL(15,4) DEFAULT 0,
+        total_cost DECIMAL(15,2) DEFAULT 0
+      )
+    `);
+
+    await client.query(`ALTER TABLE purchase_returns ADD COLUMN IF NOT EXISTS total DECIMAL(15,2) DEFAULT 0`);
 
     // ==================== POS ====================
     await client.query(`
@@ -895,6 +927,7 @@ const migrate = async () => {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
+    await client.query(`ALTER TABLE cash_transactions ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'Posted'`);
 
     // ==================== BANK MANAGEMENT ====================
     await client.query(`
@@ -1183,11 +1216,36 @@ const migrate = async () => {
         lgu_amount DECIMAL(15,2) DEFAULT 0
       )
     `);
+    // Backfill allocation rows for legacy single-invoice receipts (EWT/LGU from posted journal entries)
+    await client.query(`
+      INSERT INTO collection_receipt_allocations (id, receipt_id, invoice_id, applied_amount, ewt_amount, lgu_amount)
+      SELECT uuid_generate_v4(), cr.id, cr.invoice_id, cr.amount,
+        COALESCE((
+          SELECT SUM(jel.debit)
+          FROM journal_entries je
+          JOIN journal_entry_lines jel ON jel.entry_id = je.id
+          JOIN chart_of_accounts coa ON coa.id = jel.account_id
+          WHERE je.reference_type = 'Collection' AND je.reference_id = cr.id AND coa.account_code = '1105'
+        ), 0),
+        COALESCE((
+          SELECT SUM(jel.debit)
+          FROM journal_entries je
+          JOIN journal_entry_lines jel ON jel.entry_id = je.id
+          JOIN chart_of_accounts coa ON coa.id = jel.account_id
+          WHERE je.reference_type = 'Collection' AND je.reference_id = cr.id AND coa.account_code = '2110'
+        ), 0)
+      FROM collection_receipts cr
+      WHERE cr.invoice_id IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM collection_receipt_allocations x WHERE x.receipt_id = cr.id)
+    `);
     await client.query(`ALTER TABLE purchase_order_items ADD COLUMN IF NOT EXISTS discount_type VARCHAR(10) DEFAULT '%'`);
     await client.query(`ALTER TABLE purchase_order_items ADD COLUMN IF NOT EXISTS discount_value DECIMAL(15,2) DEFAULT 0`);
     await client.query(`ALTER TABLE purchase_order_items ADD COLUMN IF NOT EXISTS discount_amount DECIMAL(15,2) DEFAULT 0`);
     await client.query(`ALTER TABLE purchase_order_items ADD COLUMN IF NOT EXISTS net_unit_cost DECIMAL(15,2) DEFAULT 0`);
     await client.query(`ALTER TABLE purchase_order_items ADD COLUMN IF NOT EXISTS net_total DECIMAL(15,2) DEFAULT 0`);
+    await client.query(`ALTER TABLE purchase_requisition_items ADD COLUMN IF NOT EXISTS tax_type VARCHAR(50) DEFAULT 'VAT'`);
+    await client.query(`ALTER TABLE purchase_order_items ADD COLUMN IF NOT EXISTS tax_type VARCHAR(50) DEFAULT 'VAT'`);
+    await client.query(`ALTER TABLE ap_voucher_items ADD COLUMN IF NOT EXISTS tax_type VARCHAR(50) DEFAULT 'VAT'`);
     await client.query(`ALTER TABLE goods_receipt_items ADD COLUMN IF NOT EXISTS discount_amount DECIMAL(15,2) DEFAULT 0`);
     await client.query(`ALTER TABLE goods_receipt_items ADD COLUMN IF NOT EXISTS net_unit_cost DECIMAL(15,2) NOT NULL DEFAULT 0`);
     await client.query(`ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS default_discount_percent DECIMAL(5,2) DEFAULT 0`);
@@ -1246,6 +1304,21 @@ const migrate = async () => {
     `);
     await client.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS price_type VARCHAR(50) DEFAULT 'VAT Inclusive'`);
     await client.query(`ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS account_code VARCHAR(50)`);
+    await client.query(`ALTER TABLE sales_quotations ADD COLUMN IF NOT EXISTS terms_conditions TEXT`);
+    await client.query(`ALTER TABLE sales_quotations ADD COLUMN IF NOT EXISTS payment_terms VARCHAR(100)`);
+
+    // Reconcile journal entry header totals with actual line sums (e.g. SI from DR with skip_inventory)
+    await client.query(`
+      UPDATE journal_entries je
+      SET total_debit = agg.line_total, total_credit = agg.line_total
+      FROM (
+        SELECT entry_id, ROUND(SUM(debit)::numeric, 2) AS line_total
+        FROM journal_entry_lines
+        GROUP BY entry_id
+      ) agg
+      WHERE je.id = agg.entry_id
+        AND je.total_debit IS DISTINCT FROM agg.line_total
+    `);
 
     // Ensure unique GL account codes for e-wallet / payment accounts
     const ewalletCoas: [string, string, string][] = [
@@ -1284,12 +1357,15 @@ const migrate = async () => {
     }
     await client.query(
       `INSERT INTO bank_accounts (bank_name, account_name, account_number, account_type, gl_account_code, balance, is_active)
-       VALUES ('Checks on Hand', 'Undeposited Checks', 'N/A', 'Checks on Hand', '1015', 0, true)
-       ON CONFLICT DO NOTHING`
+       SELECT 'Checks on Hand', 'Undeposited Checks', 'N/A', 'Checks on Hand', '1015', 0, true
+       WHERE NOT EXISTS (SELECT 1 FROM bank_accounts WHERE account_type = 'Checks on Hand')`
     );
     await client.query(
       "INSERT INTO chart_of_accounts (account_code, account_name, account_type) VALUES ('1106','Input VAT','Asset') ON CONFLICT (account_code) DO NOTHING"
     );
+    await client.query(`ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS starting_balance DECIMAL(15,2) DEFAULT 0`);
+    await client.query(`ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS starting_balance_ref_id UUID`);
+    await client.query(`ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS starting_balance_set_at TIMESTAMP`);
 
     // ==================== SUPPLIER PRICE HISTORY ====================
     await client.query(`
@@ -1331,6 +1407,12 @@ const migrate = async () => {
       ON CONFLICT (setting_key) DO NOTHING
     `);
 
+    await client.query(`
+      INSERT INTO system_settings (setting_key, setting_value)
+      VALUES ('invoice_copy_mode', 'delivered')
+      ON CONFLICT (setting_key) DO NOTHING
+    `);
+
     // ==================== PETTY CASH VOUCHERS ====================
     await client.query(`
       CREATE TABLE IF NOT EXISTS petty_cash_vouchers (
@@ -1351,8 +1433,8 @@ const migrate = async () => {
     `);
     await client.query(
       `INSERT INTO bank_accounts (bank_name, account_name, account_number, account_type, gl_account_code, balance, is_active)
-       VALUES ('Petty Cash Fund', 'Office Petty Cash', 'PCF-001', 'Petty Cash Fund', '1016', 0, true)
-       ON CONFLICT DO NOTHING`
+       SELECT 'Petty Cash Fund', 'Office Petty Cash', 'PCF-001', 'Petty Cash Fund', '1016', 0, true
+       WHERE NOT EXISTS (SELECT 1 FROM bank_accounts WHERE account_type = 'Petty Cash Fund')`
     );
 
     // ==================== USER PERMISSIONS ====================
@@ -1366,7 +1448,308 @@ const migrate = async () => {
     `);
 
     await client.query('COMMIT');
-    console.log('Migration completed successfully');
+    console.log('Migration completed — applying structural changes...');
+
+    await client.query(`ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS starting_balance DECIMAL(15,2) DEFAULT 0`);
+    await client.query(`ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS starting_balance_ref_id UUID`);
+    await client.query(`ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS starting_balance_set_at TIMESTAMP`);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS supplier_catalog_items (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        supplier_id INTEGER NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
+        product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+        order_qty_multiplier DECIMAL(5,2) DEFAULT 2,
+        fixed_order_qty DECIMAL(15,2),
+        sort_order INTEGER DEFAULT 0,
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(supplier_id, product_id)
+      )
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_supplier_catalog_supplier ON supplier_catalog_items(supplier_id)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_supplier_catalog_product ON supplier_catalog_items(product_id)`);
+
+    // ==================== SALES ORDER ITEMS ====================
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS sales_order_items (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        order_id UUID REFERENCES sales_orders(id) ON DELETE CASCADE,
+        product_id UUID REFERENCES products(id),
+        variant_id UUID REFERENCES product_variants(id),
+        description TEXT,
+        ordered_qty DECIMAL(15,2) NOT NULL DEFAULT 0,
+        delivered_qty DECIMAL(15,2) DEFAULT 0,
+        reserved_qty DECIMAL(15,2) DEFAULT 0,
+        unit_price DECIMAL(15,2) NOT NULL DEFAULT 0,
+        discount DECIMAL(15,2) DEFAULT 0,
+        tax_type VARCHAR(50) DEFAULT 'VAT',
+        vat_amount DECIMAL(15,2) DEFAULT 0,
+        total DECIMAL(15,2) NOT NULL DEFAULT 0
+      )
+    `);
+
+    // ==================== DELIVERY NOTE ITEMS ====================
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS delivery_note_items (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        note_id UUID REFERENCES delivery_notes(id) ON DELETE CASCADE,
+        order_item_id UUID REFERENCES sales_order_items(id),
+        product_id UUID REFERENCES products(id),
+        description TEXT,
+        quantity DECIMAL(15,2) NOT NULL DEFAULT 0,
+        unit_price DECIMAL(15,2) DEFAULT 0,
+        total DECIMAL(15,2) DEFAULT 0
+      )
+    `);
+
+    // ==================== ALTER sales_orders ====================
+    await client.query(`ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS total_ordered_qty DECIMAL(15,2) DEFAULT 0`);
+    await client.query(`ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS total_delivered_qty DECIMAL(15,2) DEFAULT 0`);
+    await client.query(`ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS total_remaining_qty DECIMAL(15,2) DEFAULT 0`);
+    await client.query(`ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS total_reserved_qty DECIMAL(15,2) DEFAULT 0`);
+    await client.query(`ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS terms_conditions TEXT`);
+    // terms_conditions on all sales & purchase document headers
+    const termsTables = [
+      'delivery_notes',
+      'sales_invoices',
+      'sales_returns',
+      'collection_receipts',
+      'purchase_requisitions',
+      'purchase_orders',
+      'goods_receipts',
+      'purchase_returns',
+      'ap_vouchers',
+      'payment_vouchers',
+    ];
+    for (const tbl of termsTables) {
+      await client.query(`ALTER TABLE ${tbl} ADD COLUMN IF NOT EXISTS terms_conditions TEXT`);
+    }
+    // Update status CHECK to include new statuses
+    await client.query(`ALTER TABLE sales_orders DROP CONSTRAINT IF EXISTS sales_orders_status_check`);
+    await client.query(`ALTER TABLE sales_orders ADD CONSTRAINT sales_orders_status_check CHECK (status IN ('Draft','Confirmed','Open','Partially Delivered','Fully Delivered','Invoiced','Closed','Cancelled'))`);
+
+    // ==================== ALTER delivery_notes ====================
+    await client.query(`ALTER TABLE delivery_notes ADD COLUMN IF NOT EXISTS dr_number VARCHAR(50) UNIQUE`);
+    await client.query(`ALTER TABLE delivery_notes ADD COLUMN IF NOT EXISTS total_qty DECIMAL(15,2) DEFAULT 0`);
+    await client.query(`ALTER TABLE delivery_notes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`);
+    await client.query(`ALTER TABLE delivery_notes DROP CONSTRAINT IF EXISTS delivery_notes_status_check`);
+    await client.query(`ALTER TABLE delivery_notes ADD CONSTRAINT delivery_notes_status_check CHECK (status IN ('Draft','Posted','Cancelled'))`);
+
+    // ==================== SALES QUOTATION ITEMS ====================
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS sales_quotation_items (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        quotation_id UUID REFERENCES sales_quotations(id) ON DELETE CASCADE,
+        product_id UUID REFERENCES products(id),
+        variant_id UUID REFERENCES product_variants(id),
+        description TEXT,
+        quantity DECIMAL(15,2) NOT NULL DEFAULT 0,
+        unit_price DECIMAL(15,2) NOT NULL DEFAULT 0,
+        discount DECIMAL(15,2) DEFAULT 0,
+        tax_type VARCHAR(50) DEFAULT 'VAT',
+        vat_amount DECIMAL(15,2) DEFAULT 0,
+        total DECIMAL(15,2) NOT NULL DEFAULT 0
+      )
+    `);
+
+    console.log('Structural changes applied');
+
+    // ==================== PHASE 1: Employee returns, reconciliation, signatures, period lock ====================
+    await client.query(`ALTER TABLE sales_returns ADD COLUMN IF NOT EXISTS employee_id INTEGER REFERENCES employees(id)`);
+    await client.query(`ALTER TABLE bank_transactions ADD COLUMN IF NOT EXISTS is_cleared BOOLEAN DEFAULT false`);
+    await client.query(`ALTER TABLE bank_transactions ADD COLUMN IF NOT EXISTS cleared_at TIMESTAMP`);
+    await client.query(`ALTER TABLE bank_transactions ADD COLUMN IF NOT EXISTS cleared_by UUID REFERENCES users(id)`);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS signature_url VARCHAR(500)`);
+    await client.query(`ALTER TABLE business_details ADD COLUMN IF NOT EXISTS prepared_by_signature_url VARCHAR(500)`);
+    await client.query(`ALTER TABLE business_details ADD COLUMN IF NOT EXISTS approved_by_signature_url VARCHAR(500)`);
+    await client.query(`
+      INSERT INTO system_settings (setting_key, setting_value)
+      VALUES ('accounting_lock_date', '')
+      ON CONFLICT (setting_key) DO NOTHING
+    `);
+
+    // ==================== PHASE 2: Memos, BOM, customer prices, BIR 2307 ====================
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS sales_memos (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        memo_number VARCHAR(50) UNIQUE NOT NULL,
+        memo_type VARCHAR(10) NOT NULL CHECK (memo_type IN ('Credit', 'Debit')),
+        customer_id INTEGER REFERENCES customers(id),
+        invoice_id UUID REFERENCES sales_invoices(id),
+        memo_date DATE NOT NULL DEFAULT CURRENT_DATE,
+        amount DECIMAL(15,2) NOT NULL CHECK (amount > 0),
+        reason TEXT,
+        notes TEXT,
+        status VARCHAR(20) DEFAULT 'Posted',
+        created_by UUID REFERENCES users(id),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS purchase_memos (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        memo_number VARCHAR(50) UNIQUE NOT NULL,
+        memo_type VARCHAR(10) NOT NULL CHECK (memo_type IN ('Credit', 'Debit')),
+        supplier_id INTEGER REFERENCES suppliers(id),
+        apv_id UUID,
+        memo_date DATE NOT NULL DEFAULT CURRENT_DATE,
+        amount DECIMAL(15,2) NOT NULL CHECK (amount > 0),
+        reason TEXT,
+        notes TEXT,
+        status VARCHAR(20) DEFAULT 'Posted',
+        created_by UUID REFERENCES users(id),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS production_boms (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        bom_code VARCHAR(50) UNIQUE NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        output_product_id UUID REFERENCES products(id),
+        output_qty DECIMAL(15,4) NOT NULL DEFAULT 1,
+        notes TEXT,
+        is_active BOOLEAN DEFAULT true,
+        created_by UUID REFERENCES users(id),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS production_bom_lines (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        bom_id UUID REFERENCES production_boms(id) ON DELETE CASCADE,
+        line_type VARCHAR(10) NOT NULL CHECK (line_type IN ('Input', 'Output')),
+        product_id UUID REFERENCES products(id),
+        quantity DECIMAL(15,4) NOT NULL DEFAULT 1,
+        uom VARCHAR(50)
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS customer_product_prices (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+        product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+        unit_price DECIMAL(15,4) NOT NULL,
+        effective_from DATE,
+        effective_to DATE,
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(customer_id, product_id)
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS bir_2307_certificates (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        certificate_number VARCHAR(50) UNIQUE NOT NULL,
+        supplier_id INTEGER REFERENCES suppliers(id),
+        payee_name VARCHAR(255) NOT NULL,
+        payee_tin VARCHAR(50),
+        period_from DATE NOT NULL,
+        period_to DATE NOT NULL,
+        income_payment DECIMAL(15,2) NOT NULL DEFAULT 0,
+        tax_withheld DECIMAL(15,2) NOT NULL DEFAULT 0,
+        atc_code VARCHAR(20),
+        payment_voucher_id UUID,
+        apv_id UUID,
+        notes TEXT,
+        created_by UUID REFERENCES users(id),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS payroll_deduction_allocations (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        payroll_id UUID NOT NULL REFERENCES payroll(id) ON DELETE CASCADE,
+        allocation_type VARCHAR(50) NOT NULL CHECK (allocation_type IN ('Cash Advance', 'Grocery Credit')),
+        cash_advance_id UUID REFERENCES cash_advances(id),
+        sales_invoice_id UUID REFERENCES sales_invoices(id),
+        amount DECIMAL(15,2) NOT NULL CHECK (amount > 0),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        CHECK (
+          (allocation_type = 'Cash Advance' AND cash_advance_id IS NOT NULL AND sales_invoice_id IS NULL)
+          OR (allocation_type = 'Grocery Credit' AND sales_invoice_id IS NOT NULL AND cash_advance_id IS NULL)
+        )
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_payroll_deduction_alloc_payroll
+      ON payroll_deduction_allocations (payroll_id)
+    `);
+
+    await client.query(`
+      INSERT INTO user_permissions (user_id, permission_key)
+      SELECT user_id, REPLACE(permission_key, 'purchases.dv.', 'purchases.payment-voucher.')
+      FROM user_permissions
+      WHERE permission_key LIKE 'purchases.dv.%'
+      ON CONFLICT (user_id, permission_key) DO NOTHING
+    `);
+
+    await client.query(`
+      INSERT INTO user_permissions (user_id, permission_key)
+      SELECT user_id, REPLACE(permission_key, 'hr.payslip.', 'hr.payroll.')
+      FROM user_permissions
+      WHERE permission_key LIKE 'hr.payslip.%'
+      ON CONFLICT (user_id, permission_key) DO NOTHING
+    `);
+
+    const expenseCategorySeeds: [string, string][] = [
+      ['6110', 'Christmas Bonus'],
+      ['6111', 'Purchaser Commissions'],
+      ['6112', 'Store/Office Equipment'],
+      ['6113', 'Subscription Expense'],
+      ['6114', 'Tax, Permits & Licenses'],
+      ['6115', 'Advertising and Marketing Expense'],
+      ['6116', 'Bank Charges'],
+      ['6117', 'Donations'],
+      ['6118', 'General and Administrative Expense'],
+      ['6119', 'Internet Fee'],
+      ['6120', 'Legal Fees'],
+      ['6121', 'Motor Vehicle Expense'],
+      ['6122', 'Food Allowance Expense'],
+      ['6010', 'Fuel Expense'],
+      ['6030', 'Pantry Supply Expense'],
+    ];
+    // Category GL account mapping (Sales Revenue + COGS per product category)
+    await client.query(`ALTER TABLE categories ADD COLUMN IF NOT EXISTS revenue_account_code VARCHAR(10) DEFAULT '4000'`);
+    await client.query(`ALTER TABLE categories ADD COLUMN IF NOT EXISTS cogs_account_code VARCHAR(10) DEFAULT '5000'`);
+
+    await ensureCategoryGlAccounts(client);
+
+    // ==================== PHASE 2 OPERATIONS: FEFO dispatch, customer price mode ====================
+    await client.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS default_price_mode VARCHAR(50)`);
+    await client.query(`ALTER TABLE delivery_notes ADD COLUMN IF NOT EXISTS driver_name VARCHAR(255)`);
+    await client.query(`ALTER TABLE delivery_notes ADD COLUMN IF NOT EXISTS vehicle_plate VARCHAR(50)`);
+    await client.query(`ALTER TABLE delivery_notes ADD COLUMN IF NOT EXISTS dispatch_notes TEXT`);
+
+    // ==================== PHASE 3: Compliance & scale ====================
+    await client.query(`
+      INSERT INTO system_settings (setting_key, setting_value)
+      VALUES ('enforce_approval_limits', 'true')
+      ON CONFLICT (setting_key) DO NOTHING
+    `);
+
+    for (const [code, name] of expenseCategorySeeds) {
+      await client.query(
+        `INSERT INTO chart_of_accounts (account_code, account_name, account_type)
+         VALUES ($1, $2, 'Expense') ON CONFLICT (account_code) DO NOTHING`,
+        [code, name]
+      );
+      const exists = await client.query('SELECT id FROM expense_categories WHERE name = $1', [name]);
+      if (exists.rows.length === 0) {
+        await client.query(
+          'INSERT INTO expense_categories (name, account_code) VALUES ($1, $2)',
+          [name, code]
+        );
+      } else {
+        await client.query(
+          'UPDATE expense_categories SET account_code = $1 WHERE name = $2',
+          [code, name]
+        );
+      }
+    }
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Migration failed:', error);

@@ -1,22 +1,26 @@
 import React, { useState, useEffect } from 'react';
+import ModalOverlay from '../../components/ModalOverlay';
 import api from '../../lib/api';
 import { Plus, Edit2, Trash2 } from 'lucide-react';
 import toast from 'react-hot-toast';
 
-export default function BrandList() {
+export default function BrandList({ embedded = false, onChanged }: { embedded?: boolean; onChanged?: () => void }) {
   const [brands, setBrands] = useState<any[]>([]);
   const [showModal, setShowModal] = useState(false);
   const [editItem, setEditItem] = useState<any>(null);
   const [form, setForm] = useState({ name: '', description: '' });
 
-  useEffect(() => { api.get('/brands/all').then((res) => setBrands(res.data)).catch((err) => toast.error(err.response?.data?.error || 'Failed to load data')); }, []);
+  const loadBrands = () => {
+    api.get('/brands/all').then((res) => { setBrands(res.data); onChanged?.(); }).catch((err) => toast.error(err.response?.data?.error || 'Failed to load data'));
+  };
+  useEffect(() => { loadBrands(); }, []);
 
   const openCreate = () => { setEditItem(null); setForm({ name: '', description: '' }); setShowModal(true); };
   const openEdit = (b: any) => { setEditItem(b); setForm({ name: b.name, description: b.description || '' }); setShowModal(true); };
 
   const handleDelete = async (id: string) => {
     if (!confirm('Are you sure you want to delete this record?')) return;
-    try { await api.delete(`/brands/${id}`); toast.success('Deleted'); const res = await api.get('/brands/all'); setBrands(res.data); }
+    try { await api.delete(`/brands/${id}`); toast.success('Deleted'); loadBrands(); }
     catch (err: any) { toast.error(err.response?.data?.error || 'Cannot delete'); }
   };
 
@@ -26,14 +30,14 @@ export default function BrandList() {
       if (editItem) { await api.put(`/brands/${editItem.id}`, form); toast.success('Updated'); }
       else { await api.post('/brands', form); toast.success('Created'); }
       setShowModal(false);
-      const res = await api.get('/brands/all'); setBrands(res.data);
+      loadBrands();
     } catch (err: any) { toast.error(err.response?.data?.error || 'Error'); }
   };
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold text-gray-900">Brands</h1>
+      <div className={`flex items-center ${embedded ? 'justify-end' : 'justify-between'}`}>
+        {!embedded && <h1 className="text-2xl font-bold text-gray-900">Brands</h1>}
         <button onClick={openCreate} className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700"><Plus size={16} /> Add Brand</button>
       </div>
       <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
@@ -57,8 +61,8 @@ export default function BrandList() {
         </table>
       </div>
       {showModal && (
-        <div className="modal-overlay" onClick={() => setShowModal(false)}>
-          <div className="modal-content max-w-md" onClick={(e) => e.stopPropagation()}>
+        <ModalOverlay onClose={() => setShowModal(false)}>
+          <div className="modal-content max-w-md">
             <div className="p-6">
               <h2 className="text-lg font-semibold mb-4">{editItem ? 'Edit Brand' : 'Add Brand'}</h2>
               <div className="space-y-3">
@@ -75,7 +79,7 @@ export default function BrandList() {
               </div>
             </div>
           </div>
-        </div>
+        </ModalOverlay>
       )}
     </div>
   );

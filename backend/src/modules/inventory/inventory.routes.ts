@@ -2,7 +2,7 @@ import { Router, Response } from 'express';
 import multer from 'multer';
 import XLSX from 'xlsx';
 import { query, getClient } from '../../config/database';
-import { authenticate, AuthRequest } from '../../middleware/auth';
+import { authenticate, AuthRequest, hasUserPerm, hasUserAnyPerm } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
 import { AppError } from '../../middleware/errorHandler';
 import { v4 as uuidv4 } from 'uuid';
@@ -10,6 +10,9 @@ import { v4 as uuidv4 } from 'uuid';
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 }, fileFilter: (_req, file, cb) => { const ok = file.mimetype === 'text/csv' || file.originalname.endsWith('.csv') || file.mimetype === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' || file.originalname.endsWith('.xlsx'); cb(null, ok); } });
 
 const router = Router();
+
+const invView = hasUserPerm('inventory.inventory.view');
+const invExport = hasUserPerm('inventory.inventory.export');
 
 const generateRefNumber = async (prefix: string, table: string, column: string): Promise<string> => {
   const safePrefix = prefix.replace(/[^A-Z]/g, '');
@@ -22,7 +25,7 @@ const generateRefNumber = async (prefix: string, table: string, column: string):
 };
 
 // Get inventory with product details (original flat list)
-router.get('/', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/', authenticate, invView, async (req: AuthRequest, res: Response) => {
   try {
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 50;
@@ -84,7 +87,7 @@ router.get('/', authenticate, async (req: AuthRequest, res: Response) => {
 });
 
 // Get pivoted inventory stock list with summary cards
-router.get('/stock-list', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/stock-list', authenticate, invView, async (req: AuthRequest, res: Response) => {
   try {
     const search = req.query.search as string || '';
     const lowStockOnly = req.query.low_stock === 'true';
@@ -162,7 +165,7 @@ router.get('/stock-list', authenticate, async (req: AuthRequest, res: Response) 
 });
 
 // Get inventory for a specific product
-router.get('/product/:productId', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/product/:productId', authenticate, invView, async (req: AuthRequest, res: Response) => {
   try {
     const result = await query(
       `SELECT i.*, l.name as location_name
@@ -178,7 +181,7 @@ router.get('/product/:productId', authenticate, async (req: AuthRequest, res: Re
 });
 
 // Get stock card / inventory ledger
-router.get('/ledger/:productId', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/ledger/:productId', authenticate, invView, async (req: AuthRequest, res: Response) => {
   try {
     const location_id = req.query.location_id || 1;
     const page = parseInt(req.query.page as string) || 1;
@@ -212,7 +215,7 @@ router.get('/ledger/:productId', authenticate, async (req: AuthRequest, res: Res
 });
 
 // Get batches for a product
-router.get('/batches/:productId', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/batches/:productId', authenticate, invView, async (req: AuthRequest, res: Response) => {
   try {
     const result = await query(
       `SELECT b.*, l.name as location_name
@@ -229,7 +232,7 @@ router.get('/batches/:productId', authenticate, async (req: AuthRequest, res: Re
 });
 
 // Adjust inventory
-router.post('/adjust', authenticate, auditLog('Inventory', 'Adjust'), async (req: AuthRequest, res: Response) => {
+router.post('/adjust', authenticate, hasUserPerm('inventory.inventory.edit'), auditLog('Inventory', 'Adjust'), async (req: AuthRequest, res: Response) => {
   const client = await getClient();
   try {
     await client.query('BEGIN');
@@ -314,7 +317,7 @@ router.post('/adjust', authenticate, auditLog('Inventory', 'Adjust'), async (req
 });
 
 // Low stock alerts
-router.get('/alerts/low-stock', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/alerts/low-stock', authenticate, invView, async (req: AuthRequest, res: Response) => {
   try {
     const result = await query(
       `SELECT p.id, p.sku, p.name, p.reorder_level, p.unit_of_measure,
@@ -332,7 +335,7 @@ router.get('/alerts/low-stock', authenticate, async (req: AuthRequest, res: Resp
 });
 
 // Expiry alerts
-router.get('/alerts/expiring', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/alerts/expiring', authenticate, invView, async (req: AuthRequest, res: Response) => {
   try {
     const days = parseInt(req.query.days as string) || 30;
     const result = await query(
@@ -341,7 +344,7 @@ router.get('/alerts/expiring', authenticate, async (req: AuthRequest, res: Respo
        JOIN products p ON b.product_id = p.id
        JOIN locations l ON b.location_id = l.id
        WHERE b.expiry_date IS NOT NULL
-         AND b.expiry_date BETWEEN CURRENT_DATE AND CURRENT_DATE + $1
+         AND b.expiry_date BETWEEN CURRENT_DATE AND CURRENT_DATE + ($1::int)
          AND b.quantity > 0
        ORDER BY b.expiry_date ASC`,
       [days]
@@ -353,7 +356,7 @@ router.get('/alerts/expiring', authenticate, async (req: AuthRequest, res: Respo
 });
 
 // Expired items
-router.get('/alerts/expired', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/alerts/expired', authenticate, invView, async (req: AuthRequest, res: Response) => {
   try {
     const result = await query(
       `SELECT b.*, p.sku, p.name as product_name, l.name as location_name
@@ -370,7 +373,7 @@ router.get('/alerts/expired', authenticate, async (req: AuthRequest, res: Respon
 });
 
 // Locations
-router.get('/locations', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/locations', authenticate, hasUserAnyPerm(['inventory.inventory.view', 'pos.view', 'pos.write']), async (req: AuthRequest, res: Response) => {
   try {
     const result = await query('SELECT * FROM locations WHERE is_active = true ORDER BY name');
     res.json(result.rows);
@@ -380,7 +383,7 @@ router.get('/locations', authenticate, async (req: AuthRequest, res: Response) =
 });
 
 // Items expiring within a range (e.g. 60-90 days)
-router.get('/alerts/expiring-range', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/alerts/expiring-range', authenticate, invView, async (req: AuthRequest, res: Response) => {
   try {
     const fromDays = parseInt(req.query.from as string) || 60;
     const toDays = parseInt(req.query.to as string) || 90;
@@ -392,7 +395,7 @@ router.get('/alerts/expiring-range', authenticate, async (req: AuthRequest, res:
        JOIN products p ON b.product_id = p.id
        JOIN locations l ON b.location_id = l.id
        WHERE b.expiry_date IS NOT NULL
-         AND b.expiry_date BETWEEN CURRENT_DATE + $1 AND CURRENT_DATE + $2
+         AND b.expiry_date BETWEEN CURRENT_DATE + ($1::int) AND CURRENT_DATE + ($2::int)
          AND b.quantity > 0
        ORDER BY b.expiry_date ASC`,
       [fromDays, toDays]
@@ -433,7 +436,7 @@ const parseFile = (buffer: Buffer, originalName: string): { headers: string[]; r
 };
 
 // Download blank inventory import template
-router.get('/export/template', authenticate, async (_req: AuthRequest, res: Response) => {
+router.get('/export/template', authenticate, invExport, async (_req: AuthRequest, res: Response) => {
   const headerRow = ['SKU','Barcode','Product Name','Location','Quantity','Unit','Batch Number','Expiration Date','Average Cost','Remarks'];
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename=inventory_import_template.csv');
@@ -441,7 +444,7 @@ router.get('/export/template', authenticate, async (_req: AuthRequest, res: Resp
 });
 
 // Preview inventory import
-router.post('/import/preview', authenticate, upload.single('file'), async (req: AuthRequest, res: Response) => {
+router.post('/import/preview', authenticate, hasUserPerm('inventory.inventory.edit'), upload.single('file'), async (req: AuthRequest, res: Response) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'File is required' });
     const { headers, rows: rawRows } = parseFile(req.file.buffer, req.file.originalname);
@@ -554,7 +557,7 @@ router.post('/import/preview', authenticate, upload.single('file'), async (req: 
 });
 
 // Execute inventory import
-router.post('/import', authenticate, upload.single('file'), async (req: AuthRequest, res: Response) => {
+router.post('/import', authenticate, hasUserPerm('inventory.inventory.edit'), upload.single('file'), async (req: AuthRequest, res: Response) => {
   const client = await getClient();
   try {
     await client.query('BEGIN');
@@ -683,7 +686,7 @@ router.post('/import', authenticate, upload.single('file'), async (req: AuthRequ
 });
 
 // Export inventory
-router.get('/export', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/export', authenticate, invExport, async (req: AuthRequest, res: Response) => {
   try {
     const format = (req.query.format as string) || 'csv';
     const location = (req.query.location as string) || '';

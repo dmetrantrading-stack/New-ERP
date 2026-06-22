@@ -48,9 +48,9 @@ router.post('/login', validate(loginSchema), async (req: Request, res: Response)
     await query('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = $1', [user.id]);
 
     await query(
-      `INSERT INTO audit_logs (user_id, username, action, module, new_values, device_info)
-       VALUES ($1, $2, 'Login', 'Auth', $3, $4)`,
-      [user.id, user.username, JSON.stringify({ username: user.username }), req.headers['user-agent']]
+      `INSERT INTO audit_logs (user_id, username, action, module, reference_type, reference_id, new_values, device_info)
+       VALUES ($1, $2, 'Login', 'Auth', 'User', $3, $4, $5)`,
+      [user.id, user.username, user.id, JSON.stringify({ username: user.username }), req.headers['user-agent']]
     );
 
     res.json({

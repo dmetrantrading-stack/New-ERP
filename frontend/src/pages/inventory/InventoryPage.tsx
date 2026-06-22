@@ -1,9 +1,12 @@
 import React, { useState, useEffect, useMemo } from 'react';
+import ModalOverlay from '../../components/ModalOverlay';
 import api from '../../lib/api';
-import { formatCurrency } from '../../lib/utils';
+import { formatCurrency, parseIntegerField } from '../../lib/utils';
+import NumericInput from '../../components/NumericInput';
 import { Search, Filter, Package, AlertTriangle, Clock, Eye, Warehouse, Upload, Download, FileText, X } from 'lucide-react';
 import Pagination from '../../components/Pagination';
 import toast from 'react-hot-toast';
+import { useAuth } from '../../store/auth';
 
 interface StockItem {
   product_id: string;
@@ -19,7 +22,9 @@ interface StockItem {
   avg_cost: number;
 }
 
-export default function InventoryPage() {
+export default function InventoryPage({ embedded = false, onRefresh }: { embedded?: boolean; onRefresh?: () => void }) {
+  const { hasPerm } = useAuth();
+  const canEdit = hasPerm('inventory.inventory.edit');
   const [data, setData] = useState<StockItem[]>([]);
   const [summary, setSummary] = useState({ total_skus: 0, low_stock: 0, expiring_soon: 0, inventory_value: 0 });
   const [loading, setLoading] = useState(true);
@@ -31,8 +36,11 @@ export default function InventoryPage() {
   const [ledger, setLedger] = useState<any[]>([]);
   const [ledgerStartDate, setLedgerStartDate] = useState('');
   const [ledgerEndDate, setLedgerEndDate] = useState('');
+  const [editingReorderId, setEditingReorderId] = useState<string | null>(null);
+  const [editingReorderValue, setEditingReorderValue] = useState('');
+  const [savingReorder, setSavingReorder] = useState(false);
   const [showAdjust, setShowAdjust] = useState(false);
-  const [adjustForm, setAdjustForm] = useState<any>({ product_id: '', location_id: '', quantity: 0, reason: '' });
+  const [adjustForm, setAdjustForm] = useState<any>({ product_id: '', location_id: '', quantity: '', reason: '' });
   const [products, setProducts] = useState<any[]>([]);
   const [showBatches, setShowBatches] = useState<string | null>(null);
   const [batches, setBatches] = useState<any[]>([]);
@@ -58,6 +66,7 @@ export default function InventoryPage() {
       .then((res) => {
         setData(res.data.data);
         setSummary(res.data.summary);
+        onRefresh?.();
       })
       .catch((err) => toast.error(err.response?.data?.error || 'Failed to load data'))
       .finally(() => setLoading(false));
@@ -92,10 +101,10 @@ export default function InventoryPage() {
 
   const adjustInventory = async () => {
     try {
-      await api.post('/inventory/adjust', adjustForm);
+      await api.post('/inventory/adjust', { ...adjustForm, quantity: parseIntegerField(adjustForm.quantity) });
       toast.success('Inventory adjusted');
       setShowAdjust(false);
-      setAdjustForm({ product_id: '', location_id: '', quantity: 0, reason: '' });
+      setAdjustForm({ product_id: '', location_id: '', quantity: '', reason: '' });
       loadData();
     } catch (err: any) { toast.error(err.response?.data?.error || 'Error adjusting inventory'); }
   };
@@ -106,6 +115,40 @@ export default function InventoryPage() {
     if (total === 0) return { label: 'Out of Stock', color: 'bg-red-100 text-red-700' };
     if (total <= reorder && reorder > 0) return { label: 'Low Stock', color: 'bg-orange-100 text-orange-700' };
     return { label: 'In Stock', color: 'bg-green-100 text-green-700' };
+  };
+
+  const startEditReorder = (item: StockItem) => {
+    if (!canEdit) return;
+    setEditingReorderId(item.product_id);
+    setEditingReorderValue(String(item.reorder_level ?? ''));
+  };
+
+  const cancelEditReorder = () => {
+    setEditingReorderId(null);
+    setEditingReorderValue('');
+  };
+
+  const saveReorderLevel = async (productId: string) => {
+    if (!canEdit || savingReorder) return;
+    const parsed = parseFloat(editingReorderValue);
+    if (Number.isNaN(parsed) || parsed < 0) {
+      toast.error('Enter a valid reorder level');
+      return;
+    }
+    setSavingReorder(true);
+    try {
+      await api.patch(`/products/${productId}/reorder-level`, { reorder_level: parsed });
+      toast.success('Reorder level updated');
+      setData((prev) => prev.map((row) => (
+        row.product_id === productId ? { ...row, reorder_level: parsed } : row
+      )));
+      cancelEditReorder();
+      onRefresh?.();
+    } catch (err: any) {
+      toast.error(err.response?.data?.error || 'Failed to update reorder level');
+    } finally {
+      setSavingReorder(false);
+    }
   };
 
   const exportInventory = (format: string) => {
@@ -145,10 +188,12 @@ export default function InventoryPage() {
   return (
     <div className="space-y-5">
       {/* Header */}
-      <div>
-        <h1 className="text-2xl font-bold text-gray-900">Inventory Stock</h1>
-        <p className="text-sm text-gray-500 mt-0.5">Current stock levels across all locations</p>
-      </div>
+      {!embedded && (
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">Inventory Stock</h1>
+          <p className="text-sm text-gray-500 mt-0.5">Current stock levels across all locations</p>
+        </div>
+      )}
 
       {/* Summary Cards */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
@@ -329,7 +374,41 @@ export default function InventoryPage() {
                         <span className="font-medium text-sm text-gray-900">{formatQty(item, parseFloat(String(item.warehouse_qty)))}</span>
                       </td>
                       <td className="px-4 py-3.5 text-right">
-                        <span className="text-sm text-gray-500">{item.reorder_level ? `${item.reorder_level} ${item.unit_of_measure || ''}`.trim() : '-'}</span>
+                        {editingReorderId === item.product_id ? (
+                          <div className="inline-flex items-center gap-1 justify-end">
+                            <input
+                              type="number"
+                              step="0.01"
+                              min="0"
+                              autoFocus
+                              value={editingReorderValue}
+                              onChange={(e) => setEditingReorderValue(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') saveReorderLevel(item.product_id);
+                                if (e.key === 'Escape') cancelEditReorder();
+                              }}
+                              className="w-20 px-2 py-1 border rounded text-sm text-right focus:ring-2 focus:ring-blue-500 outline-none"
+                            />
+                            <button
+                              onClick={() => saveReorderLevel(item.product_id)}
+                              disabled={savingReorder}
+                              className="px-2 py-1 text-xs bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
+                            >
+                              Save
+                            </button>
+                          </div>
+                        ) : canEdit ? (
+                          <button
+                            type="button"
+                            onClick={() => startEditReorder(item)}
+                            className="text-sm text-gray-500 hover:text-blue-700 hover:underline tabular-nums"
+                            title="Click to edit reorder level"
+                          >
+                            {item.reorder_level ? `${item.reorder_level} ${item.unit_of_measure || ''}`.trim() : 'Set reorder'}
+                          </button>
+                        ) : (
+                          <span className="text-sm text-gray-500">{item.reorder_level ? `${item.reorder_level} ${item.unit_of_measure || ''}`.trim() : '-'}</span>
+                        )}
                       </td>
                       <td className="px-4 py-3.5 text-right">
                         <span className="text-sm text-gray-600">{formatCurrency(item.avg_cost)}</span>
@@ -362,8 +441,8 @@ export default function InventoryPage() {
 
       {/* Adjust Inventory Modal */}
       {showAdjust && (
-        <div className="modal-overlay" onClick={() => setShowAdjust(false)}>
-          <div className="modal-content max-w-lg" onClick={(e) => e.stopPropagation()}>
+        <ModalOverlay onClose={() => setShowAdjust(false)}>
+          <div className="modal-content max-w-lg">
             <div className="p-6">
               <h2 className="text-lg font-semibold mb-4">Adjust Inventory</h2>
               <div className="space-y-4">
@@ -386,7 +465,7 @@ export default function InventoryPage() {
                 </div>
                 <div>
                   <label className="block text-sm font-medium mb-1">Quantity Change (+ or -)</label>
-                  <input type="number" value={adjustForm.quantity} onChange={(e) => setAdjustForm({ ...adjustForm, quantity: parseInt(e.target.value) || 0 })}
+                  <NumericInput value={adjustForm.quantity} onValueChange={(quantity) => setAdjustForm({ ...adjustForm, quantity })}
                     className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
                 </div>
                 <div>
@@ -411,13 +490,13 @@ export default function InventoryPage() {
               </div>
             </div>
           </div>
-        </div>
+        </ModalOverlay>
       )}
 
       {/* Batches Modal */}
       {showBatches && (
-        <div className="modal-overlay" onClick={() => setShowBatches(null)}>
-          <div className="modal-content max-w-2xl" onClick={(e) => e.stopPropagation()}>
+        <ModalOverlay onClose={() => setShowBatches(null)}>
+          <div className="modal-content max-w-2xl">
             <div className="p-6">
               <h2 className="text-lg font-semibold mb-4">Batches</h2>
               <table className="w-full text-sm">
@@ -439,13 +518,13 @@ export default function InventoryPage() {
               </div>
             </div>
           </div>
-        </div>
+        </ModalOverlay>
       )}
 
       {/* Ledger Modal */}
       {showLedger && (
-        <div className="modal-overlay" onClick={() => setShowLedger(null)}>
-          <div className="modal-content max-w-4xl" onClick={(e) => e.stopPropagation()}>
+        <ModalOverlay onClose={() => setShowLedger(null)}>
+          <div className="modal-content max-w-4xl">
             <div className="p-6">
               <h2 className="text-lg font-semibold mb-4">Stock Card / Inventory Ledger</h2>
               <div className="flex gap-3 mb-4 items-end">
@@ -483,13 +562,13 @@ export default function InventoryPage() {
               </div>
             </div>
           </div>
-        </div>
+        </ModalOverlay>
       )}
 
       {/* Import modal */}
       {showImportModal && (
-        <div className="modal-overlay" onClick={() => { setShowImportModal(false); setInvImportFile(null); setInvImportPreview(null); setInvImportResult(null); }}>
-          <div className="modal-content max-w-4xl" onClick={(e) => e.stopPropagation()}>
+        <ModalOverlay onClose={() => { setShowImportModal(false); setInvImportFile(null); setInvImportPreview(null); setInvImportResult(null); }}>
+          <div className="modal-content max-w-4xl">
             <div className="p-6">
               <div className="flex items-center justify-between mb-4">
                 <h2 className="text-lg font-semibold">Import Inventory</h2>
@@ -624,7 +703,7 @@ export default function InventoryPage() {
               )}
             </div>
           </div>
-        </div>
+        </ModalOverlay>
       )}
     </div>
   );

@@ -3,12 +3,17 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\" \"npm run dev:print\"",
     "dev:backend": "cd backend && npm run dev",
     "dev:frontend": "cd frontend && npm run dev",
+    "dev:print": "cd thermal-print-server && npm start",
+    "start:print": "cd thermal-print-server && npm start",
     "build": "npm run build:backend && npm run build:frontend",
     "build:backend": "cd backend && npm run build",
     "build:frontend": "cd frontend && npm run build",
+    "start:prod": "cd backend && npm run migrate:prod && npm start",
+    "docker:up": "docker compose up -d --build",
+    "docker:down": "docker compose down",
     "electron": "cd electron && npm run dev",
     "db:migrate": "cd backend && npm run migrate",
     "db:seed": "cd backend && npm run seed"

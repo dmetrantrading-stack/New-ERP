@@ -16,6 +16,8 @@ const ESC = '\x1B';
 const GS = '\x1D';
 
 function initPrinter() { return ESC + '@'; }
+/** PC850 — byte 0x9F renders as peso (₱) on most Epson-compatible thermal printers. */
+function selectCodePage850() { return ESC + 't' + '\x02'; }
 function centerOn() { return ESC + 'a' + '\x01'; }
 function centerOff() { return ESC + 'a' + '\x00'; }
 function boldOn() { return ESC + 'E' + '\x01'; }
@@ -26,9 +28,39 @@ function cutPaper() { return GS + 'V' + '\x01'; }
 function lineFeed(n = 1) { return '\n'.repeat(n); }
 function dashLine(n = 32) { return '-'.repeat(n) + '\n'; }
 
+/** Unicode ₱ (UTF-8) prints as Chinese on GBK-default printers — use CP850 peso byte instead. */
+const PESO_CP850 = '\x9F';
+/** Set THERMAL_PESO=ascii to use plain "P" prefix if CP850 peso still looks wrong. */
+const PESO_MODE = (process.env.THERMAL_PESO || 'cp850').toLowerCase();
+
+function prepareThermalReceiptText(text) {
+  const s = String(text);
+  if (PESO_MODE === 'ascii') {
+    return s.replace(/\u20B1/g, 'P');
+  }
+  return s.replace(/\u20B1/g, PESO_CP850);
+}
+
+function toLatin1Buffer(str) {
+  return Buffer.from(str, 'latin1');
+}
+
+function buildReceiptPrintBuffer(text) {
+  const body = prepareThermalReceiptText(text);
+  const parts = [toLatin1Buffer(initPrinter())];
+  if (PESO_MODE !== 'ascii') {
+    parts.push(toLatin1Buffer(selectCodePage850()));
+  }
+  parts.push(toLatin1Buffer(body));
+  parts.push(toLatin1Buffer(lineFeed(3)));
+  parts.push(toLatin1Buffer(cutPaper()));
+  return Buffer.concat(parts);
+}
+
 function sendCommand(cmd) {
   if (!currentPort || !currentPort.isOpen) return false;
-  currentPort.write(cmd);
+  const buf = Buffer.isBuffer(cmd) ? cmd : toLatin1Buffer(cmd);
+  currentPort.write(buf);
   currentPort.drain();
   return true;
 }
@@ -121,13 +153,8 @@ app.post('/print', (req, res) => {
   if (!currentPort || !currentPort.isOpen) return res.status(503).json({ error: 'Printer not connected' });
 
   try {
-    let cmd = '';
-    cmd += initPrinter();
-    cmd += text;
-    cmd += lineFeed(3);
-    cmd += cutPaper();
-
-    if (sendCommand(cmd)) {
+    const buf = buildReceiptPrintBuffer(text);
+    if (sendCommand(buf)) {
       res.json({ success: true });
     } else {
       res.status(500).json({ error: 'Failed to send to printer' });
@@ -144,12 +171,14 @@ app.post('/test-print', (req, res) => {
   try {
     let cmd = '';
     cmd += initPrinter();
+    if (PESO_MODE !== 'ascii') cmd += selectCodePage850();
     cmd += centerOn() + doubleOn() + boldOn() + 'D METRAN TRADING\n' + boldOff() + doubleOff() + centerOff();
     cmd += centerOn() + 'General Merchandise\n' + centerOff();
     cmd += dashLine();
     cmd += centerOn() + 'TEST PRINT\n' + centerOff();
     cmd += 'Date: ' + new Date().toLocaleString() + '\n';
     cmd += 'Printer: ' + (currentPortPath || 'Unknown') + '\n';
+    cmd += 'Peso test: ' + prepareThermalReceiptText('\u20B1123.45') + '\n';
     cmd += dashLine();
     cmd += centerOn() + 'PRINTER WORKING!\n' + centerOff();
     cmd += lineFeed(3);
@@ -163,6 +192,7 @@ app.post('/test-print', (req, res) => {
 const PORT = 9999;
 app.listen(PORT, () => {
   console.log(`Thermal Print Server running on http://localhost:${PORT}`);
+  console.log(`Peso mode: ${PESO_MODE} (set THERMAL_PESO=ascii if symbol still wrong)`);
   console.log('Endpoints:');
   console.log('  GET  /scan          - List available COM ports');
   console.log('  POST /auto-connect  - Auto-connect to first printer');

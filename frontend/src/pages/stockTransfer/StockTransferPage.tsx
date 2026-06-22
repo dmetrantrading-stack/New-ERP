@@ -1,9 +1,10 @@
 import React, { useState, useEffect } from 'react';
+import ModalOverlay from '../../components/ModalOverlay';
 import api from '../../lib/api';
 import { Plus, Send, Download } from 'lucide-react';
 import toast from 'react-hot-toast';
 
-export default function StockTransferPage() {
+export default function StockTransferPage({ embedded = false }: { embedded?: boolean }) {
   const [transfers, setTransfers] = useState<any[]>([]);
   const [products, setProducts] = useState<any[]>([]);
   const [showCreate, setShowCreate] = useState(false);
@@ -49,8 +50,8 @@ export default function StockTransferPage() {
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold text-gray-900">Stock Transfers</h1>
+      <div className={`flex items-center ${embedded ? 'justify-end' : 'justify-between'}`}>
+        {!embedded && <h1 className="text-2xl font-bold text-gray-900">Stock Transfers</h1>}
         <button onClick={() => setShowCreate(true)} className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700"><Plus size={16} /> New Transfer</button>
       </div>
 
@@ -80,8 +81,8 @@ export default function StockTransferPage() {
       </div>
 
       {showCreate && (
-        <div className="modal-overlay" onClick={() => setShowCreate(false)}>
-          <div className="modal-content max-w-2xl" onClick={(e) => e.stopPropagation()}>
+        <ModalOverlay onClose={() => setShowCreate(false)}>
+          <div className="modal-content max-w-2xl">
             <div className="p-6">
               <h2 className="text-lg font-semibold mb-4">New Stock Transfer</h2>
               <div className="grid grid-cols-2 gap-4 mb-4">
@@ -107,7 +108,7 @@ export default function StockTransferPage() {
                     </select>
                   </div>
                   <div className="w-20">
-                    <input type="number" value={item.quantity} onChange={(e) => updateItem(i, 'quantity', parseFloat(e.target.value) || 0)}
+                    <input type="number" value={item.quantity} onChange={(e) => updateItem(i, 'quantity', e.target.value)}
                       className="w-full px-3 py-2 border rounded-lg text-sm text-center focus:ring-2 focus:ring-blue-500 outline-none" min="1" />
                   </div>
                   <button onClick={() => removeItem(i)} className="p-2 text-red-500 hover:bg-red-50 rounded">×</button>
@@ -120,7 +121,7 @@ export default function StockTransferPage() {
               </div>
             </div>
           </div>
-        </div>
+        </ModalOverlay>
       )}
     </div>
   );

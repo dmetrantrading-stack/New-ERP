@@ -1,18 +1,21 @@
 import { Router, Response } from 'express';
 import { query, getClient } from '../../config/database';
-import { authenticate, AuthRequest } from '../../middleware/auth';
+import { authenticate, AuthRequest, hasUserPerm } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
 import { AppError } from '../../middleware/errorHandler';
+import { postInventoryVarianceJournal } from '../../utils/journalEntryHelpers';
 import { v4 as uuidv4 } from 'uuid';
 
 const router = Router();
+
+const countView = hasUserPerm('inventory.counts.view');
 
 const generateCountNumber = async (): Promise<string> => {
   const result = await query("SELECT COALESCE(MAX(CAST(SUBSTRING(count_number, 4) AS INTEGER)), 0) + 1 as next FROM inventory_counts WHERE count_number ~ '^IC-'");
   return `IC-${String(result.rows[0]?.next || 1).padStart(5, '0')}`;
 };
 
-router.get('/', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/', authenticate, countView, async (req: AuthRequest, res: Response) => {
   try {
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 50;
@@ -44,7 +47,7 @@ router.get('/', authenticate, async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.post('/', authenticate, auditLog('Inventory Count', 'Create'), async (req: AuthRequest, res: Response) => {
+router.post('/', authenticate, hasUserPerm('inventory.counts.create'), auditLog('Inventory Count', 'Create'), async (req: AuthRequest, res: Response) => {
   const client = await getClient();
   try {
     await client.query('BEGIN');
@@ -87,7 +90,7 @@ router.post('/', authenticate, auditLog('Inventory Count', 'Create'), async (req
   }
 });
 
-router.get('/:id', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/:id', authenticate, countView, async (req: AuthRequest, res: Response) => {
   try {
     const count = await query(
       `SELECT ic.*, l.name as location_name, u.full_name as created_by_name,
@@ -116,7 +119,7 @@ router.get('/:id', authenticate, async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.patch('/:id', authenticate, auditLog('Inventory Count', 'Update'), async (req: AuthRequest, res: Response) => {
+router.patch('/:id', authenticate, hasUserPerm('inventory.counts.edit'), auditLog('Inventory Count', 'Update'), async (req: AuthRequest, res: Response) => {
   const client = await getClient();
   try {
     const existing = await client.query('SELECT * FROM inventory_counts WHERE id = $1', [req.params.id]);
@@ -161,7 +164,7 @@ router.patch('/:id', authenticate, auditLog('Inventory Count', 'Update'), async 
   }
 });
 
-router.post('/:id/post', authenticate, auditLog('Inventory Count', 'Post'), async (req: AuthRequest, res: Response) => {
+router.post('/:id/post', authenticate, hasUserPerm('inventory.counts.approve'), auditLog('Inventory Count', 'Post'), async (req: AuthRequest, res: Response) => {
   const client = await getClient();
   try {
     const existing = await client.query('SELECT * FROM inventory_counts WHERE id = $1', [req.params.id]);
@@ -176,9 +179,11 @@ router.post('/:id/post', authenticate, auditLog('Inventory Count', 'Post'), asyn
       [req.params.id]
     );
 
+    let netVariance = 0;
     for (const item of items.rows) {
       const newQty = parseFloat(item.actual_qty);
       const diffQty = newQty - parseFloat(item.system_qty);
+      netVariance += diffQty * parseFloat(item.unit_cost || 0);
 
       const inventory = await client.query(
         'SELECT * FROM inventory WHERE product_id = $1 AND location_id = $2',
@@ -212,6 +217,14 @@ router.post('/:id/post', authenticate, auditLog('Inventory Count', 'Post'), asyn
       [req.user!.id, req.params.id]
     );
 
+    await postInventoryVarianceJournal(client.query.bind(client), {
+      referenceType: 'Inventory Count',
+      referenceId: req.params.id,
+      description: `Inventory Count ${count.count_number}`,
+      netVariance,
+      userId: req.user!.id,
+    });
+
     await client.query('COMMIT');
     res.json({ message: 'Count posted' });
   } catch (error: any) {
@@ -222,7 +235,7 @@ router.post('/:id/post', authenticate, auditLog('Inventory Count', 'Post'), asyn
   }
 });
 
-router.delete('/:id', authenticate, auditLog('Inventory Count', 'Delete'), async (req: AuthRequest, res: Response) => {
+router.delete('/:id', authenticate, hasUserPerm('inventory.counts.edit'), auditLog('Inventory Count', 'Delete'), async (req: AuthRequest, res: Response) => {
   try {
     const existing = await query('SELECT * FROM inventory_counts WHERE id = $1', [req.params.id]);
     if (existing.rows.length === 0) return res.status(404).json({ error: 'Count not found' });

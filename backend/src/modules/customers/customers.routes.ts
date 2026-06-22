@@ -3,12 +3,23 @@ import multer from 'multer';
 import * as XLSX from 'xlsx';
 import { v4 as uuidv4 } from 'uuid';
 import { query } from '../../config/database';
-import { authenticate, AuthRequest } from '../../middleware/auth';
+import { authenticate, hasUserPerm, hasUserAnyPerm, AuthRequest } from '../../middleware/auth';
 import { AppError } from '../../middleware/errorHandler';
 import { auditLog } from '../../middleware/audit';
+import { auditAfter, auditBefore, auditSnapshot, AUDIT_FIELDS } from '../../utils/auditHelpers';
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 }, fileFilter: (_req, file, cb) => { const ok = file.mimetype === 'text/csv' || file.originalname.endsWith('.csv') || file.mimetype === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' || file.originalname.endsWith('.xlsx'); cb(null, ok); } });
+
+const customerView = hasUserPerm('sales.customers.view');
+const customerLookup = hasUserAnyPerm([
+  'sales.customers.view',
+  'pos.view',
+  'pos.write',
+  'sales.sales-invoice.view',
+  'sales.delivery-receipt.view',
+  'sales.collections.view',
+]);
 
 const esc = (v: any) => {
   const s = v == null ? '' : String(v);
@@ -49,7 +60,7 @@ const parseFile = (buffer: Buffer, originalName: string): { headers: string[]; r
   return { headers: parseLine(lines[0]), rows: lines.slice(1).map(parseLine) };
 };
 
-router.get('/', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/', authenticate, customerLookup, async (req: AuthRequest, res: Response) => {
   try {
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 50;
@@ -84,14 +95,14 @@ router.get('/', authenticate, async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.get('/export/template', authenticate, async (_req: AuthRequest, res: Response) => {
+router.get('/export/template', authenticate, customerView, async (_req: AuthRequest, res: Response) => {
   const headerRow = ['Customer Name','Contact Person','Address','Phone','Email','Customer Type','Credit Limit','Payment Terms','Tax Type','TIN'];
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename=customer_import_template.csv');
   res.send('\uFEFF' + headerRow.map(esc).join(','));
 });
 
-router.get('/export', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/export', authenticate, customerView, async (req: AuthRequest, res: Response) => {
   try {
     const format = (req.query.format as string) || 'csv';
     const result = await query('SELECT customer_name, contact_person, address, phone, email, customer_type, credit_limit, payment_terms, tax_type, tin, is_active FROM customers WHERE is_active = true ORDER BY customer_name');
@@ -121,7 +132,7 @@ router.get('/export', authenticate, async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.post('/import/preview', authenticate, upload.single('file'), async (req: AuthRequest, res: Response) => {
+router.post('/import/preview', authenticate, hasUserPerm('sales.customers.edit'), upload.single('file'), async (req: AuthRequest, res: Response) => {
   try {
     if (!req.file) throw new AppError('No file uploaded');
     const { headers, rows } = parseFile(req.file.buffer, req.file.originalname);
@@ -191,7 +202,7 @@ router.post('/import/preview', authenticate, upload.single('file'), async (req: 
   }
 });
 
-router.post('/import/execute', authenticate, upload.single('file'), async (req: AuthRequest, res: Response) => {
+router.post('/import/execute', authenticate, hasUserPerm('sales.customers.edit'), upload.single('file'), async (req: AuthRequest, res: Response) => {
   try {
     if (!req.file) throw new AppError('No file uploaded');
     const { headers, rows } = parseFile(req.file.buffer, req.file.originalname);
@@ -276,7 +287,79 @@ router.post('/import/execute', authenticate, upload.single('file'), async (req: 
   }
 });
 
-router.get('/:id', authenticate, async (req: AuthRequest, res: Response) => {
+// Customer product prices (must be registered before GET /:id)
+router.get('/:id/prices/lookup', authenticate, customerLookup, async (req: AuthRequest, res: Response) => {
+  try {
+    const productId = req.query.product_id as string;
+    if (!productId) return res.status(400).json({ error: 'product_id required' });
+    const today = new Date().toISOString().slice(0, 10);
+    const r = await query(
+      `SELECT unit_price FROM customer_product_prices
+       WHERE customer_id = $1 AND product_id = $2
+         AND (effective_from IS NULL OR effective_from <= $3)
+         AND (effective_to IS NULL OR effective_to >= $3)
+       LIMIT 1`,
+      [req.params.id, productId, today]
+    );
+    res.json({ unit_price: r.rows[0]?.unit_price ?? null });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/:id/prices', authenticate, customerView, async (req: AuthRequest, res: Response) => {
+  try {
+    const r = await query(
+      `SELECT cpp.*, p.sku, p.name as product_name, p.retail_price, p.wholesale_price
+       FROM customer_product_prices cpp
+       JOIN products p ON cpp.product_id = p.id
+       WHERE cpp.customer_id = $1
+       ORDER BY p.name`,
+      [req.params.id]
+    );
+    res.json(r.rows);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.put('/:id/prices', authenticate, hasUserPerm('sales.customers.edit'), auditLog('Customers', 'Update Customer Prices'), async (req: AuthRequest, res: Response) => {
+  try {
+    const { prices } = req.body;
+    if (!Array.isArray(prices)) throw new AppError('prices array required');
+    const cust = await query('SELECT id FROM customers WHERE id = $1', [req.params.id]);
+    if (cust.rows.length === 0) return res.status(404).json({ error: 'Customer not found' });
+
+    for (const row of prices) {
+      if (!row.product_id || row.unit_price == null) continue;
+      await query(
+        `INSERT INTO customer_product_prices (id, customer_id, product_id, unit_price, effective_from, effective_to, notes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (customer_id, product_id) DO UPDATE SET
+           unit_price = EXCLUDED.unit_price,
+           effective_from = EXCLUDED.effective_from,
+           effective_to = EXCLUDED.effective_to,
+           notes = EXCLUDED.notes`,
+        [uuidv4(), req.params.id, row.product_id, row.unit_price, row.effective_from || null, row.effective_to || null, row.notes || null]
+      );
+    }
+    res.json({ message: 'Prices saved' });
+  } catch (error: any) {
+    if (error instanceof AppError) return res.status(error.statusCode).json({ error: error.message });
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.delete('/:id/prices/:priceId', authenticate, hasUserPerm('sales.customers.edit'), async (req: AuthRequest, res: Response) => {
+  try {
+    await query('DELETE FROM customer_product_prices WHERE id = $1 AND customer_id = $2', [req.params.priceId, req.params.id]);
+    res.json({ message: 'Price removed' });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/:id', authenticate, customerView, async (req: AuthRequest, res: Response) => {
   try {
     const result = await query('SELECT * FROM customers WHERE id = $1', [req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Customer not found' });
@@ -286,18 +369,18 @@ router.get('/:id', authenticate, async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.post('/', authenticate, auditLog('Customers', 'Create'), async (req: AuthRequest, res: Response) => {
+router.post('/', authenticate, hasUserPerm('sales.customers.create'), auditLog('Customers', 'Create'), async (req: AuthRequest, res: Response) => {
   try {
-    const { customer_name, contact_person, address, phone, email, customer_type, credit_limit, payment_terms, tax_type, tin } = req.body;
+    const { customer_name, contact_person, address, phone, email, customer_type, credit_limit, payment_terms, tax_type, tin, default_price_mode } = req.body;
     if (!customer_name) return res.status(400).json({ error: 'Customer name is required' });
 
     const codeResult = await query("SELECT COALESCE(MAX(CAST(SUBSTRING(customer_code FROM 5) AS INTEGER)), 0) + 1 as next FROM customers WHERE customer_code ~ '^DMC-'");
     const code = `DMC-${String(codeResult.rows[0].next).padStart(5, '0')}`;
 
     const result = await query(
-      `INSERT INTO customers (customer_code, customer_name, contact_person, address, phone, email, customer_type, credit_limit, payment_terms, tax_type, tin)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
-      [code, customer_name, contact_person, address, phone, email, customer_type || 'Retail', credit_limit || 0, payment_terms, tax_type || 'VAT', tin]
+      `INSERT INTO customers (customer_code, customer_name, contact_person, address, phone, email, customer_type, credit_limit, payment_terms, tax_type, tin, default_price_mode)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+      [code, customer_name, contact_person, address, phone, email, customer_type || 'Retail', credit_limit || 0, payment_terms, tax_type || 'VAT', tin, default_price_mode || null]
     );
     res.status(201).json(result.rows[0]);
   } catch (error: any) {
@@ -305,19 +388,25 @@ router.post('/', authenticate, auditLog('Customers', 'Create'), async (req: Auth
   }
 });
 
-router.put('/:id', authenticate, auditLog('Customers', 'Update'), async (req: AuthRequest, res: Response) => {
+router.put('/:id', authenticate, hasUserPerm('sales.customers.edit'), auditLog('Customers', 'Update'), async (req: AuthRequest, res: Response) => {
   try {
-    const { customer_name, contact_person, address, phone, email, customer_type, credit_limit, payment_terms, tax_type, tin, is_active } = req.body;
+    const existing = await query('SELECT * FROM customers WHERE id = $1', [req.params.id]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Customer not found' });
+    auditBefore(req, auditSnapshot(existing.rows[0], AUDIT_FIELDS.customer));
+
+    const { customer_name, contact_person, address, phone, email, customer_type, credit_limit, payment_terms, tax_type, tin, is_active, default_price_mode } = req.body;
     const result = await query(
       `UPDATE customers SET customer_name = COALESCE($1, customer_name), contact_person = COALESCE($2, contact_person),
         address = COALESCE($3, address), phone = COALESCE($4, phone), email = COALESCE($5, email),
         customer_type = COALESCE($6, customer_type), credit_limit = COALESCE($7, credit_limit),
         payment_terms = COALESCE($8, payment_terms), tax_type = COALESCE($9, tax_type),
-        tin = COALESCE($10, tin), is_active = COALESCE($11, is_active), updated_at = CURRENT_TIMESTAMP
-       WHERE id = $12 RETURNING *`,
-      [customer_name, contact_person, address, phone, email, customer_type, credit_limit, payment_terms, tax_type, tin, is_active, req.params.id]
+        tin = COALESCE($10, tin), is_active = COALESCE($11, is_active),
+        default_price_mode = COALESCE($12, default_price_mode), updated_at = CURRENT_TIMESTAMP
+       WHERE id = $13 RETURNING *`,
+      [customer_name, contact_person, address, phone, email, customer_type, credit_limit, payment_terms, tax_type, tin, is_active, default_price_mode, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Customer not found' });
+    auditAfter(req, auditSnapshot(result.rows[0], AUDIT_FIELDS.customer));
     res.json(result.rows[0]);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -325,7 +414,7 @@ router.put('/:id', authenticate, auditLog('Customers', 'Update'), async (req: Au
 });
 
 // Customer aging
-router.get('/aging/report', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/aging/report', authenticate, hasUserPerm('sales.collections.view'), async (req: AuthRequest, res: Response) => {
   try {
     const result = await query(`
       SELECT c.*,
@@ -343,7 +432,7 @@ router.get('/aging/report', authenticate, async (req: AuthRequest, res: Response
   }
 });
 
-router.delete('/:id', authenticate, auditLog('Customers', 'Delete'), async (req: AuthRequest, res: Response) => {
+router.delete('/:id', authenticate, hasUserPerm('sales.customers.edit'), auditLog('Customers', 'Delete'), async (req: AuthRequest, res: Response) => {
   try {
     const { id } = req.params;
 

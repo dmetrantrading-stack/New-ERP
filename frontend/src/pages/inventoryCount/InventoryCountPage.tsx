@@ -1,9 +1,10 @@
 import React, { useState, useEffect } from 'react';
+import ModalOverlay from '../../components/ModalOverlay';
 import api from '../../lib/api';
 import { Plus, Send, Edit2, Trash2 } from 'lucide-react';
 import toast from 'react-hot-toast';
 
-export default function InventoryCountPage() {
+export default function InventoryCountPage({ embedded = false }: { embedded?: boolean }) {
   const [counts, setCounts] = useState<any[]>([]);
   const [products, setProducts] = useState<any[]>([]);
   const [locations, setLocations] = useState<any[]>([]);
@@ -82,8 +83,8 @@ export default function InventoryCountPage() {
     const submit = isEdit ? updateCount : createCount;
 
     return visible ? (
-      <div className="modal-overlay" onClick={close}>
-        <div className="modal-content max-w-2xl" onClick={(e) => e.stopPropagation()}>
+      <ModalOverlay onClose={close}>
+        <div className="modal-content max-w-2xl">
           <div className="p-6">
             <h2 className="text-lg font-semibold mb-4">{isEdit ? 'Edit Count' : 'New Inventory Count'}</h2>
             <div className="grid grid-cols-2 gap-4 mb-4">
@@ -111,7 +112,7 @@ export default function InventoryCountPage() {
                   </select>
                 </div>
                 <div className="w-24">
-                  <input type="number" value={item.actual_qty} onChange={(e) => updateItem(i, 'actual_qty', parseFloat(e.target.value) || 0)}
+                  <input type="number" value={item.actual_qty} onChange={(e) => updateItem(i, 'actual_qty', e.target.value)}
                     className="w-full px-3 py-2 border rounded-lg text-sm text-center focus:ring-2 focus:ring-blue-500 outline-none" step="0.01" />
                 </div>
                 <button onClick={() => removeItem(i)} className="p-2 text-red-500 hover:bg-red-50 rounded">×</button>
@@ -126,14 +127,14 @@ export default function InventoryCountPage() {
             </div>
           </div>
         </div>
-      </div>
+      </ModalOverlay>
     ) : null;
   };
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold text-gray-900">Inventory Counts</h1>
+      <div className={`flex items-center ${embedded ? 'justify-end' : 'justify-between'}`}>
+        {!embedded && <h1 className="text-2xl font-bold text-gray-900">Inventory Counts</h1>}
         <button onClick={() => { resetForm(); setShowCreate(true); }} className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700">
           <Plus size={16} /> New Count
         </button>

@@ -1,10 +1,12 @@
 import express from 'express';
 import path from 'path';
+import fs from 'fs';
 import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import { config } from './config';
 import { errorHandler, notFound } from './middleware/errorHandler';
+import { loginRateLimiter } from './middleware/rateLimit';
 
 // Import routes
 import authRoutes from './modules/auth/auth.routes';
@@ -21,7 +23,6 @@ import posRoutes from './modules/pos/pos.routes';
 import accountingRoutes from './modules/accounting/accounting.routes';
 import stockTransferRoutes from './modules/stockTransfer/stockTransfer.routes';
 import bankCashRoutes from './modules/bankCash/bankCash.routes';
-import bankManagementRoutes from './modules/bankManagement/bankManagement.routes';
 import expenseRoutes from './modules/expenses/expenses.routes';
 import hrRoutes from './modules/hr/hr.routes';
 import reportRoutes from './modules/reports/reports.routes';
@@ -36,13 +37,29 @@ import productionRoutes from './modules/production/production.routes';
 import attachmentRoutes from './modules/attachments/attachment.routes';
 import supplierPriceHistoryRoutes from './modules/supplier-price-history/supplier-price-history.routes';
 import pettyCashRoutes from './modules/pettyCash/pettyCash.routes';
+import orderRoutes from './modules/order.routes';
+import deliveryRoutes from './modules/delivery.routes';
+import quotationRoutes from './modules/quotation.routes';
+import salesMemosRoutes from './modules/sales/salesMemos.routes';
+import purchaseMemosRoutes from './modules/purchases/purchaseMemos.routes';
+import bomRoutes from './modules/production/bom.routes';
+import bir2307Routes from './modules/payables/bir2307.routes';
 
 const app = express();
 
+if (config.trustProxy) {
+  app.set('trust proxy', 1);
+}
+
 // Middleware
-app.use(helmet());
-app.use(cors());
-app.use(morgan('dev'));
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+}));
+app.use(cors({
+  origin: config.corsOrigins,
+  credentials: true,
+}));
+app.use(morgan(config.isProduction ? 'combined' : 'dev'));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -50,6 +67,7 @@ app.use(express.urlencoded({ extended: true }));
 app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
 
 // API Routes
+app.use('/api/auth/login', loginRateLimiter);
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/products', productRoutes);
@@ -64,7 +82,6 @@ app.use('/api/pos', posRoutes);
 app.use('/api/accounting', accountingRoutes);
 app.use('/api/stock-transfers', stockTransferRoutes);
 app.use('/api/bank-cash', bankCashRoutes);
-app.use('/api/bank-management', bankManagementRoutes);
 app.use('/api/expenses', expenseRoutes);
 app.use('/api/hr', hrRoutes);
 app.use('/api/reports', reportRoutes);
@@ -75,15 +92,38 @@ app.use('/api/payables', payableRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/inventory-count', inventoryCountRoutes);
 app.use('/api/settings', settingsRoutes);
+app.use('/api/production/boms', bomRoutes);
 app.use('/api/production', productionRoutes);
 app.use('/api/attachments', attachmentRoutes);
 app.use('/api/supplier-price-history', supplierPriceHistoryRoutes);
 app.use('/api/petty-cash', pettyCashRoutes);
+app.use('/api/sales/memos', salesMemosRoutes);
+app.use('/api/purchases/memos', purchaseMemosRoutes);
+app.use('/api/payables/bir-2307', bir2307Routes);
+app.use('/api/sales-orders', orderRoutes);
+app.use('/api/delivery-notes', deliveryRoutes);
+app.use('/api/sales-quotations', quotationRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
+
+// Production / hybrid: serve React SPA from same origin (cloud ERP in browser)
+if (config.serveFrontend && fs.existsSync(config.frontendDist)) {
+  app.use(express.static(config.frontendDist));
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api') || req.path.startsWith('/uploads')) {
+      return next();
+    }
+    res.sendFile(path.join(config.frontendDist, 'index.html'), (err) => {
+      if (err) next(err);
+    });
+  });
+} else if (config.serveFrontend && config.isProduction) {
+  console.warn(`[WARN] SERVE_FRONTEND enabled but dist not found at: ${config.frontendDist}`);
+  console.warn('[WARN] Run: cd frontend && npm run build');
+}
 
 // Error handling
 app.use(notFound);
@@ -92,6 +132,14 @@ app.use(errorHandler);
 app.listen(config.port, () => {
   console.log(`D METRAN ERP Server running on port ${config.port}`);
   console.log(`Environment: ${config.nodeEnv}`);
+  if (config.serveFrontend && fs.existsSync(config.frontendDist)) {
+    console.log(`Serving web UI from: ${config.frontendDist}`);
+  }
+  if (config.isProduction && config.jwtSecret === 'default-secret') {
+    console.warn('[WARN] JWT_SECRET is still default-secret — set a strong secret in .env before go-live');
+  }
 });
 
 export default app;
+
+

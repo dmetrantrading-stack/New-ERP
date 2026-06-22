@@ -3,12 +3,22 @@ import multer from 'multer';
 import * as XLSX from 'xlsx';
 import { v4 as uuidv4 } from 'uuid';
 import { query } from '../../config/database';
-import { authenticate, AuthRequest } from '../../middleware/auth';
+import { authenticate, hasUserPerm, hasUserAnyPerm, AuthRequest } from '../../middleware/auth';
 import { AppError } from '../../middleware/errorHandler';
 import { auditLog } from '../../middleware/audit';
+import { auditAfter, auditBefore, auditSnapshot, AUDIT_FIELDS } from '../../utils/auditHelpers';
+import { fetchSupplierCatalogItems, addProductsToSupplierCatalog, resolveProductIdBySkuOrName } from '../../utils/supplierCatalog';
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 }, fileFilter: (_req, file, cb) => { const ok = file.mimetype === 'text/csv' || file.originalname.endsWith('.csv') || file.mimetype === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' || file.originalname.endsWith('.xlsx'); cb(null, ok); } });
+
+const supplierView = hasUserPerm('purchases.suppliers.view');
+const supplierLookup = hasUserAnyPerm([
+  'purchases.suppliers.view',
+  'purchases.purchase-order.view',
+  'purchases.apv.view',
+  'purchases.receiving-report.view',
+]);
 
 const esc = (v: any) => {
   const s = v == null ? '' : String(v);
@@ -49,7 +59,7 @@ const parseFile = (buffer: Buffer, originalName: string): { headers: string[]; r
   return { headers: parseLine(lines[0]), rows: lines.slice(1).map(parseLine) };
 };
 
-router.get('/', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/', authenticate, supplierLookup, async (req: AuthRequest, res: Response) => {
   try {
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 50;
@@ -79,14 +89,14 @@ router.get('/', authenticate, async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.get('/export/template', authenticate, async (_req: AuthRequest, res: Response) => {
+router.get('/export/template', authenticate, supplierView, async (_req: AuthRequest, res: Response) => {
   const headerRow = ['Supplier Name','Contact Person','Address','Phone','Email','Payment Terms','TIN','Default Discount Percent'];
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename=supplier_import_template.csv');
   res.send('\uFEFF' + headerRow.map(esc).join(','));
 });
 
-router.get('/export', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/export', authenticate, supplierView, async (req: AuthRequest, res: Response) => {
   try {
     const format = (req.query.format as string) || 'csv';
     const result = await query('SELECT supplier_name, contact_person, address, phone, email, payment_terms, tin, default_discount_percent, is_active FROM suppliers WHERE is_active = true ORDER BY supplier_name');
@@ -115,7 +125,7 @@ router.get('/export', authenticate, async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.post('/import/preview', authenticate, upload.single('file'), async (req: AuthRequest, res: Response) => {
+router.post('/import/preview', authenticate, hasUserPerm('purchases.suppliers.edit'), upload.single('file'), async (req: AuthRequest, res: Response) => {
   try {
     if (!req.file) throw new AppError('No file uploaded');
     const { headers, rows } = parseFile(req.file.buffer, req.file.originalname);
@@ -181,7 +191,7 @@ router.post('/import/preview', authenticate, upload.single('file'), async (req: 
   }
 });
 
-router.post('/import/execute', authenticate, upload.single('file'), async (req: AuthRequest, res: Response) => {
+router.post('/import/execute', authenticate, hasUserPerm('purchases.suppliers.edit'), upload.single('file'), async (req: AuthRequest, res: Response) => {
   try {
     if (!req.file) throw new AppError('No file uploaded');
     const { headers, rows } = parseFile(req.file.buffer, req.file.originalname);
@@ -263,17 +273,7 @@ router.post('/import/execute', authenticate, upload.single('file'), async (req: 
   }
 });
 
-router.get('/:id', authenticate, async (req: AuthRequest, res: Response) => {
-  try {
-    const result = await query('SELECT * FROM suppliers WHERE id = $1', [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Supplier not found' });
-    res.json(result.rows[0]);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-router.get('/:id/ledger', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/:id/ledger', authenticate, supplierView, async (req: AuthRequest, res: Response) => {
   try {
     const supplierId = parseInt(req.params.id);
     const supplier = await query('SELECT * FROM suppliers WHERE id = $1', [supplierId]);
@@ -339,7 +339,354 @@ router.get('/:id/ledger', authenticate, async (req: AuthRequest, res: Response) 
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.post('/', authenticate, auditLog('Suppliers', 'Create'), async (req: AuthRequest, res: Response) => {
+router.get('/:id', authenticate, supplierView, async (req: AuthRequest, res: Response) => {
+  try {
+    const result = await query('SELECT * FROM suppliers WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Supplier not found' });
+    res.json(result.rows[0]);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/:id/catalog', authenticate, supplierView, async (req: AuthRequest, res: Response) => {
+  try {
+    const supplierId = parseInt(req.params.id, 10);
+    if (Number.isNaN(supplierId)) return res.status(400).json({ error: 'Invalid supplier id' });
+
+    const supplier = await query('SELECT id, supplier_code, supplier_name, payment_terms FROM suppliers WHERE id = $1 AND is_active = true', [supplierId]);
+    if (supplier.rows.length === 0) return res.status(404).json({ error: 'Supplier not found' });
+
+    const lowStockOnly = req.query.low_stock === 'true';
+    const { items, summary } = await fetchSupplierCatalogItems(supplierId, lowStockOnly);
+
+    res.json({
+      supplier: supplier.rows[0],
+      summary,
+      items,
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/:id/catalog', authenticate, hasUserPerm('purchases.suppliers.edit'), async (req: AuthRequest, res: Response) => {
+  try {
+    const supplierId = parseInt(req.params.id, 10);
+    if (Number.isNaN(supplierId)) return res.status(400).json({ error: 'Invalid supplier id' });
+
+    const supplier = await query('SELECT id FROM suppliers WHERE id = $1 AND is_active = true', [supplierId]);
+    if (supplier.rows.length === 0) return res.status(404).json({ error: 'Supplier not found' });
+
+    const { product_id, order_qty_multiplier, fixed_order_qty, sort_order } = req.body;
+    if (!product_id) return res.status(400).json({ error: 'Product is required' });
+
+    const product = await query('SELECT id FROM products WHERE id = $1 AND is_active = true', [product_id]);
+    if (product.rows.length === 0) return res.status(404).json({ error: 'Product not found' });
+
+    const id = uuidv4();
+    await query(
+      `INSERT INTO supplier_catalog_items (id, supplier_id, product_id, order_qty_multiplier, fixed_order_qty, sort_order)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        id,
+        supplierId,
+        product_id,
+        order_qty_multiplier != null ? parseFloat(String(order_qty_multiplier)) : 2,
+        fixed_order_qty != null && String(fixed_order_qty).trim() !== '' ? parseFloat(String(fixed_order_qty)) : null,
+        sort_order != null ? parseInt(String(sort_order), 10) : 0,
+      ],
+    );
+
+    const { items } = await fetchSupplierCatalogItems(supplierId);
+    const created = items.find((i) => i.catalog_item_id === id);
+    res.status(201).json(created || { catalog_item_id: id, product_id });
+  } catch (error: any) {
+    if (error.code === '23505') return res.status(409).json({ error: 'Product is already in this supplier catalog' });
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/:id/catalog/bulk', authenticate, hasUserPerm('purchases.suppliers.edit'), async (req: AuthRequest, res: Response) => {
+  try {
+    const supplierId = parseInt(req.params.id, 10);
+    if (Number.isNaN(supplierId)) return res.status(400).json({ error: 'Invalid supplier id' });
+
+    const supplier = await query('SELECT id FROM suppliers WHERE id = $1 AND is_active = true', [supplierId]);
+    if (supplier.rows.length === 0) return res.status(404).json({ error: 'Supplier not found' });
+
+    const productIds: string[] = Array.isArray(req.body.product_ids) ? req.body.product_ids : [];
+    if (productIds.length === 0) return res.status(400).json({ error: 'Select at least one product' });
+
+    const orderQtyMultiplier = req.body.order_qty_multiplier;
+    const fixedOrderQty = req.body.fixed_order_qty;
+    const inputs = productIds.map((product_id: string) => ({
+      product_id,
+      order_qty_multiplier: orderQtyMultiplier,
+      fixed_order_qty: fixedOrderQty,
+    }));
+
+    const result = await addProductsToSupplierCatalog(supplierId, inputs);
+    if (result.added === 0 && result.reactivated === 0 && result.errors.length > 0) {
+      return res.status(400).json({ error: result.errors[0]?.message || 'No products added', ...result });
+    }
+
+    res.status(201).json(result);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/:id/catalog/import/template', authenticate, supplierView, async (_req: AuthRequest, res: Response) => {
+  const headerRow = ['SKU', 'Product Name', 'Order Qty Multiplier', 'Fixed Order Qty'];
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename=supplier_catalog_import_template.csv');
+  res.send('\uFEFF' + headerRow.map(esc).join(','));
+});
+
+const mapCatalogImportHeaders = (headers: string[]): Record<string, number> => {
+  const hm: Record<string, number> = {};
+  for (let i = 0; i < headers.length; i++) {
+    const h = headers[i].toLowerCase();
+    if (h === 'sku') hm.SKU = i;
+    else if (h === 'product name' || h === 'name' || h === 'product') hm['Product Name'] = i;
+    else if (h === 'order qty multiplier' || h === 'multiplier') hm['Order Qty Multiplier'] = i;
+    else if (h === 'fixed order qty' || h === 'fixed qty' || h === 'order qty') hm['Fixed Order Qty'] = i;
+  }
+  return hm;
+};
+
+const buildCatalogImportPreview = async (supplierId: number, headers: string[], rows: string[][]) => {
+  const hm = mapCatalogImportHeaders(headers);
+  if (!('SKU' in hm) && !('Product Name' in hm)) {
+    throw new AppError('File must include SKU and/or Product Name column');
+  }
+
+  const products = await query('SELECT id, sku, name FROM products WHERE is_active = true');
+  const bySku = new Map(products.rows.map((r: any) => [String(r.sku).trim(), r]));
+  const bySkuLower = new Map(products.rows.map((r: any) => [String(r.sku).trim().toLowerCase(), r]));
+  const byName = new Map(products.rows.map((r: any) => [String(r.name).trim().toLowerCase(), r]));
+
+  const catalogExisting = await query(
+    'SELECT product_id FROM supplier_catalog_items WHERE supplier_id = $1 AND is_active = true',
+    [supplierId],
+  );
+  const inCatalog = new Set(catalogExisting.rows.map((r: any) => r.product_id));
+
+  const previewRows: any[] = [];
+  const errors: { row: number; message: string }[] = [];
+  let validRows = 0;
+
+  for (let ri = 0; ri < rows.length; ri++) {
+    const row = rows[ri];
+    const rowNum = ri + 2;
+    const entry: any = { row: rowNum, has_errors: false, errors: [] };
+
+    entry.sku = hm.SKU !== undefined ? row[hm.SKU] || '' : '';
+    entry.name = hm['Product Name'] !== undefined ? row[hm['Product Name']] || '' : '';
+    entry.order_qty_multiplier = hm['Order Qty Multiplier'] !== undefined ? row[hm['Order Qty Multiplier']] || '2' : '2';
+    entry.fixed_order_qty = hm['Fixed Order Qty'] !== undefined ? row[hm['Fixed Order Qty']] || '' : '';
+
+    if (!entry.sku.trim() && !entry.name.trim()) {
+      entry.has_errors = true;
+      entry.errors.push('SKU or Product Name is required');
+    }
+
+    const multiplier = parseFloat(entry.order_qty_multiplier);
+    if (entry.order_qty_multiplier !== '' && Number.isNaN(multiplier)) {
+      entry.has_errors = true;
+      entry.errors.push('Order Qty Multiplier must be a number');
+    } else {
+      entry.order_qty_multiplier = Number.isNaN(multiplier) ? 2 : multiplier;
+    }
+
+    if (entry.fixed_order_qty !== '' && Number.isNaN(parseFloat(entry.fixed_order_qty))) {
+      entry.has_errors = true;
+      entry.errors.push('Fixed Order Qty must be a number');
+    }
+
+    if (!entry.has_errors) {
+      const match = await resolveProductIdBySkuOrName(entry.sku, entry.name, bySku, byName, bySkuLower);
+      if (!match) {
+        entry.has_errors = true;
+        entry.errors.push('Product not found in master catalog');
+      } else {
+        entry.product_id = match.id;
+        entry.resolved_name = match.name;
+        entry.resolved_sku = match.sku;
+        entry.action = inCatalog.has(match.id) ? 'Skip (already in catalog)' : 'Add';
+        if (inCatalog.has(match.id)) {
+          entry.has_errors = true;
+          entry.errors.push('Already in supplier catalog');
+        }
+      }
+    }
+
+    if (!entry.has_errors) validRows++;
+    if (entry.has_errors) errors.push({ row: rowNum, message: entry.errors.join('; ') });
+    previewRows.push(entry);
+  }
+
+  return {
+    total_rows: rows.length,
+    valid_rows: validRows,
+    error_rows: errors.length,
+    rows: previewRows,
+    errors,
+  };
+};
+
+router.post('/:id/catalog/import/preview', authenticate, hasUserPerm('purchases.suppliers.edit'), upload.single('file'), async (req: AuthRequest, res: Response) => {
+  try {
+    if (!req.file) throw new AppError('No file uploaded');
+    const supplierId = parseInt(req.params.id, 10);
+    if (Number.isNaN(supplierId)) return res.status(400).json({ error: 'Invalid supplier id' });
+
+    const supplier = await query('SELECT id FROM suppliers WHERE id = $1 AND is_active = true', [supplierId]);
+    if (supplier.rows.length === 0) return res.status(404).json({ error: 'Supplier not found' });
+
+    const { headers, rows } = parseFile(req.file.buffer, req.file.originalname);
+    const preview = await buildCatalogImportPreview(supplierId, headers, rows);
+
+    res.json({
+      file_name: req.file.originalname,
+      ...preview,
+    });
+  } catch (error: any) {
+    res.status(error instanceof AppError ? error.statusCode : 500).json({ error: error.message });
+  }
+});
+
+router.post('/:id/catalog/import/execute', authenticate, hasUserPerm('purchases.suppliers.edit'), upload.single('file'), async (req: AuthRequest, res: Response) => {
+  try {
+    if (!req.file) throw new AppError('No file uploaded');
+    const supplierId = parseInt(req.params.id, 10);
+    if (Number.isNaN(supplierId)) return res.status(400).json({ error: 'Invalid supplier id' });
+
+    const supplier = await query('SELECT id FROM suppliers WHERE id = $1 AND is_active = true', [supplierId]);
+    if (supplier.rows.length === 0) return res.status(404).json({ error: 'Supplier not found' });
+
+    const { headers, rows } = parseFile(req.file.buffer, req.file.originalname);
+    const preview = await buildCatalogImportPreview(supplierId, headers, rows);
+    const validRows = preview.rows.filter((r: any) => !r.has_errors);
+
+    if (validRows.length === 0) {
+      return res.status(400).json({ error: 'No valid rows to import', errors: preview.errors });
+    }
+
+    const inputs = validRows.map((r: any) => ({
+      product_id: r.product_id,
+      order_qty_multiplier: r.order_qty_multiplier,
+      fixed_order_qty: r.fixed_order_qty !== '' ? parseFloat(r.fixed_order_qty) : null,
+    }));
+
+    const result = await addProductsToSupplierCatalog(supplierId, inputs);
+    res.json({ ...result, total: rows.length, imported_rows: validRows.length });
+  } catch (error: any) {
+    res.status(error instanceof AppError ? error.statusCode : 500).json({ error: error.message });
+  }
+});
+
+router.put('/:id/catalog/:itemId', authenticate, hasUserPerm('purchases.suppliers.edit'), async (req: AuthRequest, res: Response) => {
+  try {
+    const supplierId = parseInt(req.params.id, 10);
+    const { itemId } = req.params;
+    const { order_qty_multiplier, fixed_order_qty, sort_order } = req.body;
+
+    const existing = await query(
+      'SELECT * FROM supplier_catalog_items WHERE id = $1 AND supplier_id = $2 AND is_active = true',
+      [itemId, supplierId],
+    );
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Catalog item not found' });
+
+    await query(
+      `UPDATE supplier_catalog_items SET
+        order_qty_multiplier = COALESCE($1, order_qty_multiplier),
+        fixed_order_qty = $2,
+        sort_order = COALESCE($3, sort_order),
+        updated_at = CURRENT_TIMESTAMP
+       WHERE id = $4 AND supplier_id = $5`,
+      [
+        order_qty_multiplier != null ? parseFloat(String(order_qty_multiplier)) : null,
+        fixed_order_qty != null && String(fixed_order_qty).trim() !== '' ? parseFloat(String(fixed_order_qty)) : null,
+        sort_order != null ? parseInt(String(sort_order), 10) : null,
+        itemId,
+        supplierId,
+      ],
+    );
+
+    const { items } = await fetchSupplierCatalogItems(supplierId);
+    const updated = items.find((i) => i.catalog_item_id === itemId);
+    res.json(updated);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.delete('/:id/catalog/:itemId', authenticate, hasUserPerm('purchases.suppliers.edit'), async (req: AuthRequest, res: Response) => {
+  try {
+    const supplierId = parseInt(req.params.id, 10);
+    const { itemId } = req.params;
+
+    const result = await query(
+      `UPDATE supplier_catalog_items SET is_active = false, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 AND supplier_id = $2 AND is_active = true RETURNING id`,
+      [itemId, supplierId],
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Catalog item not found' });
+    res.json({ message: 'Removed from catalog' });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/:id/catalog/copy-to-po', authenticate, hasUserPerm('purchases.purchase-order.create'), async (req: AuthRequest, res: Response) => {
+  try {
+    const supplierId = parseInt(req.params.id, 10);
+    if (Number.isNaN(supplierId)) return res.status(400).json({ error: 'Invalid supplier id' });
+
+    const supplier = await query('SELECT id, supplier_name, payment_terms FROM suppliers WHERE id = $1 AND is_active = true', [supplierId]);
+    if (supplier.rows.length === 0) return res.status(404).json({ error: 'Supplier not found' });
+
+    const productIds: string[] = Array.isArray(req.body.product_ids) ? req.body.product_ids : [];
+    if (productIds.length === 0) return res.status(400).json({ error: 'Select at least one product' });
+
+    const { items } = await fetchSupplierCatalogItems(supplierId);
+    const selected = items.filter((i) => productIds.includes(i.product_id));
+
+    if (selected.length === 0) {
+      return res.status(400).json({ error: 'No matching catalog products found' });
+    }
+
+    const poItems = selected
+      .map((i) => ({
+        product_id: i.product_id,
+        product_name: i.name,
+        sku: i.sku,
+        quantity: i.standard_order_qty,
+        unit_cost: i.unit_cost,
+        unit_of_measure: i.unit_of_measure,
+        tax_type: i.tax_type,
+      }))
+      .filter((i) => i.quantity != null && i.quantity > 0);
+
+    if (poItems.length === 0) {
+      return res.status(400).json({ error: 'Selected items have no order quantity — set reorder level on the product first' });
+    }
+
+    res.json({
+      supplier_id: supplierId,
+      supplier_name: supplier.rows[0].supplier_name,
+      payment_terms: supplier.rows[0].payment_terms || '',
+      notes: req.body.notes || 'Generated from supplier low stock catalog',
+      items: poItems,
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/', authenticate, hasUserPerm('purchases.suppliers.create'), auditLog('Suppliers', 'Create'), async (req: AuthRequest, res: Response) => {
   try {
     const { supplier_name, contact_person, address, phone, email, payment_terms, tin } = req.body;
     if (!supplier_name) return res.status(400).json({ error: 'Supplier name is required' });
@@ -358,8 +705,12 @@ router.post('/', authenticate, auditLog('Suppliers', 'Create'), async (req: Auth
   }
 });
 
-router.put('/:id', authenticate, auditLog('Suppliers', 'Update'), async (req: AuthRequest, res: Response) => {
+router.put('/:id', authenticate, hasUserPerm('purchases.suppliers.edit'), auditLog('Suppliers', 'Update'), async (req: AuthRequest, res: Response) => {
   try {
+    const existing = await query('SELECT * FROM suppliers WHERE id = $1', [req.params.id]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Supplier not found' });
+    auditBefore(req, auditSnapshot(existing.rows[0], AUDIT_FIELDS.supplier));
+
     const { supplier_name, contact_person, address, phone, email, payment_terms, tin, is_active } = req.body;
     const result = await query(
       `UPDATE suppliers SET supplier_name = COALESCE($1, supplier_name), contact_person = COALESCE($2, contact_person),
@@ -369,13 +720,14 @@ router.put('/:id', authenticate, auditLog('Suppliers', 'Update'), async (req: Au
       [supplier_name, contact_person, address, phone, email, payment_terms, tin, is_active, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Supplier not found' });
+    auditAfter(req, auditSnapshot(result.rows[0], AUDIT_FIELDS.supplier));
     res.json(result.rows[0]);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 });
 
-router.delete('/:id', authenticate, auditLog('Suppliers', 'Delete'), async (req: AuthRequest, res: Response) => {
+router.delete('/:id', authenticate, hasUserPerm('purchases.suppliers.edit'), auditLog('Suppliers', 'Delete'), async (req: AuthRequest, res: Response) => {
   try {
     const { id } = req.params;
 

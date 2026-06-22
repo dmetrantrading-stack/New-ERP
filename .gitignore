@@ -1,6 +1,8 @@
 node_modules/
 dist/
 .env
+**/.env
+backend/.env
 *.log
 uploads/
 .DS_Store

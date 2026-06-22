@@ -1,10 +1,21 @@
 import { Router, Response } from 'express';
 import { query, getClient } from '../../config/database';
-import { authenticate, AuthRequest } from '../../middleware/auth';
+import { authenticate, hasUserPerm, AuthRequest } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
 import { v4 as uuidv4 } from 'uuid';
+import {
+  tableRow, fc, fmtCurrency, fmtDate,
+  renderEnterpriseItemsTable, renderEnterpriseSectionTitle, renderEnterpriseTotalBanner,
+} from '../../utils/printLayout';
+import {
+  buildSalesEnterpriseDocument,
+  buildEnterpriseSignatures,
+} from '../../utils/salesEnterprisePrint';
 
 const router = Router();
+
+const prodView = hasUserPerm('inventory.production.view');
+const prodPrint = hasUserPerm('inventory.production.print');
 
 const generatePONumber = async (): Promise<string> => {
   const yr = new Date().getFullYear();
@@ -16,7 +27,7 @@ const generatePONumber = async (): Promise<string> => {
 };
 
 // List
-router.get('/', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/', authenticate, prodView, async (req: AuthRequest, res: Response) => {
   try {
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 50;
@@ -39,7 +50,7 @@ router.get('/', authenticate, async (req: AuthRequest, res: Response) => {
 });
 
 // Get
-router.get('/:id', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/:id', authenticate, prodView, async (req: AuthRequest, res: Response) => {
   try {
     const r = await query('SELECT * FROM production_orders WHERE id = $1', [req.params.id]);
     if (r.rows.length === 0) return res.status(404).json({ error: 'Not found' });
@@ -56,7 +67,7 @@ router.get('/:id', authenticate, async (req: AuthRequest, res: Response) => {
 });
 
 // Create
-router.post('/', authenticate, auditLog('Production', 'Create Production Order'), async (req: AuthRequest, res: Response) => {
+router.post('/', authenticate, hasUserPerm('inventory.production.create'), auditLog('Production', 'Create Production Order'), async (req: AuthRequest, res: Response) => {
   try {
     const po_number = await generatePONumber();
     const { po_date, source_location_id, destination_location_id, notes, inputs, outputs } = req.body;
@@ -107,7 +118,7 @@ router.post('/', authenticate, auditLog('Production', 'Create Production Order')
 });
 
 // Update (Draft only)
-router.patch('/:id', authenticate, auditLog('Production', 'Update Production Order'), async (req: AuthRequest, res: Response) => {
+router.patch('/:id', authenticate, hasUserPerm('inventory.production.edit'), auditLog('Production', 'Update Production Order'), async (req: AuthRequest, res: Response) => {
   try {
     const r = await query('SELECT * FROM production_orders WHERE id = $1', [req.params.id]);
     if (r.rows.length === 0) return res.status(404).json({ error: 'Not found' });
@@ -159,7 +170,7 @@ router.patch('/:id', authenticate, auditLog('Production', 'Update Production Ord
 });
 
 // Complete
-router.post('/:id/complete', authenticate, auditLog('Production', 'Complete Production Order'), async (req: AuthRequest, res: Response) => {
+router.post('/:id/complete', authenticate, hasUserPerm('inventory.production.approve'), auditLog('Production', 'Complete Production Order'), async (req: AuthRequest, res: Response) => {
   const client = await getClient();
   try {
     await client.query('BEGIN');
@@ -247,7 +258,7 @@ router.post('/:id/complete', authenticate, auditLog('Production', 'Complete Prod
 });
 
 // Cancel
-router.post('/:id/cancel', authenticate, auditLog('Production', 'Cancel Production Order'), async (req: AuthRequest, res: Response) => {
+router.post('/:id/cancel', authenticate, hasUserPerm('inventory.production.edit'), auditLog('Production', 'Cancel Production Order'), async (req: AuthRequest, res: Response) => {
   try {
     const r = await query('SELECT * FROM production_orders WHERE id = $1', [req.params.id]);
     if (r.rows.length === 0) return res.status(404).json({ error: 'Not found' });
@@ -309,7 +320,7 @@ router.post('/:id/cancel', authenticate, auditLog('Production', 'Cancel Producti
 });
 
 // Delete
-router.delete('/:id', authenticate, auditLog('Production', 'Delete Production Order'), async (req: AuthRequest, res: Response) => {
+router.delete('/:id', authenticate, hasUserPerm('inventory.production.edit'), auditLog('Production', 'Delete Production Order'), async (req: AuthRequest, res: Response) => {
   try {
     const r = await query('SELECT * FROM production_orders WHERE id = $1', [req.params.id]);
     if (r.rows.length === 0) return res.status(404).json({ error: 'Not found' });
@@ -320,7 +331,7 @@ router.delete('/:id', authenticate, auditLog('Production', 'Delete Production Or
 });
 
 // Print
-router.get('/:id/print', async (req: AuthRequest, res: Response) => {
+router.get('/:id/print', authenticate, prodPrint, async (req: AuthRequest, res: Response) => {
   try {
     const r = await query('SELECT * FROM production_orders WHERE id = $1', [req.params.id]);
     if (r.rows.length === 0) return res.status(404).send('Not found');
@@ -328,13 +339,83 @@ router.get('/:id/print', async (req: AuthRequest, res: Response) => {
     const inputs = await query('SELECT pi.*, p.name as product_name, p.sku FROM production_order_inputs pi LEFT JOIN products p ON pi.product_id = p.id WHERE pi.po_id = $1', [req.params.id]);
     const outputs = await query('SELECT po2.*, p.name as product_name, p.sku FROM production_order_outputs po2 LEFT JOIN products p ON po2.product_id = p.id WHERE po2.po_id = $1', [req.params.id]);
 
-    const fc = (v: any) => { const n = parseFloat(v); return isNaN(n) ? '0.00' : n.toLocaleString('en-PH', { minimumFractionDigits: 2 }); };
+    const biz = await query('SELECT * FROM business_details WHERE id = 1');
+    const b = biz.rows[0] || {};
 
-    const inputRows = inputs.rows.map((i: any, idx: number) => '<tr><td style="padding:6px 4px;font-size:12px;text-align:center">' + (idx + 1) + '</td><td style="padding:6px 4px;font-size:12px">' + (i.product_name || '-') + '</td><td style="padding:6px 4px;font-size:12px;text-align:center">' + (i.sku || '') + '</td><td style="padding:6px 4px;font-size:12px;text-align:center">' + (i.uom || '') + '</td><td style="padding:6px 4px;font-size:12px;text-align:right">' + fc(i.quantity) + '</td><td style="padding:6px 4px;font-size:12px;text-align:center">' + (i.batch_number || '-') + '</td><td style="padding:6px 4px;font-size:12px;text-align:center">' + (i.expiry_date ? new Date(i.expiry_date).toLocaleDateString('en-PH') : '-') + '</td><td style="padding:6px 4px;font-size:12px;text-align:right">' + fc(i.unit_cost) + '</td><td style="padding:6px 4px;font-size:12px;text-align:right">' + fc(i.total_cost) + '</td></tr>').join('');
+    const inputRows = inputs.rows.map((i: any, idx: number) => tableRow([
+      { html: String(idx + 1), align: 'c' },
+      { html: i.product_name || '—' },
+      { html: i.sku || '—', align: 'c' },
+      { html: i.uom || '—', align: 'c' },
+      { html: fc(i.quantity), align: 'r' },
+      { html: i.batch_number || '—', align: 'c' },
+      { html: i.expiry_date ? fmtDate(i.expiry_date, 'short') : '—', align: 'c' },
+      { html: fmtCurrency(i.unit_cost), align: 'r' },
+      { html: fmtCurrency(i.total_cost), align: 'r' },
+    ])).join('');
 
-    const outputRows = outputs.rows.map((o: any, idx: number) => '<tr><td style="padding:6px 4px;font-size:12px;text-align:center">' + (idx + 1) + '</td><td style="padding:6px 4px;font-size:12px">' + (o.product_name || '-') + '</td><td style="padding:6px 4px;font-size:12px;text-align:center">' + (o.sku || '') + '</td><td style="padding:6px 4px;font-size:12px;text-align:center">' + (o.uom || '') + '</td><td style="padding:6px 4px;font-size:12px;text-align:right">' + fc(o.quantity) + '</td><td style="padding:6px 4px;font-size:12px;text-align:center">' + (o.batch_number || '-') + '</td><td style="padding:6px 4px;font-size:12px;text-align:center">' + (o.expiry_date ? new Date(o.expiry_date).toLocaleDateString('en-PH') : '-') + '</td><td style="padding:6px 4px;font-size:12px;text-align:right">' + fc(o.unit_cost) + '</td><td style="padding:6px 4px;font-size:12px;text-align:right">' + fc(o.total_cost) + '</td></tr>').join('');
+    const outputRows = outputs.rows.map((o: any, idx: number) => tableRow([
+      { html: String(idx + 1), align: 'c' },
+      { html: o.product_name || '—' },
+      { html: o.sku || '—', align: 'c' },
+      { html: o.uom || '—', align: 'c' },
+      { html: fc(o.quantity), align: 'r' },
+      { html: o.batch_number || '—', align: 'c' },
+      { html: o.expiry_date ? fmtDate(o.expiry_date, 'short') : '—', align: 'c' },
+      { html: fmtCurrency(o.unit_cost), align: 'r' },
+      { html: fmtCurrency(o.total_cost), align: 'r' },
+    ])).join('');
 
-    const html = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>' + po.po_number + '</title><style>body{font-family:Arial;margin:20px;color:#333}.header{display:flex;justify-content:space-between;border-bottom:2px solid #1e40af;padding-bottom:12px;margin-bottom:16px}.company-info h2{color:#1e40af;margin:0;font-size:20px}.company-info p{margin:2px 0;font-size:12px;color:#666}.doc-title h1{color:#1e40af;margin:0;font-size:22px}table{width:100%;border-collapse:collapse;margin:12px 0}thead th{background:#1e40af;color:#fff;font-size:11px;padding:8px 4px}tbody td{border-bottom:1px solid #e5e7eb}.section-title{background:#eff6ff;padding:6px 10px;font-weight:bold;font-size:13px;margin-top:16px;border-radius:4px}.totals{width:350px;margin-left:auto}.totals td{font-size:12px;padding:4px 8px;border:none}.signatures{display:flex;justify-content:space-between;margin-top:40px;font-size:12px}.signatures div{text-align:center;width:22%}.line{margin-top:32px;border-top:1px solid #333}@media print{body{margin:0;padding:10px}}</style></head><body><div class="header"><div class="company-info"><h2>D METRAN TRADING</h2><p>123 Main Street, Cagayan de Oro City</p><p>TIN: 123-456-789-000</p></div><div class="doc-title"><h1>PRODUCTION ORDER</h1><p>' + po.po_number + '</p><p>Date: ' + new Date(po.po_date || po.created_at).toLocaleDateString('en-PH') + '</p></div></div><div style="display:flex;gap:20px;margin-bottom:12px;font-size:12px"><div><strong>Source:</strong> Location ' + (po.source_location_id || '-') + '</div><div><strong>Destination:</strong> Location ' + (po.destination_location_id || '-') + '</div></div><div class="section-title">INPUT MATERIALS</div><table><thead><tr><th>#</th><th>Product</th><th>SKU</th><th>UOM</th><th>Qty</th><th>Batch #</th><th>Expiry</th><th>Unit Cost</th><th>Total</th></tr></thead><tbody>' + inputRows + '</tbody></table><table class="totals"><tr style="font-weight:bold"><td style="text-align:right">Total Input Cost:</td><td style="text-align:right">' + fc(po.total_input_cost) + '</td></tr></table><div class="section-title">OUTPUT FINISHED GOODS</div><table><thead><tr><th>#</th><th>Product</th><th>SKU</th><th>UOM</th><th>Qty</th><th>Batch #</th><th>Expiry</th><th>Unit Cost</th><th>Total</th></tr></thead><tbody>' + outputRows + '</tbody></table><table class="totals"><tr><td style="text-align:right">Total Output Qty:</td><td style="text-align:right">' + fc(po.total_output_qty) + '</td></tr><tr style="font-weight:bold"><td style="text-align:right">Output Unit Cost:</td><td style="text-align:right">' + fc(po.output_unit_cost) + '</td></tr></table>' + (po.notes ? '<div style="margin-top:12px;font-size:12px"><strong>Remarks:</strong> ' + po.notes + '</div>' : '') + '<div class="signatures"><div><div class="line"></div>Prepared by</div><div><div class="line"></div>Checked by</div><div><div class="line"></div>Approved by</div><div><div class="line"></div>Received by</div></div></body></html>';
+    const lineHeaders = [
+      { text: '#', align: 'center' as const, width: '28px' },
+      { text: 'Product', align: 'left' as const },
+      { text: 'Item Code', align: 'center' as const, width: '72px' },
+      { text: 'UOM', align: 'center' as const, width: '40px' },
+      { text: 'Qty', align: 'center' as const, width: '44px' },
+      { text: 'Batch #', align: 'center' as const, width: '64px' },
+      { text: 'Expiry', align: 'center' as const, width: '64px' },
+      { text: 'Unit Cost', align: 'right' as const, width: '76px' },
+      { text: 'Amount', align: 'right' as const, width: '80px' },
+    ];
+
+    const beforeItemsHtml = [
+      renderEnterpriseSectionTitle('Input Materials'),
+      renderEnterpriseItemsTable(lineHeaders, inputRows),
+      renderEnterpriseTotalBanner('Total Input Cost', fmtCurrency(po.total_input_cost)),
+      renderEnterpriseSectionTitle('Output Finished Goods'),
+      renderEnterpriseItemsTable(lineHeaders, outputRows),
+    ].join('');
+
+    const html = buildSalesEnterpriseDocument({
+      pageTitle: `Production Order ${po.po_number}`,
+      docTitle: 'Production Order',
+      docMetaRows: [
+        { label: 'Document No.', value: po.po_number || '—' },
+        { label: 'Production Date', value: fmtDate(po.po_date || po.created_at, 'short') },
+        { label: 'Source Location', value: String(po.source_location_id || '—') },
+        { label: 'Status', value: String(po.status || 'Draft').toUpperCase() },
+      ],
+      partySectionTitle: 'Production Details',
+      customerRows: [
+        { label: 'Destination Location', value: String(po.destination_location_id || '—') },
+      ],
+      detailsRows: [
+        { label: 'Total Input Cost', value: fmtCurrency(po.total_input_cost) },
+        { label: 'Total Output Qty', value: fc(po.total_output_qty) },
+      ],
+      beforeItemsHtml,
+      skipItemsTable: true,
+      summaryRows: [
+        { label: 'Total Output Qty', value: fc(po.total_output_qty) },
+        { label: 'OUTPUT UNIT COST', value: fmtCurrency(po.output_unit_cost), total: true },
+      ],
+      amountInWords: parseFloat(po.output_unit_cost) || 0,
+      notes: po.notes ? [{ label: 'Remarks', content: po.notes }] : [],
+      footerNote: 'System-generated production order.',
+      status: po.status,
+      biz: b,
+      signatures: buildEnterpriseSignatures(b),
+    });
     res.send(html);
   } catch (error: any) { res.status(500).send('<p>Error: ' + error.message + '</p>'); }
 });

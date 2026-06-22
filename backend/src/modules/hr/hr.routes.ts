@@ -1,10 +1,34 @@
 import { Router, Response } from 'express';
-import { query } from '../../config/database';
-import { authenticate, AuthRequest, hasUserPerm } from '../../middleware/auth';
+import { query, getClient } from '../../config/database';
+import { authenticate, AuthRequest, hasUserPerm, hasUserAnyPerm } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
 import { v4 as uuidv4 } from 'uuid';
 import jwt from 'jsonwebtoken';
 import { config } from '../../config';
+import {
+  tableRow, fc, fmtCurrency, fmtDate,
+  renderEnterpriseSectionTitle, renderEnterpriseNotesBlock,
+} from '../../utils/printLayout';
+import {
+  buildSalesEnterpriseDocument,
+  buildEmployeeMetaRows,
+  buildEnterpriseSignatures,
+} from '../../utils/salesEnterprisePrint';
+import {
+  applyCashAdvanceDeductions,
+  applyGroceryCreditDeductions,
+  restorePayrollDeductionAllocations,
+  countPayrollAllocations,
+  createJournalEntryTx,
+  getNextCodeTx,
+  type QueryFn,
+} from '../../utils/payrollAllocations';
+import {
+  findExistingPayrollForPeriod,
+  getAttendanceWorkedDays,
+  insertPayrollRecord,
+  previewBatchPayroll,
+} from '../../utils/payrollCompute';
 
 const router = Router();
 
@@ -38,14 +62,14 @@ const createJournalEntry = async (
 
   await query(
     `INSERT INTO journal_entries (id, entry_number, entry_date, reference_type, reference_id, description, total_debit, total_credit, created_by)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+     VALUES ($1, $2, $3::date, $4, $5::uuid, $6, $7, $8, $9::uuid)`,
     [entryId, entryNumber, date, refType, refId, desc, totalDebit, totalCredit, createdBy]
   );
 
   for (const line of lines) {
     await query(
       `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
-       VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = $3), $4, $5, $6, $7, $8)`,
+       VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = $3::varchar), $4, $5, $6, $7, $8::uuid)`,
       [uuidv4(), entryId, line.accountCode, line.description, line.debit, line.credit, refType, refId]
     );
   }
@@ -108,21 +132,29 @@ const getOutstandingGC = async (employeeId: number) => {
 };
 
 // ==================== EMPLOYEES ====================
-router.get('/employees', authenticate, async (req: AuthRequest, res: Response) => {
+const HR_MODULE_VIEW = [
+  'hr.employees.view',
+  'hr.attendance.view',
+  'hr.payroll.view',
+  'hr.payslip.view',
+  'hr.cash-advances.view',
+] as const;
+
+router.get('/employees', authenticate, hasUserPerm('hr.employees.view'), async (req: AuthRequest, res: Response) => {
   try {
     const result = await query('SELECT * FROM employees WHERE is_active = true ORDER BY last_name, first_name');
     res.json(result.rows);
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.get('/employees/all', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/employees/all', authenticate, hasUserPerm('hr.employees.view'), async (req: AuthRequest, res: Response) => {
   try {
     const result = await query('SELECT * FROM employees ORDER BY last_name, first_name');
     res.json(result.rows);
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.get('/employees/:id/ledger', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/employees/:id/ledger', authenticate, hasUserPerm('hr.employees.view'), async (req: AuthRequest, res: Response) => {
   try {
     const employeeId = parseInt(req.params.id);
     const rows: EmployeeLedgerRow[] = [];
@@ -185,7 +217,7 @@ router.get('/employees/:id/ledger', authenticate, async (req: AuthRequest, res: 
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.post('/employees', authenticate, auditLog('HR', 'Create Employee'), async (req: AuthRequest, res: Response) => {
+router.post('/employees', authenticate, hasUserPerm('hr.employees.create'), auditLog('HR', 'Create Employee'), async (req: AuthRequest, res: Response) => {
   try {
     const { first_name, last_name, middle_name, address, phone, email, position, department, daily_rate, monthly_rate, sss, philhealth, pagibig, tin, employment_type, hire_date, credit_limit, sss_default_amount } = req.body;
     if (!first_name || !last_name) return res.status(400).json({ error: 'First and last name are required' });
@@ -201,7 +233,7 @@ router.post('/employees', authenticate, auditLog('HR', 'Create Employee'), async
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.put('/employees/:id', authenticate, auditLog('HR', 'Update Employee'), async (req: AuthRequest, res: Response) => {
+router.put('/employees/:id', authenticate, hasUserPerm('hr.employees.edit'), auditLog('HR', 'Update Employee'), async (req: AuthRequest, res: Response) => {
   try {
     const { first_name, last_name, middle_name, address, phone, email, position, department, daily_rate, monthly_rate, sss, philhealth, pagibig, tin, employment_type, is_active, hire_date, credit_limit, sss_default_amount } = req.body;
     const result = await query(
@@ -221,7 +253,7 @@ router.put('/employees/:id', authenticate, auditLog('HR', 'Update Employee'), as
 });
 
 // ==================== ATTENDANCE ====================
-router.post('/attendance', authenticate, auditLog('HR', 'Create Attendance'), async (req: AuthRequest, res: Response) => {
+router.post('/attendance', authenticate, hasUserPerm('hr.attendance.create'), auditLog('HR', 'Create Attendance'), async (req: AuthRequest, res: Response) => {
   try {
     const { employee_id, date, time_in, time_out, status, notes } = req.body;
     const recordDate = date || new Date().toISOString().split('T')[0];
@@ -241,7 +273,7 @@ router.post('/attendance', authenticate, auditLog('HR', 'Create Attendance'), as
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.get('/attendance', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/attendance', authenticate, hasUserPerm('hr.attendance.view'), async (req: AuthRequest, res: Response) => {
   try {
     const { employee_id, from, to } = req.query;
     let whereClause = '';
@@ -262,23 +294,31 @@ router.get('/attendance', authenticate, async (req: AuthRequest, res: Response) 
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.get('/attendance/worked-days', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/attendance/worked-days', authenticate, hasUserAnyPerm([...HR_MODULE_VIEW]), async (req: AuthRequest, res: Response) => {
   try {
     const { employee_id, from, to } = req.query;
     if (!employee_id || !from || !to) return res.status(400).json({ error: 'employee_id, from, and to are required' });
 
     const result = await query(
-      `SELECT COUNT(*)::int as worked
+      `SELECT COALESCE(SUM(
+         CASE status
+           WHEN 'Half-day' THEN 0.5
+           WHEN 'Present' THEN 1
+           WHEN 'Late' THEN 1
+           ELSE 0
+         END
+       ), 0) as worked
        FROM attendance
-       WHERE employee_id = $1 AND date >= $2 AND date <= $3 AND status IN ('Present', 'Late', 'Half-day')`,
+       WHERE employee_id = $1 AND date >= $2 AND date <= $3
+         AND status IN ('Present', 'Late', 'Half-day')`,
       [employee_id, from, to]
     );
-    res.json({ worked_days: result.rows[0].worked });
+    res.json({ worked_days: parseFloat(result.rows[0].worked) });
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
 // Attendance Sheet — pivoted grid: employees × dates
-router.get('/attendance/sheet', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/attendance/sheet', authenticate, hasUserPerm('hr.attendance.view'), async (req: AuthRequest, res: Response) => {
   try {
     const from = req.query.from as string || new Date().toISOString().slice(0, 7) + '-01';
     const to = req.query.to as string || new Date().toISOString().slice(0, 7) + '-15';
@@ -343,7 +383,7 @@ router.get('/attendance/sheet', authenticate, async (req: AuthRequest, res: Resp
 });
 
 // Batch upsert attendance sheet entries
-router.post('/attendance/sheet', authenticate, async (req: AuthRequest, res: Response) => {
+router.post('/attendance/sheet', authenticate, hasUserPerm('hr.attendance.create'), async (req: AuthRequest, res: Response) => {
   try {
     const { entries } = req.body;
     if (!entries || !Array.isArray(entries) || entries.length === 0) {
@@ -352,25 +392,25 @@ router.post('/attendance/sheet', authenticate, async (req: AuthRequest, res: Res
     let upserted = 0;
     for (const e of entries) {
       if (!e.employee_id || !e.date) continue;
-      await query(
-        `INSERT INTO attendance (employee_id, date, status, time_in, time_out)
-         VALUES ($1,$2,$3,$4,$5)
-         ON CONFLICT (employee_id, date) DO UPDATE SET status = $3, time_in = COALESCE($4, attendance.time_in), time_out = COALESCE($5, attendance.time_out)`,
-        [e.employee_id, e.date, e.status || 'Present', e.time_in || null, e.time_out || null]
-      );
+      if (!e.status) {
+        await query('DELETE FROM attendance WHERE employee_id = $1 AND date = $2', [e.employee_id, e.date]);
+      } else {
+        await query(
+          `INSERT INTO attendance (employee_id, date, status, time_in, time_out)
+           VALUES ($1,$2,$3,$4,$5)
+           ON CONFLICT (employee_id, date) DO UPDATE SET status = $3, time_in = COALESCE($4, attendance.time_in), time_out = COALESCE($5, attendance.time_out)`,
+          [e.employee_id, e.date, e.status, e.time_in || null, e.time_out || null]
+        );
+      }
       upserted++;
     }
     res.json({ upserted });
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-// Attendance Sheet Print — dot-matrix HTML
-router.get('/attendance/sheet/print', async (req: AuthRequest, res: Response) => {
+// Attendance Sheet Print
+router.get('/attendance/sheet/print', authenticate, hasUserPerm('hr.attendance.print'), async (req: AuthRequest, res: Response) => {
   try {
-    const token = req.query.token as string || (req.headers.authorization || '').replace('Bearer ', '');
-    if (!token) return res.status(401).json({ error: 'Auth required' });
-    try { jwt.verify(token, config.jwtSecret); } catch { return res.status(401).json({ error: 'Invalid token' }); }
-
     const from = req.query.from as string || new Date().toISOString().slice(0, 7) + '-01';
     const to = req.query.to as string || new Date().toISOString().slice(0, 7) + '-15';
     const employeeId = req.query.employee_id as string;
@@ -396,60 +436,80 @@ router.get('/attendance/sheet/print', async (req: AuthRequest, res: Response) =>
       attMap[row.employee_id][`${row.date.getFullYear()}-${String(row.date.getMonth()+1).padStart(2,'0')}-${String(row.date.getDate()).padStart(2,'0')}`] = row;
     }
 
-    const fmtDate = (dt: string) => new Date(dt).toLocaleDateString('en-PH', { month: 'short', day: 'numeric' });
     const statusLabel = (s: string) => s === 'Present' ? 'P' : s === 'Absent' ? 'A' : s === 'Late' ? 'L' : s === 'Half-day' ? 'H' : s === 'Leave' ? 'LV' : s === 'Rest Day' ? 'RD' : '';
 
-    let rows = '';
+    const tableHeaders = [
+      { text: 'Employee' },
+      ...dates.map((dt) => ({ text: String(new Date(dt).getDate()), align: 'center' as const, width: '22px' })),
+      { text: 'P', align: 'center' as const, width: '24px' },
+      { text: 'A', align: 'center' as const, width: '24px' },
+      { text: 'L', align: 'center' as const, width: '24px' },
+      { text: 'H', align: 'center' as const, width: '24px' },
+      { text: 'LV', align: 'center' as const, width: '24px' },
+      { text: 'RD', align: 'center' as const, width: '24px' },
+      { text: 'W', align: 'center' as const, width: '28px' },
+    ];
+
+    let tableRows = '';
     for (const e of emps.rows) {
-      let cells = `<td style="font-size:9px;padding:3px 4px;text-align:left">${e.last_name}, ${e.first_name}</td>`;
+      const cells: { html: string; align?: 'c' | 'r' }[] = [
+        { html: `<strong>${e.last_name}, ${e.first_name}</strong>` },
+      ];
       let p = 0, a = 0, l = 0, h = 0, lv = 0, rd = 0;
       for (const dt of dates) {
         const rec = attMap[e.id]?.[dt];
-        if (!rec) { cells += '<td></td>'; continue; }
+        if (!rec) { cells.push({ html: '—', align: 'c' }); continue; }
         const s = rec.status;
-        cells += `<td style="text-align:center;font-size:9px">${statusLabel(s)}</td>`;
+        cells.push({ html: statusLabel(s), align: 'c' });
         if (s === 'Present') p++; else if (s === 'Absent') a++; else if (s === 'Late') l++;
         else if (s === 'Half-day') h++; else if (s === 'Leave') lv++; else if (s === 'Rest Day') rd++;
       }
-      cells += `<td style="text-align:center;font-weight:bold">${p}</td><td style="text-align:center">${a}</td><td style="text-align:center">${l}</td><td style="text-align:center">${h}</td><td style="text-align:center">${lv}</td><td style="text-align:center">${rd}</td><td style="text-align:center;font-weight:bold">${p + l + h*0.5}</td>`;
-      rows += `<tr>${cells}</tr>`;
+      const worked = p + l + h * 0.5;
+      cells.push(
+        { html: `<strong>${p}</strong>`, align: 'c' },
+        { html: String(a), align: 'c' },
+        { html: String(l), align: 'c' },
+        { html: String(h), align: 'c' },
+        { html: String(lv), align: 'c' },
+        { html: String(rd), align: 'c' },
+        { html: `<strong>${worked}</strong>`, align: 'c' },
+      );
+      tableRows += tableRow(cells);
     }
 
     const biz = await query('SELECT * FROM business_details WHERE id = 1');
     const b = biz.rows[0] || {};
-    const bizName = b.business_name || 'D METRAN TRADING';
 
-    const style = `
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:"Courier New",monospace;font-size:10px;color:#111;padding:6mm 8mm;max-width:297mm;margin:0 auto}
-.header{text-align:center;margin-bottom:8px}
-.header h1{font-size:16px;font-weight:bold;letter-spacing:3px;margin:0}
-.header p{font-size:9px;margin:2px 0}
-.doc-title{text-align:center;border:1px dotted #444;padding:5px 0;margin:8px 0}
-.doc-title h2{font-size:13px;font-weight:bold;letter-spacing:4px;margin:0}
-.info{font-size:9px;margin:6px 0;display:flex;gap:20px}
-table{width:100%;border-collapse:collapse;margin:6px 0}
-th{background:#f8f8f8;border:1px dotted #444;padding:3px 4px;font-size:8px;text-align:center;font-weight:bold}
-td{border:1px dotted #444;padding:2px 4px;font-size:8px}
-.legend{font-size:8px;margin-top:6px}
-.footer{text-align:center;font-size:7px;color:#666;margin-top:10px;border-top:1px dotted #999;padding-top:4px}
-@media print{body{padding:4mm 6mm}}
-`.trim();
-
-    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Attendance Sheet ${from} to ${to}</title><style>${style}</style></head><body>
-<div class="header"><h1>${bizName}</h1><p>Attendance Sheet</p></div>
-<div class="doc-title"><h2>ATTENDANCE SHEET</h2></div>
-<div class="info"><span><strong>Period:</strong> ${fmtDate(from)} — ${fmtDate(to)}</span><span><strong>Employees:</strong> ${emps.rows.length}</span></div>
-<table><thead><tr><th style="text-align:left">Employee</th>${dates.map(dt => `<th>${new Date(dt).getDate()}</th>`).join('')}<th>P</th><th>A</th><th>L</th><th>H</th><th>LV</th><th>RD</th><th>W</th></tr></thead><tbody>${rows}</tbody></table>
-<div class="legend"><strong>Legend:</strong> P=Present A=Absent L=Late H=Half-day LV=Leave RD=Rest Day W=Worked Days</div>
-<div class="footer">Printed: ${new Date().toLocaleString('en-PH')} | Attendance Sheet | ${bizName}</div>
-</body></html>`;
-    res.send(html);
+    res.send(buildSalesEnterpriseDocument({
+      pageTitle: `Attendance Sheet ${from} to ${to}`,
+      docTitle: 'Attendance Sheet',
+      docMetaRows: [
+        { label: 'Period From', value: fmtDate(from, 'short') },
+        { label: 'Period To', value: fmtDate(to, 'short') },
+        { label: 'Employees', value: String(emps.rows.length) },
+      ],
+      partySectionTitle: 'Report Information',
+      customerRows: [{ label: 'Report Type', value: 'Daily Attendance Record' }],
+      detailsRows: [{ label: 'Coverage', value: `${fmtDate(from, 'short')} — ${fmtDate(to, 'short')}` }],
+      itemHeaders: tableHeaders,
+      itemRows: tableRows,
+      summaryRows: [{ label: 'Employees Listed', value: String(emps.rows.length), total: true }],
+      skipBottom: true,
+      showAmountInWords: false,
+      afterSummaryHtml: renderEnterpriseNotesBlock(
+        'Legend',
+        'P = Present · A = Absent · L = Late · H = Half-day · LV = Leave · RD = Rest Day · W = Worked Days',
+      ),
+      footerNote: 'Attendance Sheet · Computer-generated document',
+      biz: b,
+      skipSignatures: true,
+      landscape: true,
+    }));
   } catch (error: any) { res.status(500).send('<p>Error: ' + error.message + '</p>'); }
 });
 
 // ==================== CASH ADVANCES ====================
-router.get('/cash-advances', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/cash-advances', authenticate, hasUserPerm('hr.cash-advances.view'), async (req: AuthRequest, res: Response) => {
   try {
     const result = await query(
       `SELECT ca.*, e.first_name, e.last_name, e.employee_code
@@ -460,7 +520,7 @@ router.get('/cash-advances', authenticate, async (req: AuthRequest, res: Respons
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.post('/cash-advances', authenticate, auditLog('HR', 'Create Cash Advance'), async (req: AuthRequest, res: Response) => {
+router.post('/cash-advances', authenticate, hasUserPerm('hr.cash-advances.create'), auditLog('HR', 'Create Cash Advance'), async (req: AuthRequest, res: Response) => {
   try {
     const { employee_id, amount, payment_account_type, payment_account_id, notes, installment_amount, installment_count } = req.body;
     if (!employee_id || !amount || amount <= 0) return res.status(400).json({ error: 'Employee and valid amount are required' });
@@ -504,7 +564,7 @@ router.post('/cash-advances', authenticate, auditLog('HR', 'Create Cash Advance'
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.put('/cash-advances/:id/cancel', authenticate, async (req: AuthRequest, res: Response) => {
+router.put('/cash-advances/:id/cancel', authenticate, hasUserPerm('hr.cash-advances.edit'), async (req: AuthRequest, res: Response) => {
   try {
     const r = await query(`UPDATE cash_advances SET status='Cancelled', remaining_balance=0, updated_at=CURRENT_TIMESTAMP WHERE id=$1 AND status='Active' RETURNING *`, [req.params.id]);
     if (r.rows.length === 0) return res.status(404).json({ error: 'Cash advance not found or already settled' });
@@ -527,7 +587,7 @@ router.put('/cash-advances/:id/cancel', authenticate, async (req: AuthRequest, r
 });
 
 // ==================== EMPLOYEE GROCERY CREDITS (via Sales Invoices) ====================
-router.get('/grocery-credits', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/grocery-credits', authenticate, hasUserAnyPerm(['hr.employees.view', 'hr.payroll.view']), async (req: AuthRequest, res: Response) => {
   try {
     const result = await query(
       `SELECT si.id, si.invoice_number as credit_number, si.invoice_date as credit_date,
@@ -543,7 +603,7 @@ router.get('/grocery-credits', authenticate, async (req: AuthRequest, res: Respo
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.get('/grocery-credits/:id', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/grocery-credits/:id', authenticate, hasUserAnyPerm(['hr.employees.view', 'hr.payroll.view']), async (req: AuthRequest, res: Response) => {
   try {
     const header = await query(
       `SELECT si.id, si.invoice_number as credit_number, si.invoice_date as credit_date,
@@ -567,7 +627,7 @@ router.get('/grocery-credits/:id', authenticate, async (req: AuthRequest, res: R
 });
 
 // ==================== PAYROLL ====================
-router.get('/payroll', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/payroll', authenticate, hasUserPerm('hr.payroll.view'), async (req: AuthRequest, res: Response) => {
   try {
     const employee_id = req.query.employee_id as string;
     let whereClause = '';
@@ -586,76 +646,135 @@ router.get('/payroll', authenticate, async (req: AuthRequest, res: Response) => 
 router.post('/payroll', authenticate, hasUserPerm('hr.payroll.create'), auditLog('HR', 'Create Payroll'), async (req: AuthRequest, res: Response) => {
   try {
     const { employee_id, pay_period_start, pay_period_end, days_worked, other_deductions, notes } = req.body;
-    if (!employee_id || !pay_period_start || !pay_period_end) return res.status(400).json({ error: 'Employee and pay period are required' });
-
-    const emp = await query('SELECT * FROM employees WHERE id = $1', [employee_id]);
-    if (emp.rows.length === 0) return res.status(404).json({ error: 'Employee not found' });
-
-    const dailyRate = parseFloat(emp.rows[0].daily_rate);
-    const grossPay = (days_worked || 0) * dailyRate;
-
-    // Auto-compute cash advance deduction
-    // Compute cash advance deduction — respect installment caps
-    const activeCAs = await query(
-      `SELECT id, remaining_balance, installment_amount FROM cash_advances WHERE employee_id = $1 AND status = 'Active' ORDER BY advance_date ASC`,
-      [employee_id]
-    );
-    let caDeduction = 0;
-    for (const ca of activeCAs.rows) {
-      const bal = parseFloat(ca.remaining_balance);
-      const instAmt = parseFloat(ca.installment_amount || '0');
-      const cap = instAmt > 0 ? Math.min(instAmt, bal) : bal;
-      const deduct = Math.min(cap, Math.max(0, grossPay - caDeduction));
-      caDeduction += deduct;
+    if (!employee_id || !pay_period_start || !pay_period_end) {
+      return res.status(400).json({ error: 'Employee and pay period are required' });
     }
-    caDeduction = Math.min(caDeduction, grossPay);
 
-    // Auto-compute grocery credit deduction
-    const gcResult = await query(
-      `SELECT COALESCE(SUM(balance), 0) as total FROM sales_invoices
-       WHERE employee_id = $1 AND customer_type = 'Employee' AND status IN ('Posted', 'Partial')`,
-      [employee_id]
-    );
-    const gcBalance = parseFloat(gcResult.rows[0].total);
+    const existing = await findExistingPayrollForPeriod(query, Number(employee_id), pay_period_start, pay_period_end);
+    if (existing) {
+      return res.status(400).json({ error: `Employee already has payroll ${existing} for this period` });
+    }
 
-    const remainingAfterCA = grossPay - caDeduction;
-    const gcDeduction = Math.min(gcBalance, remainingAfterCA);
+    let resolvedDays = parseFloat(String(days_worked));
+    if (Number.isNaN(resolvedDays)) {
+      resolvedDays = await getAttendanceWorkedDays(query, Number(employee_id), pay_period_start, pay_period_end);
+    }
 
-    const otherTotal = (other_deductions || []).reduce((s: number, d: any) => s + parseFloat(d.amount || 0), 0);
-    const deductionsTotal = caDeduction + gcDeduction + otherTotal;
-    const netPay = Math.max(0, grossPay - deductionsTotal);
-
-    const payroll_number = await getNextCode('payroll', 'payroll_number', 'PY-', 4);
-    const id = uuidv4();
-
-    await query(
-      `INSERT INTO payroll (id, payroll_number, employee_id, pay_period_start, pay_period_end, days_worked,
-        gross_pay, cash_advance_deduction, grocery_credit_deduction, other_deductions, deductions_total, net_pay, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-      [id, payroll_number, employee_id, pay_period_start, pay_period_end, days_worked,
-       grossPay, caDeduction, gcDeduction, otherTotal, deductionsTotal, netPay, req.user!.id]
+    const result = await insertPayrollRecord(
+      query,
+      () => getNextCode('payroll', 'payroll_number', 'PY-', 4),
+      {
+        employee_id: Number(employee_id),
+        pay_period_start,
+        pay_period_end,
+        days_worked: resolvedDays,
+        other_deductions,
+        notes,
+        created_by: req.user!.id,
+      },
     );
 
-    // Insert individual deductions
-    if (caDeduction > 0) {
-      await query(`INSERT INTO payroll_deductions (id, payroll_id, deduction_type, amount) VALUES ($1,$2,'Cash Advance',$3)`, [uuidv4(), id, caDeduction]);
-    }
-    if (gcDeduction > 0) {
-      await query(`INSERT INTO payroll_deductions (id, payroll_id, deduction_type, amount) VALUES ($1,$2,'Grocery Credit',$3)`, [uuidv4(), id, gcDeduction]);
-    }
-    for (const d of other_deductions || []) {
-      await query(`INSERT INTO payroll_deductions (id, payroll_id, deduction_type, amount) VALUES ($1,$2,$3,$4)`, [uuidv4(), id, d.type, d.amount]);
+    res.status(201).json({
+      id: result.id,
+      payroll_number: result.payroll_number,
+      net_pay: result.net_pay,
+    });
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+router.post('/payroll/batch/preview', authenticate, hasUserPerm('hr.payroll.create'), async (req: AuthRequest, res: Response) => {
+  try {
+    const { pay_period_start, pay_period_end, overrides } = req.body;
+    if (!pay_period_start || !pay_period_end) {
+      return res.status(400).json({ error: 'Pay period start and end are required' });
     }
 
-    res.status(201).json({ id, payroll_number, gross_pay: grossPay, ca_deduction: caDeduction, gc_deduction: gcDeduction, net_pay: netPay });
+    const rows = await previewBatchPayroll(pay_period_start, pay_period_end, overrides || []);
+    const selectable = rows.filter((r) => r.selectable);
+    res.json({
+      pay_period_start,
+      pay_period_end,
+      rows,
+      totals: {
+        employee_count: rows.length,
+        selectable_count: selectable.length,
+        gross_pay: selectable.reduce((s, r) => s + r.gross_pay, 0),
+        net_pay: selectable.reduce((s, r) => s + r.net_pay, 0),
+      },
+    });
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+router.post('/payroll/batch', authenticate, hasUserPerm('hr.payroll.create'), auditLog('HR', 'Batch Create Payroll'), async (req: AuthRequest, res: Response) => {
+  try {
+    const { pay_period_start, pay_period_end, entries, notes } = req.body;
+    if (!pay_period_start || !pay_period_end) {
+      return res.status(400).json({ error: 'Pay period start and end are required' });
+    }
+    if (!Array.isArray(entries) || entries.length === 0) {
+      return res.status(400).json({ error: 'Select at least one employee to compute' });
+    }
+
+    const created: { employee_id: number; payroll_number: string; net_pay: number }[] = [];
+    const skipped: { employee_id: number; reason: string }[] = [];
+
+    for (const entry of entries) {
+      const employeeId = Number(entry.employee_id);
+      if (!employeeId) continue;
+
+      const existing = await findExistingPayrollForPeriod(query, employeeId, pay_period_start, pay_period_end);
+      if (existing) {
+        skipped.push({ employee_id: employeeId, reason: `Already has payroll ${existing}` });
+        continue;
+      }
+
+      const daysWorked = Math.max(0, parseFloat(String(entry.days_worked)) || 0);
+      if (daysWorked <= 0) {
+        skipped.push({ employee_id: employeeId, reason: 'Days worked must be greater than zero' });
+        continue;
+      }
+
+      const result = await insertPayrollRecord(
+        query,
+        () => getNextCode('payroll', 'payroll_number', 'PY-', 4),
+        {
+          employee_id: employeeId,
+          pay_period_start,
+          pay_period_end,
+          days_worked: daysWorked,
+          notes,
+          created_by: req.user!.id,
+        },
+      );
+      created.push({ employee_id: employeeId, payroll_number: result.payroll_number, net_pay: result.net_pay });
+    }
+
+    if (created.length === 0) {
+      return res.status(400).json({ error: 'No payroll records were created', skipped });
+    }
+
+    res.status(201).json({ created: created.length, skipped: skipped.length, records: created, skipped_details: skipped });
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
 router.put('/payroll/:id/approve', authenticate, hasUserPerm('hr.payroll.approve'), async (req: AuthRequest, res: Response) => {
+  const client = await getClient();
   try {
-    const p = await query(`SELECT p.*, e.employee_code FROM payroll p JOIN employees e ON p.employee_id = e.id WHERE p.id=$1`, [req.params.id]);
-    if (p.rows.length === 0) return res.status(404).json({ error: 'Not found' });
-    if (p.rows[0].status !== 'Draft') return res.status(400).json({ error: 'Only draft payroll can be approved' });
+    await client.query('BEGIN');
+    const q: QueryFn = (text, params) => client.query(text, params);
+
+    const p = await q(
+      `SELECT p.*, e.employee_code FROM payroll p JOIN employees e ON p.employee_id = e.id WHERE p.id = $1::uuid FOR UPDATE`,
+      [req.params.id],
+    );
+    if (p.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Not found' });
+    }
+    if (p.rows[0].status !== 'Draft') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Only draft payroll can be approved' });
+    }
 
     const payroll = p.rows[0];
     const grossPay = parseFloat(payroll.gross_pay);
@@ -663,10 +782,17 @@ router.put('/payroll/:id/approve', authenticate, hasUserPerm('hr.payroll.approve
     const gcDed = parseFloat(payroll.grocery_credit_deduction || 0);
     const netPay = parseFloat(payroll.net_pay);
 
-    if (grossPay <= 0) return res.status(400).json({ error: 'Gross pay must be greater than zero' });
+    if (grossPay <= 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Gross pay must be greater than zero' });
+    }
 
-    // Accounting entry
-    const jeNumber = await getNextCode('journal_entries', 'entry_number', 'JE-', 4);
+    const existingAlloc = await countPayrollAllocations(q, req.params.id);
+    if (existingAlloc > 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Payroll deductions already allocated' });
+    }
+
     const lines: { accountCode: string; description: string; debit: number; credit: number }[] = [
       { accountCode: '6000', description: `Salaries - ${payroll.payroll_number}`, debit: grossPay, credit: 0 },
       { accountCode: '2300', description: `Payroll Payable - ${payroll.payroll_number}`, debit: 0, credit: netPay },
@@ -674,61 +800,33 @@ router.put('/payroll/:id/approve', authenticate, hasUserPerm('hr.payroll.approve
 
     if (caDed > 0) {
       lines.push({ accountCode: '1110', description: `CA deduction - ${payroll.payroll_number}`, debit: 0, credit: caDed });
-      // Deduct from cash advances in FIFO order (oldest first)
-      let remaining = caDed;
-      const activeCAs = await query(
-        `SELECT * FROM cash_advances WHERE employee_id = $1 AND status = 'Active' ORDER BY advance_date ASC`,
-        [payroll.employee_id]
-      );
-      for (const ca of activeCAs.rows) {
-        if (remaining <= 0) break;
-        const caBal = parseFloat(ca.remaining_balance);
-        const deduct = Math.min(caBal, remaining);
-        const newBal = caBal - deduct;
-        await query(
-          `UPDATE cash_advances SET remaining_balance = $1, status = CASE WHEN $1 <= 0::numeric THEN 'Fully Paid' ELSE 'Active' END, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
-          [newBal, ca.id]
-        );
-        remaining -= deduct;
-      }
+      await applyCashAdvanceDeductions(q, req.params.id, payroll.employee_id, caDed);
     }
 
     if (gcDed > 0) {
       lines.push({ accountCode: '1120', description: `GC deduction - ${payroll.payroll_number}`, debit: 0, credit: gcDed });
-      // Deduct from employee sales invoices in FIFO order (oldest first)
-      let remaining = gcDed;
-      const invoices = await query(
-        `SELECT * FROM sales_invoices WHERE employee_id = $1 AND customer_type = 'Employee' AND status IN ('Posted', 'Partial')
-         ORDER BY invoice_date ASC`,
-        [payroll.employee_id]
-      );
-      for (const inv of invoices.rows) {
-        if (remaining <= 0) break;
-        const invBal = parseFloat(inv.balance);
-        const total = parseFloat(inv.total);
-        const deduct = Math.min(invBal, remaining);
-        const newBalance = invBal - deduct;
-        const newPaid = (parseFloat(inv.amount_paid) || 0) + deduct;
-        const newStatus = newBalance <= 0 ? 'Deducted' : 'Partial';
-        await query(
-          `UPDATE sales_invoices SET balance = $1, amount_paid = $2, status = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4`,
-          [newBalance, newPaid, newStatus, inv.id]
-        );
-        remaining -= deduct;
-      }
+      await applyGroceryCreditDeductions(q, req.params.id, payroll.employee_id, gcDed);
     }
 
-    await createJournalEntry(jeNumber, new Date(), 'Payroll', req.params.id, `Payroll ${payroll.payroll_number}`,
-      lines, req.user!.id
+    const jeNumber = await getNextCodeTx(q, 'journal_entries', 'entry_number', 'JE-', 4);
+    await createJournalEntryTx(
+      q, jeNumber, new Date(), 'Payroll', req.params.id, `Payroll ${payroll.payroll_number}`, lines, req.user!.id,
     );
 
-    await query(`UPDATE payroll SET status='Posted', updated_at=CURRENT_TIMESTAMP WHERE id=$1`, [req.params.id]);
+    await q(`UPDATE payroll SET status = 'Posted', updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid`, [req.params.id]);
+
+    await client.query('COMMIT');
     await updateEmployeeBalances(payroll.employee_id);
     res.json({ message: 'Payroll approved' });
-  } catch (error: any) { res.status(500).json({ error: error.message }); }
+  } catch (error: any) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
 });
 
-router.put('/payroll/:id/pay', authenticate, async (req: AuthRequest, res: Response) => {
+router.put('/payroll/:id/pay', authenticate, hasUserPerm('hr.payroll.approve'), async (req: AuthRequest, res: Response) => {
   try {
     const { payment_account_type, payment_account_id, payment_date, reference_number } = req.body;
     if (!payment_account_type) return res.status(400).json({ error: 'Payment account type is required' });
@@ -767,100 +865,69 @@ router.put('/payroll/:id/pay', authenticate, async (req: AuthRequest, res: Respo
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.put('/payroll/:id/cancel', authenticate, async (req: AuthRequest, res: Response) => {
+router.put('/payroll/:id/cancel', authenticate, hasUserPerm('hr.payroll.edit'), async (req: AuthRequest, res: Response) => {
+  const client = await getClient();
   try {
-    const p = await query(`SELECT * FROM payroll WHERE id=$1`, [req.params.id]);
-    if (p.rows.length === 0) return res.status(404).json({ error: 'Not found' });
-    if (p.rows[0].status === 'Paid') return res.status(400).json({ error: 'Cannot cancel paid payroll' });
+    await client.query('BEGIN');
+    const q: QueryFn = (text, params) => client.query(text, params);
+
+    const p = await q(`SELECT * FROM payroll WHERE id = $1 FOR UPDATE`, [req.params.id]);
+    if (p.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Not found' });
+    }
+    if (p.rows[0].status === 'Paid') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Cannot cancel paid payroll' });
+    }
 
     if (p.rows[0].status === 'Posted') {
-      // Reverse accounting
       const grossPay = parseFloat(p.rows[0].gross_pay);
       const caDed = parseFloat(p.rows[0].cash_advance_deduction || 0);
       const gcDed = parseFloat(p.rows[0].grocery_credit_deduction || 0);
       const netPay = parseFloat(p.rows[0].net_pay);
+      const hasDeductions = caDed > 0 || gcDed > 0;
+      const allocCount = await countPayrollAllocations(q, req.params.id);
 
-      const jeNumber = await getNextCode('journal_entries', 'entry_number', 'JE-', 4);
+      if (hasDeductions && allocCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          error: 'Cannot cancel: this payroll has CA/GC deductions but no allocation records (legacy approve). Re-post or adjust balances manually.',
+        });
+      }
+
+      const jeNumber = await getNextCodeTx(q, 'journal_entries', 'entry_number', 'JE-', 4);
       const lines: { accountCode: string; description: string; debit: number; credit: number }[] = [
-        { accountCode: '2300', description: `Reverse Payroll Payable`, debit: netPay, credit: 0 },
-        { accountCode: '6000', description: `Reverse Salaries`, debit: 0, credit: grossPay },
+        { accountCode: '2300', description: 'Reverse Payroll Payable', debit: netPay, credit: 0 },
+        { accountCode: '6000', description: 'Reverse Salaries', debit: 0, credit: grossPay },
       ];
       if (caDed > 0) lines.push({ accountCode: '1110', description: 'Reverse CA deduction', debit: caDed, credit: 0 });
       if (gcDed > 0) lines.push({ accountCode: '1120', description: 'Reverse GC deduction', debit: gcDed, credit: 0 });
 
-      await createJournalEntry(jeNumber, new Date(), 'Payroll Cancel', req.params.id, `Cancel ${p.rows[0].payroll_number}`,
-        lines, req.user!.id
+      await createJournalEntryTx(
+        q, jeNumber, new Date(), 'Payroll Cancel', req.params.id, `Cancel ${p.rows[0].payroll_number}`, lines, req.user!.id,
       );
 
-      // Restore cash advance balances by reversing deductions
-      const deductions = await query(`SELECT * FROM payroll_deductions WHERE payroll_id = $1`, [req.params.id]);
-      for (const d of deductions.rows) {
-        if (d.deduction_type === 'Cash Advance') {
-          // Restore to most recently deducted CAs first (reverse-FIFO)
-          let remaining = parseFloat(d.amount);
-          const activeCAs = await query(
-            `SELECT * FROM cash_advances WHERE employee_id = $1 AND status = 'Fully Paid' ORDER BY advance_date DESC`,
-            [p.rows[0].employee_id]
-          );
-          for (const ca of activeCAs.rows) {
-            if (remaining <= 0) break;
-            const caOriginal = parseFloat(ca.amount);
-            const caDeducted = await query(
-              `SELECT COALESCE(SUM(pd.amount), 0) as total FROM payroll_deductions pd
-               JOIN payroll pr ON pd.payroll_id = pr.id
-               WHERE pd.deduction_type = 'Cash Advance' AND pr.employee_id = $2 AND pr.id != $3 AND pr.status != 'Cancelled'`,
-              [ca.id, p.rows[0].employee_id, req.params.id]
-            );
-            const alreadyDeducted = parseFloat(caDeducted.rows[0].total);
-            const caBal = caOriginal - alreadyDeducted;
-            const restore = Math.min(caBal, remaining);
-            const newBal = caBal - restore + parseFloat(d.amount); // careful: this is restoring
-            await query(
-              `UPDATE cash_advances SET remaining_balance = $1, status = CASE WHEN $1 > 0::numeric THEN 'Active' ELSE 'Fully Paid' END, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
-              [Math.min(caOriginal, caOriginal - alreadyDeducted + parseFloat(d.amount)), ca.id]
-            );
-            remaining -= restore;
-          }
-        }
-        if (d.deduction_type === 'Grocery Credit') {
-          let remaining = parseFloat(d.amount);
-          const invoices = await query(
-            `SELECT * FROM sales_invoices WHERE employee_id = $1 AND customer_type = 'Employee' AND status = 'Deducted'
-             ORDER BY invoice_date DESC`,
-            [p.rows[0].employee_id]
-          );
-          for (const inv of invoices.rows) {
-            if (remaining <= 0) break;
-            const total = parseFloat(inv.total);
-            const otherDeductions = await query(
-              `SELECT COALESCE(SUM(pd.amount), 0) as total FROM payroll_deductions pd
-               JOIN payroll pr ON pd.payroll_id = pr.id
-               WHERE pd.deduction_type = 'Grocery Credit' AND pr.employee_id = $2 AND pr.id != $3 AND pr.status != 'Cancelled'`,
-              [inv.id, p.rows[0].employee_id, req.params.id]
-            );
-            const alreadyDeducted = parseFloat(otherDeductions.rows[0].total);
-            const restore = Math.min(total - alreadyDeducted, remaining);
-            const newPaid = parseFloat(inv.amount_paid) - restore;
-            const newBal = total - newPaid;
-            const newStatus = newBal <= 0 ? 'Deducted' : newPaid > 0 ? 'Partial' : 'Posted';
-            await query(
-              `UPDATE sales_invoices SET balance = $1, amount_paid = $2, status = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4`,
-              [newBal, newPaid, newStatus, inv.id]
-            );
-            remaining -= restore;
-          }
-        }
+      if (allocCount > 0) {
+        await restorePayrollDeductionAllocations(q, req.params.id);
       }
     }
 
-    await query(`UPDATE payroll SET status='Cancelled', updated_at=CURRENT_TIMESTAMP WHERE id=$1`, [req.params.id]);
+    await q(`UPDATE payroll SET status = 'Cancelled', updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [req.params.id]);
+
+    await client.query('COMMIT');
     await updateEmployeeBalances(p.rows[0].employee_id);
     res.json({ message: 'Payroll cancelled' });
-  } catch (error: any) { res.status(500).json({ error: error.message }); }
+  } catch (error: any) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
 });
 
 // ==================== PAYSLIP ====================
-router.get('/payslip/:id', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/payslip/:id', authenticate, hasUserAnyPerm(['hr.payslip.view', 'hr.payroll.view']), async (req: AuthRequest, res: Response) => {
   try {
     const { id } = req.params;
 
@@ -894,9 +961,12 @@ router.get('/payslip/:id', authenticate, async (req: AuthRequest, res: Response)
       totalAttendanceDays += row.count;
     }
 
+    const deductionsTotal = deductionsResult.rows.reduce((s: number, d: any) => s + parseFloat(d.amount || 0), 0);
+
     res.json({
       ...payroll,
       deductions: deductionsResult.rows,
+      deductions_total: deductionsTotal,
       attendance: {
         summary: attendanceSummary,
         total_days: totalAttendanceDays,
@@ -915,7 +985,7 @@ router.get('/payslip/:id', authenticate, async (req: AuthRequest, res: Response)
 });
 
 // ==================== SSS CONTRIBUTIONS ====================
-router.get('/sss-contributions', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/sss-contributions', authenticate, hasUserPerm('hr.payroll.view'), async (req: AuthRequest, res: Response) => {
   try {
     const result = await query(
       `SELECT sc.*, e.first_name, e.last_name, e.employee_code
@@ -927,7 +997,7 @@ router.get('/sss-contributions', authenticate, async (req: AuthRequest, res: Res
 });
 
 // Auto-generate SSS contributions for all employees with a default amount
-router.post('/sss-contributions/generate', authenticate, async (req: AuthRequest, res: Response) => {
+router.post('/sss-contributions/generate', authenticate, hasUserPerm('hr.payroll.create'), async (req: AuthRequest, res: Response) => {
   try {
     const periodStart = req.body.period_start || new Date().toISOString().slice(0, 7) + '-01';
     const periodEnd = req.body.period_end || new Date().toISOString().slice(0, 7) + '-' + new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0).getDate();
@@ -952,7 +1022,7 @@ router.post('/sss-contributions/generate', authenticate, async (req: AuthRequest
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.post('/sss-contributions', authenticate, auditLog('HR', 'Create SSS Contribution'), async (req: AuthRequest, res: Response) => {
+router.post('/sss-contributions', authenticate, hasUserPerm('hr.payroll.create'), auditLog('HR', 'Create SSS Contribution'), async (req: AuthRequest, res: Response) => {
   try {
     const { employee_id, period_start, period_end, employer_amount, employee_amount, notes } = req.body;
     if (!employee_id || !period_start || !period_end) return res.status(400).json({ error: 'Employee and period are required' });
@@ -973,7 +1043,7 @@ router.post('/sss-contributions', authenticate, auditLog('HR', 'Create SSS Contr
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.put('/sss-contributions/:id/approve', authenticate, async (req: AuthRequest, res: Response) => {
+router.put('/sss-contributions/:id/approve', authenticate, hasUserPerm('hr.payroll.approve'), async (req: AuthRequest, res: Response) => {
   try {
     const sc = await query(`SELECT * FROM sss_contributions WHERE id=$1`, [req.params.id]);
     if (sc.rows.length === 0) return res.status(404).json({ error: 'Not found' });
@@ -995,7 +1065,7 @@ router.put('/sss-contributions/:id/approve', authenticate, async (req: AuthReque
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.put('/sss-contributions/:id/pay', authenticate, async (req: AuthRequest, res: Response) => {
+router.put('/sss-contributions/:id/pay', authenticate, hasUserPerm('hr.payroll.edit'), async (req: AuthRequest, res: Response) => {
   try {
     const { payment_account_type } = req.body;
     const sc = await query(`SELECT * FROM sss_contributions WHERE id=$1`, [req.params.id]);
@@ -1028,7 +1098,7 @@ router.put('/sss-contributions/:id/pay', authenticate, async (req: AuthRequest, 
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.put('/sss-contributions/:id/cancel', authenticate, async (req: AuthRequest, res: Response) => {
+router.put('/sss-contributions/:id/cancel', authenticate, hasUserPerm('hr.payroll.edit'), async (req: AuthRequest, res: Response) => {
   try {
     const sc = await query(`SELECT * FROM sss_contributions WHERE id=$1`, [req.params.id]);
     if (sc.rows.length === 0) return res.status(404).json({ error: 'Not found' });
@@ -1039,13 +1109,225 @@ router.put('/sss-contributions/:id/cancel', authenticate, async (req: AuthReques
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-// Print payroll
-router.get('/payroll/:id/print', async (req: AuthRequest, res: Response) => {
+// Print SSS contributions register (all records for a period)
+router.get('/sss-contributions/register/print', authenticate, hasUserAnyPerm(['hr.payroll.print', 'hr.payslip.print']), async (req: AuthRequest, res: Response) => {
   try {
-    const token = req.query.token as string || (req.headers.authorization || '').replace('Bearer ', '');
-    if (!token) return res.status(401).json({ error: 'Auth required' });
-    try { jwt.verify(token, config.jwtSecret); } catch { return res.status(401).json({ error: 'Invalid token' }); }
+    const from = (req.query.from as string) || new Date().toISOString().slice(0, 7) + '-01';
+    const to = (req.query.to as string) || new Date().toISOString().slice(0, 10);
 
+    const r = await query(
+      `SELECT sc.*, e.first_name, e.last_name, e.employee_code, e.department, e.sss AS employee_sss_no
+       FROM sss_contributions sc
+       JOIN employees e ON sc.employee_id = e.id
+       WHERE sc.period_start <= $2::date AND sc.period_end >= $1::date
+         AND sc.status != 'Cancelled'
+       ORDER BY e.last_name, e.first_name, sc.contribution_number`,
+      [from, to],
+    );
+
+    const biz = await query('SELECT * FROM business_details WHERE id = 1');
+    const b = biz.rows[0] || {};
+
+    let totEmployer = 0;
+    let totEmployee = 0;
+    let totAmount = 0;
+
+    const tableRows = r.rows.map((row: any) => {
+      const employer = parseFloat(row.employer_amount) || 0;
+      const employee = parseFloat(row.employee_amount) || 0;
+      const total = parseFloat(row.total_amount) || employer + employee;
+      totEmployer += employer;
+      totEmployee += employee;
+      totAmount += total;
+      const period = `${fmtDate(row.period_start, 'short')} – ${fmtDate(row.period_end, 'short')}`;
+      return tableRow([
+        { html: row.employee_code || '—' },
+        { html: `<strong>${row.last_name}, ${row.first_name}</strong><br><span style="font-size:9px;color:#666">${row.employee_sss_no || row.department || ''}</span>` },
+        { html: row.contribution_number, align: 'c' },
+        { html: period, align: 'c' },
+        { html: fmtCurrency(employer), align: 'r' },
+        { html: employee > 0 ? fmtCurrency(employee) : '—', align: 'r' },
+        { html: `<strong>${fmtCurrency(total)}</strong>`, align: 'r' },
+        { html: row.status, align: 'c' },
+      ]);
+    }).join('');
+
+    const totalsRow = tableRow([
+      { html: `<strong>TOTALS (${r.rows.length} record(s))</strong>`, align: 'r' },
+      { html: '' },
+      { html: '' },
+      { html: '' },
+      { html: `<strong>${fmtCurrency(totEmployer)}</strong>`, align: 'r' },
+      { html: `<strong>${fmtCurrency(totEmployee)}</strong>`, align: 'r' },
+      { html: `<strong>${fmtCurrency(totAmount)}</strong>`, align: 'r' },
+      { html: '' },
+    ]);
+
+    const periodLabel = `${fmtDate(from, 'short')} — ${fmtDate(to, 'short')}`;
+
+    res.send(buildSalesEnterpriseDocument({
+      pageTitle: `SSS Register ${periodLabel}`,
+      docTitle: 'SSS Contributions Register',
+      docMetaRows: [
+        { label: 'Period From', value: fmtDate(from, 'short') },
+        { label: 'Period To', value: fmtDate(to, 'short') },
+        { label: 'Records', value: String(r.rows.length) },
+        { label: 'Total Amount', value: fmtCurrency(totAmount) },
+      ],
+      partySectionTitle: 'Register Information',
+      customerRows: [{ label: 'Contribution Period Overlap', value: periodLabel }],
+      detailsRows: [
+        { label: 'Employer Share Total', value: fmtCurrency(totEmployer) },
+        { label: 'Employee Share Total', value: fmtCurrency(totEmployee) },
+      ],
+      itemHeaders: [
+        { text: 'Code', align: 'left', width: '52px' },
+        { text: 'Employee', align: 'left' },
+        { text: 'Ref #', align: 'center', width: '72px' },
+        { text: 'Period', align: 'center', width: '88px' },
+        { text: 'Employer', align: 'right', width: '76px' },
+        { text: 'Employee', align: 'right', width: '76px' },
+        { text: 'Total', align: 'right', width: '76px' },
+        { text: 'Status', align: 'center', width: '56px' },
+      ],
+      itemRows: tableRows + totalsRow,
+      summaryRows: [
+        { label: 'Total Employer Share', value: fmtCurrency(totEmployer) },
+        { label: 'Total Employee Share', value: fmtCurrency(totEmployee) },
+        { label: 'GRAND TOTAL', value: fmtCurrency(totAmount), total: true },
+      ],
+      amountInWords: totAmount,
+      footerNote: 'SSS contributions register · Excludes cancelled records',
+      biz: b,
+      signatures: buildEnterpriseSignatures(b),
+      signatureCols: 3,
+      landscape: true,
+    }));
+  } catch (error: any) { res.status(500).send('<p>Error: ' + error.message + '</p>'); }
+});
+
+// Print payroll register (all employees for a pay period)
+router.get('/payroll/register/print', authenticate, hasUserAnyPerm(['hr.payroll.print', 'hr.payslip.print']), async (req: AuthRequest, res: Response) => {
+  try {
+    const from = (req.query.from as string) || new Date().toISOString().slice(0, 7) + '-01';
+    const to = (req.query.to as string) || new Date().toISOString().slice(0, 10);
+    const statusFilter = (req.query.status as string) || '';
+
+    const params: any[] = [from, to];
+    let statusClause = ` AND p.status != 'Cancelled'`;
+    if (statusFilter) {
+      const statuses = statusFilter.split(',').map((s) => s.trim()).filter(Boolean);
+      if (statuses.length > 0) {
+        statusClause = ` AND p.status = ANY($3)`;
+        params.push(statuses);
+      }
+    }
+
+    const r = await query(
+      `SELECT p.*, e.first_name, e.last_name, e.employee_code, e.department, e.position
+       FROM payroll p
+       JOIN employees e ON p.employee_id = e.id
+       WHERE p.pay_period_start <= $2 AND p.pay_period_end >= $1
+       ${statusClause}
+       ORDER BY e.last_name, e.first_name, p.payroll_number`,
+      params,
+    );
+
+    const biz = await query('SELECT * FROM business_details WHERE id = 1');
+    const b = biz.rows[0] || {};
+
+    let totGross = 0;
+    let totCa = 0;
+    let totGc = 0;
+    let totOther = 0;
+    let totNet = 0;
+    let totDays = 0;
+
+    const tableRows = r.rows.map((row: any) => {
+      const gross = parseFloat(row.gross_pay) || 0;
+      const ca = parseFloat(row.cash_advance_deduction) || 0;
+      const gc = parseFloat(row.grocery_credit_deduction) || 0;
+      const other = parseFloat(row.other_deductions) || 0;
+      const net = parseFloat(row.net_pay) || 0;
+      const days = parseInt(row.days_worked, 10) || 0;
+      totGross += gross;
+      totCa += ca;
+      totGc += gc;
+      totOther += other;
+      totNet += net;
+      totDays += days;
+      const period = `${fmtDate(row.pay_period_start, 'short')} – ${fmtDate(row.pay_period_end, 'short')}`;
+      return tableRow([
+        { html: row.employee_code || '—' },
+        { html: `<strong>${row.last_name}, ${row.first_name}</strong><br><span style="font-size:9px;color:#666">${row.department || ''}</span>` },
+        { html: row.payroll_number, align: 'c' },
+        { html: period, align: 'c' },
+        { html: String(days), align: 'c' },
+        { html: fmtCurrency(gross), align: 'r' },
+        { html: ca > 0 ? fmtCurrency(ca) : '—', align: 'r' },
+        { html: gc > 0 ? fmtCurrency(gc) : '—', align: 'r' },
+        { html: other > 0 ? fmtCurrency(other) : '—', align: 'r' },
+        { html: `<strong>${fmtCurrency(net)}</strong>`, align: 'r' },
+        { html: row.status, align: 'c' },
+      ]);
+    }).join('');
+
+    const totalsRow = tableRow([
+      { html: `<strong>TOTALS (${r.rows.length} employee(s))</strong>`, align: 'r' },
+      { html: '' },
+      { html: '' },
+      { html: '' },
+      { html: `<strong>${totDays}</strong>`, align: 'c' },
+      { html: `<strong>${fmtCurrency(totGross)}</strong>`, align: 'r' },
+      { html: `<strong>${fmtCurrency(totCa)}</strong>`, align: 'r' },
+      { html: `<strong>${fmtCurrency(totGc)}</strong>`, align: 'r' },
+      { html: `<strong>${fmtCurrency(totOther)}</strong>`, align: 'r' },
+      { html: `<strong>${fmtCurrency(totNet)}</strong>`, align: 'r' },
+      { html: '' },
+    ]);
+
+    const periodLabel = `${fmtDate(from, 'short')} — ${fmtDate(to, 'short')}`;
+
+    res.send(buildSalesEnterpriseDocument({
+      pageTitle: `Payroll Register ${periodLabel}`,
+      docTitle: 'Payroll Register',
+      docMetaRows: [
+        { label: 'Period From', value: fmtDate(from, 'short') },
+        { label: 'Period To', value: fmtDate(to, 'short') },
+        { label: 'Records', value: String(r.rows.length) },
+        { label: 'Total Net Pay', value: fmtCurrency(totNet) },
+      ],
+      partySectionTitle: 'Register Information',
+      customerRows: [{ label: 'Pay Period Overlap', value: periodLabel }],
+      detailsRows: [{ label: 'Employees', value: String(r.rows.length) }],
+      itemHeaders: [
+        { text: 'Code', align: 'left', width: '52px' },
+        { text: 'Employee', align: 'left' },
+        { text: 'Ref #', align: 'center', width: '64px' },
+        { text: 'Period', align: 'center', width: '88px' },
+        { text: 'Days', align: 'center', width: '40px' },
+        { text: 'Gross', align: 'right', width: '72px' },
+        { text: 'CA Ded.', align: 'right', width: '64px' },
+        { text: 'GC Ded.', align: 'right', width: '64px' },
+        { text: 'Other', align: 'right', width: '64px' },
+        { text: 'Net Pay', align: 'right', width: '76px' },
+        { text: 'Status', align: 'center', width: '56px' },
+      ],
+      itemRows: tableRows + totalsRow,
+      summaryRows: [{ label: 'TOTAL NET PAY', value: fmtCurrency(totNet), total: true }],
+      amountInWords: totNet,
+      footerNote: 'Payroll register · Excludes cancelled records unless filtered',
+      biz: b,
+      signatures: buildEnterpriseSignatures(b),
+      signatureCols: 3,
+      landscape: true,
+    }));
+  } catch (error: any) { res.status(500).send('<p>Error: ' + error.message + '</p>'); }
+});
+
+// Print payroll
+router.get('/payroll/:id/print', authenticate, hasUserAnyPerm(['hr.payroll.print', 'hr.payslip.print']), async (req: AuthRequest, res: Response) => {
+  try {
     const r = await query(
       `SELECT p.*, e.first_name, e.last_name, e.employee_code, e.department, e.position,
               e.daily_rate, e.monthly_rate, e.cash_advance_balance, e.grocery_credit_balance AS grocery_balance,
@@ -1061,7 +1343,6 @@ router.get('/payroll/:id/print', async (req: AuthRequest, res: Response) => {
 
     const biz = await query('SELECT * FROM business_details WHERE id = 1');
     const b = biz.rows[0] || {};
-    const bizName = b.business_name || 'D METRAN TRADING';
 
     const gross = parseFloat(d.gross_pay) || 0;
     const ssS = parseFloat(d.sss_contribution) || 0;
@@ -1073,88 +1354,65 @@ router.get('/payroll/:id/print', async (req: AuthRequest, res: Response) => {
     const totalDed = ssS + philH + pagIbig + ca + gc + otherDed;
     const net = parseFloat(d.net_pay) || 0;
 
-    const fc = (v: number) => v.toLocaleString('en-PH', {minimumFractionDigits:2});
+    const periodSubtitle = `${fmtDate(d.pay_period_start, 'short')} — ${fmtDate(d.pay_period_end, 'short')}`;
 
-    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Payslip ${d.payroll_number}</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:Arial,Helvetica,sans-serif;font-size:10px;color:#1a1a1a;padding:6mm 8mm;max-width:210mm;margin:0 auto}
-.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;padding-bottom:8px;border-bottom:2px solid #1e3a5f}
-.header h1{font-size:16px;color:#1e3a5f;margin:0}
-.header .doc-num{font-size:11px;font-weight:bold;color:#1e3a5f;text-align:right}
-.doc-title{text-align:center;margin:8px 0;font-size:14px;font-weight:bold;color:#1e3a5f}
-.info-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px 16px;margin:8px 0;padding:8px;border:1px solid #dde1e6;border-radius:6px;background:#f8f9fa}
-.info-grid .lbl{font-size:7px;color:#5f6368;text-transform:uppercase}
-.info-grid .val{font-size:9px;font-weight:600}
-.items-table{width:100%;border-collapse:collapse;margin:8px 0;font-size:8px}
-.items-table th{background:#1e3a5f;color:#fff;padding:5px 8px;text-align:left;font-size:7px;text-transform:uppercase}
-.items-table td{padding:5px 8px;border-bottom:1px solid #e8eaed}
-.items-table td:last-child{text-align:right;font-weight:600}
-.summary{display:flex;justify-content:flex-end;margin:8px 0}
-.summary-table{border-collapse:collapse;font-size:9px;width:260px}
-.summary-table td{padding:3px 8px}
-.summary-table td:last-child{text-align:right;font-weight:600}
-.summary-table .grand{border-top:2px solid #1e3a5f;font-size:13px;font-weight:bold;color:#1e3a5f}
-.signatures{display:flex;justify-content:space-between;margin-top:24px;gap:10px}
-.sig-block{text-align:center;flex:1}
-.sig-block .sig-line{border-bottom:1px solid #1e3a5f;height:30px;margin-bottom:3px}
-.sig-block .sig-label{font-size:7px;color:#5f6368;font-weight:600}
-.footer{text-align:center;font-size:6px;color:#999;margin-top:12px;border-top:1px solid #e8eaed;padding-top:6px}
-@media print{body{padding:4mm 6mm}}
-</style></head><body>
-<div class="header">
-<div><h1>${bizName}</h1><div style="font-size:7px;color:#666">Payroll / Payslip</div></div>
-<div class="doc-num">${d.payroll_number}<br><div style="font-size:8px;font-weight:normal;color:#5f6368">${new Date(d.pay_period_start).toLocaleDateString('en-PH')} - ${new Date(d.pay_period_end).toLocaleDateString('en-PH')}</div></div>
-</div>
-<div class="doc-title">PAYSLIP / PAYROLL</div>
-<div class="info-grid">
-<div><span class="lbl">Employee</span><br><span class="val">${d.last_name}, ${d.first_name}</span></div>
-<div><span class="lbl">Code</span><br><span class="val">${d.employee_code || '—'}</span></div>
-<div><span class="lbl">Status</span><br><span class="val">${d.status}</span></div>
-<div><span class="lbl">Department</span><br><span class="val">${d.department || '—'}</span></div>
-<div><span class="lbl">Position</span><br><span class="val">${d.position || '—'}</span></div>
-<div><span class="lbl">Days Worked</span><br><span class="val">${d.days_worked || 0}</span></div>
-<div><span class="lbl">Daily Rate</span><br><span class="val">₱${fc(d.daily_rate || 0)}</span></div>
-<div><span class="lbl">Monthly Rate</span><br><span class="val">₱${fc(d.monthly_rate || 0)}</span></div>
-<div><span class="lbl">Gross Pay</span><br><span class="val">₱${fc(gross)}</span></div>
-</div>
-<table class="items-table">
-<thead><tr><th>Description</th><th style="text-align:center">Type</th><th style="text-align:right">Amount</th></tr></thead>
-<tbody>
-<tr><td>Gross Pay</td><td style="text-align:center">Earnings</td><td>₱${fc(gross)}</td></tr>
-${ssS > 0 ? '<tr><td>SSS Contribution</td><td style="text-align:center">Deduction</td><td>₱' + fc(ssS) + '</td></tr>' : ''}
-${philH > 0 ? '<tr><td>PhilHealth Contribution</td><td style="text-align:center">Deduction</td><td>₱' + fc(philH) + '</td></tr>' : ''}
-${pagIbig > 0 ? '<tr><td>Pag-IBIG Contribution</td><td style="text-align:center">Deduction</td><td>₱' + fc(pagIbig) + '</td></tr>' : ''}
-${ca > 0 ? '<tr><td>Cash Advance Deduction</td><td style="text-align:center">Deduction</td><td>₱' + fc(ca) + '</td></tr>' : ''}
-${gc > 0 ? '<tr><td>Grocery Credit Deduction</td><td style="text-align:center">Deduction</td><td>₱' + fc(gc) + '</td></tr>' : ''}
-${otherDed > 0 ? '<tr><td>Other Deductions</td><td style="text-align:center">Deduction</td><td>₱' + fc(otherDed) + '</td></tr>' : ''}
-</tbody>
-</table>
-<div class="summary">
-<table class="summary-table">
-<tr><td>Gross Pay:</td><td>₱${fc(gross)}</td></tr>
-<tr><td>Total Deductions:</td><td>₱${fc(totalDed)}</td></tr>
-<tr class="grand"><td>Net Pay:</td><td>₱${fc(net)}</td></tr>
-</table>
-</div>
-<div class="signatures">
-<div class="sig-block"><div class="sig-line"></div><div class="sig-label">Prepared by</div></div>
-<div class="sig-block"><div class="sig-line"></div><div class="sig-label">Approved by</div></div>
-<div class="sig-block"><div class="sig-line"></div><div class="sig-label">Received by</div></div>
-</div>
-<div class="footer">Printed: ${new Date().toLocaleString('en-PH')} | Computer-generated payslip</div>
-</body></html>`;
-    res.send(html);
+    const payRows = [
+      tableRow([{ html: 'Gross Pay' }, { html: 'Earnings', align: 'c' }, { html: fmtCurrency(gross), align: 'r' }]),
+      ...(ssS > 0 ? [tableRow([{ html: 'SSS Contribution' }, { html: 'Deduction', align: 'c' }, { html: fmtCurrency(ssS), align: 'r' }])] : []),
+      ...(philH > 0 ? [tableRow([{ html: 'PhilHealth Contribution' }, { html: 'Deduction', align: 'c' }, { html: fmtCurrency(philH), align: 'r' }])] : []),
+      ...(pagIbig > 0 ? [tableRow([{ html: 'Pag-IBIG Contribution' }, { html: 'Deduction', align: 'c' }, { html: fmtCurrency(pagIbig), align: 'r' }])] : []),
+      ...(ca > 0 ? [tableRow([{ html: 'Cash Advance Deduction' }, { html: 'Deduction', align: 'c' }, { html: fmtCurrency(ca), align: 'r' }])] : []),
+      ...(gc > 0 ? [tableRow([{ html: 'Grocery Credit Deduction' }, { html: 'Deduction', align: 'c' }, { html: fmtCurrency(gc), align: 'r' }])] : []),
+      ...(otherDed > 0 ? [tableRow([{ html: 'Other Deductions' }, { html: 'Deduction', align: 'c' }, { html: fmtCurrency(otherDed), align: 'r' }])] : []),
+    ].join('');
+
+    res.send(buildSalesEnterpriseDocument({
+      pageTitle: `Payslip ${d.payroll_number}`,
+      docTitle: 'Payslip',
+      docMetaRows: [
+        { label: 'Payroll No.', value: d.payroll_number || '—' },
+        { label: 'Pay Period', value: periodSubtitle },
+        { label: 'Days Worked', value: String(d.days_worked || 0) },
+        { label: 'Status', value: String(d.status || 'Draft').toUpperCase() },
+      ],
+      partySectionTitle: 'Employee Information',
+      customerRows: buildEmployeeMetaRows({
+        name: `${d.last_name}, ${d.first_name}`,
+        code: d.employee_code,
+        department: d.department,
+        position: d.position,
+      }),
+      detailsTitle: 'Compensation',
+      detailsRows: [
+        { label: 'Daily Rate', value: fmtCurrency(d.daily_rate || 0) },
+        { label: 'Monthly Rate', value: fmtCurrency(d.monthly_rate || 0) },
+        { label: 'Gross Pay', value: fmtCurrency(gross) },
+      ],
+      beforeItemsHtml: renderEnterpriseSectionTitle('Earnings & Deductions'),
+      itemHeaders: [
+        { text: 'Description', align: 'left' },
+        { text: 'Type', align: 'center', width: '72px' },
+        { text: 'Amount', align: 'right', width: '80px' },
+      ],
+      itemRows: payRows,
+      summaryRows: [
+        { label: 'Gross Pay', value: fmtCurrency(gross) },
+        { label: 'Total Deductions', value: fmtCurrency(totalDed) },
+        { label: 'NET PAY', value: fmtCurrency(net), total: true },
+      ],
+      amountInWords: net,
+      footerNote: 'Computer-generated payslip',
+      status: d.status,
+      biz: b,
+      signatures: buildEnterpriseSignatures(b),
+      signatureCols: 3,
+    }));
   } catch (error: any) { res.status(500).send('<p>Error: ' + error.message + '</p>'); }
 });
 
 // Print payroll payment voucher
-router.get('/payroll/:id/payment-voucher/print', async (req: AuthRequest, res: Response) => {
+router.get('/payroll/:id/payment-voucher/print', authenticate, hasUserAnyPerm(['hr.payroll.print', 'hr.payslip.print']), async (req: AuthRequest, res: Response) => {
   try {
-    const token = req.query.token as string || (req.headers.authorization || '').replace('Bearer ', '');
-    if (!token) return res.status(401).json({ error: 'Auth required' });
-    try { jwt.verify(token, config.jwtSecret); } catch { return res.status(401).json({ error: 'Invalid token' }); }
-
     const r = await query(
       `SELECT p.*, e.first_name, e.last_name, e.employee_code, e.department, e.position,
               u.full_name as created_by_name
@@ -1170,101 +1428,55 @@ router.get('/payroll/:id/payment-voucher/print', async (req: AuthRequest, res: R
 
     const biz = await query('SELECT * FROM business_details WHERE id = 1');
     const b = biz.rows[0] || {};
-    const bizName = b.business_name || 'D METRAN TRADING';
 
     const netPay = parseFloat(d.net_pay) || 0;
-    const fc = (v: number) => v.toLocaleString('en-PH', {minimumFractionDigits:2});
+    const grossPay = parseFloat(d.gross_pay) || 0;
+    const deductionsTotal = parseFloat(d.deductions_total) || 0;
     const payMethod = d.payment_account_type === 'bank' ? 'Bank Transfer' : 'Cash';
+    const periodSubtitle = `${fmtDate(d.pay_period_start, 'short')} — ${fmtDate(d.pay_period_end, 'short')}`;
 
-    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Payment Voucher ${d.payment_voucher_number}</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:'Courier New',monospace;font-size:10px;color:#111;padding:8mm 12mm;max-width:210mm;margin:0 auto;letter-spacing:0.2px}
-.company-header{text-align:center;margin-bottom:8px}
-.company-header h1{font-size:18px;font-weight:bold;letter-spacing:4px;margin:0}
-.company-header .tagline{font-size:9px;color:#111;margin:3px 0}
-.company-header .info{font-size:8px;color:#111;margin:2px 0}
-.dot-divider{text-align:center;font-size:11px;font-weight:bold;margin:4px 0;letter-spacing:1px}
-.dot-divider-thin{text-align:center;font-size:10px;color:#444;margin:2px 0;letter-spacing:1px}
-.doc-title{text-align:center;border:1px dotted #444;padding:6px 0;margin:8px 0}
-.doc-title h2{font-size:14px;font-weight:bold;letter-spacing:6px;margin:0}
-.doc-title .sub{font-size:9px;color:#333}
-.details{display:flex;gap:20px;margin:10px 0}
-.details-left{flex:1;border:1px dotted #444;padding:8px 10px}
-.details-right{flex:1;border:1px dotted #444;padding:8px 10px}
-.details-left .label,.details-right .label{font-size:9px;font-weight:bold;text-transform:uppercase;margin-bottom:5px}
-.details p{font-size:9px;margin:2px 0}
-.details .amount{font-size:16px;font-weight:bold;margin-top:4px}
-.items-table{width:100%;border-collapse:collapse;margin:10px 0}
-.items-table th{background:#f8f8f8;border:1px dotted #444;padding:5px 6px;font-size:9px;text-align:left;font-weight:bold}
-.items-table td{border:1px dotted #444;padding:4px 6px;font-size:9px}
-.computation{display:flex;justify-content:flex-end;margin:10px 0}
-.comp-table{width:260px;border-collapse:collapse}
-.comp-table td{padding:3px 8px;font-size:9px}
-.comp-table td:last-child{text-align:right}
-.comp-table .total-row{border-top:2px dotted #000;font-size:12px;font-weight:bold}
-.signatures{display:flex;justify-content:space-between;margin-top:28px;gap:10px}
-.sig-block{text-align:center;flex:1}
-.sig-block .sig-line{border-bottom:1px solid #000;height:34px;margin-bottom:4px}
-.sig-block .sig-label{font-size:8px;color:#222}
-.footer-note{text-align:center;font-size:7px;color:#666;margin-top:14px}
-@media print{body{padding:5mm 8mm}}
-</style></head><body>
-
-<div class="company-header">
-<h1>${bizName}</h1>
-<div class="tagline">${(b.trade_name || '')}</div>
-<div class="info">${b.address || ''}${b.city ? ', ' + b.city : ''} | Tel: ${b.telephone_number || b.mobile_number || ''}</div>
-</div>
-<div class="dot-divider">================================================</div>
-
-<div class="doc-title">
-<h2>PAYMENT VOUCHER</h2>
-<div class="sub">${d.payment_voucher_number}</div>
-</div>
-
-<div class="details">
-<div class="details-left">
-<div class="label">Payee / Employee</div>
-<p><strong>Name:</strong> ${d.last_name}, ${d.first_name}</p>
-<p><strong>Code:</strong> ${d.employee_code || '—'}</p>
-<p><strong>Department:</strong> ${d.department || '—'}</p>
-</div>
-<div class="details-right">
-<div class="label">Payment Details</div>
-<p><strong>Payroll #:</strong> ${d.payroll_number}</p>
-<p><strong>Pay Period:</strong> ${new Date(d.pay_period_start).toLocaleDateString('en-PH')} - ${new Date(d.pay_period_end).toLocaleDateString('en-PH')}</p>
-<p><strong>Payment Date:</strong> ${d.payment_date ? new Date(d.payment_date).toLocaleDateString('en-PH') : '—'}</p>
-<p><strong>Method:</strong> ${payMethod}</p>
-${d.payment_ref ? '<p><strong>Ref #:</strong> ' + d.payment_ref + '</p>' : ''}
-</div>
-</div>
-
-<table class="items-table">
-<thead><tr><th>Description</th><th style="text-align:right">Amount</th></tr></thead>
-<tbody>
-<tr><td>Gross Pay (${d.days_worked || 0} days)</td><td style="text-align:right">₱${fc(parseFloat(d.gross_pay) || 0)}</td></tr>
-<tr><td>Total Deductions</td><td style="text-align:right">₱${fc(parseFloat(d.deductions_total) || 0)}</td></tr>
-</tbody>
-</table>
-
-<div class="computation">
-<table class="comp-table">
-<tr><td>Gross Pay:</td><td>₱${fc(parseFloat(d.gross_pay) || 0)}</td></tr>
-<tr><td>Total Deductions:</td><td>₱${fc(parseFloat(d.deductions_total) || 0)}</td></tr>
-<tr class="total-row"><td>NET PAY DISBURSED:</td><td>₱${fc(netPay)}</td></tr>
-</table>
-</div>
-
-<div class="signatures">
-<div class="sig-block"><div class="sig-line"></div><div class="sig-label">Prepared by</div></div>
-<div class="sig-block"><div class="sig-line"></div><div class="sig-label">Approved by</div></div>
-<div class="sig-block"><div class="sig-line"></div><div class="sig-label">Received by</div></div>
-</div>
-
-<div class="footer-note">Printed: ${new Date().toLocaleString('en-PH')} | Computer-generated payment voucher</div>
-</body></html>`;
-    res.send(html);
+    res.send(buildSalesEnterpriseDocument({
+      pageTitle: `Payment Voucher ${d.payment_voucher_number}`,
+      docTitle: 'Payment Voucher',
+      docMetaRows: [
+        { label: 'Voucher No.', value: d.payment_voucher_number || '—' },
+        { label: 'Payment Date', value: fmtDate(d.payment_date, 'short') },
+        { label: 'Payroll No.', value: d.payroll_number || '—' },
+        { label: 'Status', value: String(d.status || 'Paid').toUpperCase() },
+      ],
+      partySectionTitle: 'Employee Information',
+      customerRows: buildEmployeeMetaRows({
+        name: `${d.last_name}, ${d.first_name}`,
+        code: d.employee_code,
+        department: d.department,
+        position: d.position,
+      }),
+      detailsTitle: 'Disbursement Details',
+      detailsRows: [
+        { label: 'Pay Period', value: periodSubtitle },
+        { label: 'Payment Method', value: payMethod },
+        ...(d.payment_ref ? [{ label: 'Reference No.', value: d.payment_ref }] : []),
+      ],
+      itemHeaders: [
+        { text: 'Description', align: 'left' },
+        { text: 'Amount', align: 'right', width: '100px' },
+      ],
+      itemRows: [
+        tableRow([{ html: `Gross Pay (${d.days_worked || 0} days worked)` }, { html: fmtCurrency(grossPay), align: 'r' }]),
+        tableRow([{ html: 'Total Deductions' }, { html: fmtCurrency(deductionsTotal), align: 'r' }]),
+      ].join(''),
+      summaryRows: [
+        { label: 'Gross Pay', value: fmtCurrency(grossPay) },
+        { label: 'Total Deductions', value: fmtCurrency(deductionsTotal) },
+        { label: 'NET PAY DISBURSED', value: fmtCurrency(netPay), total: true },
+      ],
+      amountInWords: netPay,
+      footerNote: 'Computer-generated payment voucher',
+      status: d.status,
+      biz: b,
+      signatures: buildEnterpriseSignatures(b),
+      signatureCols: 3,
+    }));
   } catch (error: any) { res.status(500).send('<p>Error: ' + error.message + '</p>'); }
 });
 

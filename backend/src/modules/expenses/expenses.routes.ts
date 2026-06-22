@@ -3,6 +3,7 @@ import { query } from '../../config/database';
 import { authenticate, AuthRequest, hasUserPerm } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
 import { v4 as uuidv4 } from 'uuid';
+import { assertPeriodNotLocked } from '../../utils/periodLock';
 
 const router = Router();
 
@@ -11,7 +12,7 @@ const generateRefNumber = async (): Promise<string> => {
   return `EX-${String(result.rows[0]?.next || 1).padStart(5, '0')}`;
 };
 
-router.get('/', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/', authenticate, hasUserPerm('finance.expenses.view'), async (req: AuthRequest, res: Response) => {
   try {
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 50;
@@ -48,8 +49,9 @@ router.get('/', authenticate, async (req: AuthRequest, res: Response) => {
 
 router.post('/', authenticate, hasUserPerm('finance.expenses.create'), auditLog('Expenses', 'Create'), async (req: AuthRequest, res: Response) => {
   try {
-    const expense_number = await generateRefNumber();
     const { category_id, description, amount, expense_date, payment_method, reference_number, notes } = req.body;
+    await assertPeriodNotLocked(expense_date || new Date().toISOString().slice(0, 10));
+    const expense_number = await generateRefNumber();
     const id = uuidv4();
 
     await query(
@@ -165,7 +167,7 @@ router.put('/:id', authenticate, hasUserPerm('finance.expenses.edit'), auditLog(
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.delete('/:id', authenticate, async (req: AuthRequest, res: Response) => {
+router.delete('/:id', authenticate, hasUserPerm('finance.expenses.edit'), auditLog('Expenses', 'Delete'), async (req: AuthRequest, res: Response) => {
   try {
     const result = await query(
       "UPDATE expenses SET status = 'Cancelled', updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status != 'Cancelled' RETURNING *",
@@ -176,7 +178,7 @@ router.delete('/:id', authenticate, async (req: AuthRequest, res: Response) => {
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.get('/categories', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/categories', authenticate, hasUserPerm('finance.expenses.view'), async (req: AuthRequest, res: Response) => {
   try {
     const result = await query('SELECT * FROM expense_categories WHERE is_active = true ORDER BY name');
     res.json(result.rows);
@@ -185,7 +187,7 @@ router.get('/categories', authenticate, async (req: AuthRequest, res: Response) 
   }
 });
 
-router.post('/categories', authenticate, async (req: AuthRequest, res: Response) => {
+router.post('/categories', authenticate, hasUserPerm('finance.expenses.edit'), async (req: AuthRequest, res: Response) => {
   try {
     const { name, account_code } = req.body;
     if (!name || !account_code) return res.status(400).json({ error: 'Name and account code are required' });

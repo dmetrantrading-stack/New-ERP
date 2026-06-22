@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import api from '../lib/api';
 import type { User } from '../types';
+import { checkPermission, checkAnyPermission } from '../lib/permissions';
 
 interface AuthContextType {
   user: User | null;
@@ -9,6 +10,8 @@ interface AuthContextType {
   login: (username: string, password: string) => Promise<void>;
   logout: () => void;
   refreshUser: () => Promise<void>;
+  hasPerm: (perm: string) => boolean;
+  hasAnyPerm: (perms: string[]) => boolean;
 }
 
 const AuthContext = createContext<AuthContextType>({} as AuthContextType);
@@ -53,8 +56,20 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     } catch { /* ignore */ }
   }, []);
 
+  const hasPerm = useCallback((perm: string) => {
+    if (!user) return true;
+    if (user.role_name === 'Admin' || user.role_name === 'Owner') return true;
+    return checkPermission(user.permissions, perm);
+  }, [user]);
+
+  const hasAnyPerm = useCallback((perms: string[]) => {
+    if (!user) return true;
+    if (user.role_name === 'Admin' || user.role_name === 'Owner') return true;
+    return checkAnyPermission(user.permissions, perms);
+  }, [user]);
+
   return (
-    <AuthContext.Provider value={{ user, token, loading, login, logout, refreshUser }}>
+    <AuthContext.Provider value={{ user, token, loading, login, logout, refreshUser, hasPerm, hasAnyPerm }}>
       {children}
     </AuthContext.Provider>
   );

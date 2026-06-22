@@ -1,14 +1,20 @@
 import { Router, Response } from 'express';
 import { query } from '../../config/database';
-import { authenticate, AuthRequest } from '../../middleware/auth';
+import { authenticate, AuthRequest, hasUserPerm, hasUserAnyPerm } from '../../middleware/auth';
 import { AppError } from '../../middleware/errorHandler';
 import { auditLog } from '../../middleware/audit';
+import { auditAfter, auditBefore, auditSnapshot, AUDIT_FIELDS } from '../../utils/auditHelpers';
 import { v4 as uuidv4 } from 'uuid';
 import bcrypt from 'bcryptjs';
+import multer from 'multer';
+import path from 'path';
+import fs from 'fs';
 
 const router = Router();
 
-router.get('/', authenticate, async (req: AuthRequest, res: Response) => {
+const usersManage = hasUserAnyPerm(['system.users.view', 'system.users.edit']);
+
+router.get('/', authenticate, usersManage, async (req: AuthRequest, res: Response) => {
   try {
     const result = await query(
       `SELECT u.id, u.username, u.email, u.full_name, u.role_id, r.name as role_name, u.phone, u.is_active, u.last_login, u.created_at
@@ -20,7 +26,7 @@ router.get('/', authenticate, async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.post('/', authenticate, auditLog('Users', 'Create'), async (req: AuthRequest, res: Response) => {
+router.post('/', authenticate, hasUserPerm('system.users.create'), auditLog('Users', 'Create'), async (req: AuthRequest, res: Response) => {
   try {
     const { username, password, email, full_name, role_id, phone } = req.body;
     if (!username || !password || !full_name) return res.status(400).json({ error: 'Username, password, and full name are required' });
@@ -42,8 +48,12 @@ router.post('/', authenticate, auditLog('Users', 'Create'), async (req: AuthRequ
   }
 });
 
-router.put('/:id', authenticate, auditLog('Users', 'Update'), async (req: AuthRequest, res: Response) => {
+router.put('/:id', authenticate, hasUserPerm('system.users.edit'), auditLog('Users', 'Update'), async (req: AuthRequest, res: Response) => {
   try {
+    const existing = await query('SELECT id, username, email, full_name, role_id, phone, is_active FROM users WHERE id = $1', [req.params.id]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    auditBefore(req, auditSnapshot(existing.rows[0], AUDIT_FIELDS.user));
+
     const { email, full_name, role_id, phone, is_active, password } = req.body;
     let passwordHash: string | undefined;
     if (password) {
@@ -59,6 +69,7 @@ router.put('/:id', authenticate, auditLog('Users', 'Update'), async (req: AuthRe
       [email, full_name, role_id, phone, is_active, passwordHash || null, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    auditAfter(req, auditSnapshot(result.rows[0], AUDIT_FIELDS.user));
     res.json(result.rows[0]);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -75,7 +86,7 @@ router.get('/roles', authenticate, async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.delete('/:id', authenticate, auditLog('Users', 'Delete'), async (req: AuthRequest, res: Response) => {
+router.delete('/:id', authenticate, hasUserPerm('system.users.delete'), auditLog('Users', 'Delete'), async (req: AuthRequest, res: Response) => {
   try {
     const { id } = req.params;
 
@@ -103,7 +114,7 @@ router.get('/roles', authenticate, async (req: AuthRequest, res: Response) => {
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.put('/roles/:id', authenticate, async (req: AuthRequest, res: Response) => {
+router.put('/roles/:id', authenticate, hasUserPerm('system.users.edit'), async (req: AuthRequest, res: Response) => {
   try {
     const { name, description, permissions, approval_limit } = req.body;
     // Cannot edit own role
@@ -123,7 +134,7 @@ router.put('/roles/:id', authenticate, async (req: AuthRequest, res: Response) =
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.post('/roles', authenticate, async (req: AuthRequest, res: Response) => {
+router.post('/roles', authenticate, hasUserPerm('system.users.create'), async (req: AuthRequest, res: Response) => {
   try {
     const { name, description, permissions } = req.body;
     if (!name) return res.status(400).json({ error: 'Role name is required' });
@@ -136,14 +147,14 @@ router.post('/roles', authenticate, async (req: AuthRequest, res: Response) => {
 });
 
 // ==================== USER PERMISSIONS ====================
-router.get('/:id/permissions', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/:id/permissions', authenticate, usersManage, async (req: AuthRequest, res: Response) => {
   try {
     const r = await query('SELECT permission_key FROM user_permissions WHERE user_id = $1 ORDER BY permission_key', [req.params.id]);
     res.json({ permissions: r.rows.map((r: any) => r.permission_key) });
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.put('/:id/permissions', authenticate, async (req: AuthRequest, res: Response) => {
+router.put('/:id/permissions', authenticate, hasUserPerm('system.users.edit'), async (req: AuthRequest, res: Response) => {
   try {
     const { permissions } = req.body;
     if (!Array.isArray(permissions)) return res.status(400).json({ error: 'permissions array required' });
@@ -168,7 +179,7 @@ router.put('/:id/permissions', authenticate, async (req: AuthRequest, res: Respo
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.post('/:id/copy-permissions/:fromId', authenticate, async (req: AuthRequest, res: Response) => {
+router.post('/:id/copy-permissions/:fromId', authenticate, hasUserPerm('system.users.edit'), async (req: AuthRequest, res: Response) => {
   try {
     const srcPerms = await query('SELECT permission_key FROM user_permissions WHERE user_id = $1', [req.params.fromId]);
     await query('DELETE FROM user_permissions WHERE user_id = $1', [req.params.id]);
@@ -176,6 +187,55 @@ router.post('/:id/copy-permissions/:fromId', authenticate, async (req: AuthReque
       await query('INSERT INTO user_permissions (user_id, permission_key) VALUES ($1, $2) ON CONFLICT DO NOTHING', [req.params.id, row.permission_key]);
     }
     res.json({ copied: srcPerms.rows.length });
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+const userSigStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => {
+    const dir = path.join('uploads', 'user-signatures');
+    fs.mkdirSync(dir, { recursive: true });
+    cb(null, dir);
+  },
+  filename: (req, file, cb) => {
+    cb(null, `${req.params.id}${path.extname(file.originalname)}`);
+  },
+});
+
+const userSigUpload = multer({
+  storage: userSigStorage,
+  limits: { fileSize: 2 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(file.mimetype)) cb(null, true);
+    else cb(new Error('Only PNG, JPG, GIF, WEBP images allowed') as any);
+  },
+});
+
+router.post('/:id/upload-signature', authenticate, userSigUpload.single('signature'), async (req: AuthRequest, res: Response) => {
+  try {
+    if (req.user!.id !== req.params.id) {
+      const perm = await query(
+        `SELECT 1 FROM user_permissions WHERE user_id = $1 AND permission_key = 'system.users.edit'`,
+        [req.user!.id]
+      );
+      if (perm.rows.length === 0) return res.status(403).json({ error: 'Not allowed' });
+    }
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const url = `/api/users/${req.params.id}/signature`;
+    await query('UPDATE users SET signature_url = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [url, req.params.id]);
+    res.json({ signature_url: url });
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+router.get('/:id/signature', async (req, res: Response) => {
+  try {
+    const dir = path.join(__dirname, '..', '..', '..', 'uploads', 'user-signatures');
+    const files = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.startsWith(req.params.id)) : [];
+    if (files.length === 0) return res.status(404).end();
+    const file = path.join(dir, files[0]);
+    const ext = path.extname(files[0]).toLowerCase();
+    const mime = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : ext === '.gif' ? 'image/gif' : 'image/jpeg';
+    res.setHeader('Content-Type', mime);
+    res.sendFile(file);
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 

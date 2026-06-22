@@ -3,12 +3,16 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { query, getClient } from '../../config/database';
-import { authenticate, AuthRequest } from '../../middleware/auth';
+import { authenticate, AuthRequest, hasUserPerm } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
+import { AppError } from '../../middleware/errorHandler';
+import { getInvoiceCopyMode, setInvoiceCopyMode, InvoiceCopyMode } from '../../utils/salesSettings';
+import { getAccountingLockDate, setAccountingLockDate } from '../../utils/periodLock';
+import { runOpeningBalanceImport } from '../../utils/openingBalanceImport';
 
 const router = Router();
 
-router.post('/reset-transactions', authenticate, auditLog('Settings', 'Reset Transactions'), async (req: AuthRequest, res: Response) => {
+router.post('/reset-transactions', authenticate, hasUserPerm('system.settings.edit'), auditLog('Settings', 'Reset Transactions'), async (req: AuthRequest, res: Response) => {
   const client = await getClient();
   try {
     await client.query('BEGIN');
@@ -29,6 +33,7 @@ router.post('/reset-transactions', authenticate, auditLog('Settings', 'Reset Tra
       'ap_vouchers', 'ap_voucher_items',
       'production_orders', 'production_order_inputs', 'production_order_outputs',
       'cash_transactions', 'bank_transactions',
+      'petty_cash_vouchers',
       'expenses',
       'attendance', 'payroll', 'payroll_deductions', 'cash_advances',
       'audit_logs', 'notifications',
@@ -68,7 +73,7 @@ router.get('/business-details', authenticate, async (req: AuthRequest, res: Resp
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.put('/business-details', authenticate, auditLog('Settings', 'Update Business Details'), async (req: AuthRequest, res: Response) => {
+router.put('/business-details', authenticate, hasUserPerm('system.settings.edit'), auditLog('Settings', 'Update Business Details'), async (req: AuthRequest, res: Response) => {
   try {
     const { business_name, trade_name, address, barangay, city, province, zip_code, mobile_number, telephone_number, email_address, website, tin_number, vat_type, vat_rate, prepared_by, prepared_by_position, approved_by, approved_by_position, currency, date_format, logo_url, printer_name, printer_type, paper_size, auto_print, printer_port } = req.body;
     await query(
@@ -80,7 +85,7 @@ router.put('/business-details', authenticate, auditLog('Settings', 'Update Busin
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.post('/reset-products', authenticate, auditLog('Settings', 'Reset Products'), async (req: AuthRequest, res: Response) => {
+router.post('/reset-products', authenticate, hasUserPerm('system.settings.edit'), auditLog('Settings', 'Reset Products'), async (req: AuthRequest, res: Response) => {
   const client = await getClient();
   try {
     await client.query('BEGIN');
@@ -127,7 +132,7 @@ const logoUpload = multer({
   },
 });
 
-router.post('/upload-logo', authenticate, logoUpload.single('logo'), async (req: AuthRequest, res: Response) => {
+router.post('/upload-logo', authenticate, hasUserPerm('system.settings.edit'), logoUpload.single('logo'), async (req: AuthRequest, res: Response) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     const logoUrl = '/api/settings/logo';
@@ -151,6 +156,122 @@ router.get('/logo', async (req, res: Response) => {
     const mime = ext === '.png' ? 'image/png' : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : 'image/gif';
     res.setHeader('Content-Type', mime);
     res.sendFile(logoFile);
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+router.get('/sales-workflow', authenticate, async (req: AuthRequest, res: Response) => {
+  try {
+    const invoice_copy_mode = await getInvoiceCopyMode();
+    res.json({ invoice_copy_mode });
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+router.put('/sales-workflow', authenticate, hasUserPerm('system.settings.edit'), auditLog('Settings', 'Update Sales Workflow'), async (req: AuthRequest, res: Response) => {
+  try {
+    const { invoice_copy_mode } = req.body;
+    if (!['ordered', 'delivered'].includes(invoice_copy_mode)) {
+      return res.status(400).json({ error: 'invoice_copy_mode must be ordered or delivered' });
+    }
+    await setInvoiceCopyMode(invoice_copy_mode as InvoiceCopyMode);
+    res.json({ invoice_copy_mode });
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+router.get('/purchase-workflow', authenticate, async (_req: AuthRequest, res: Response) => {
+  try {
+    const r = await query(`SELECT setting_value FROM system_settings WHERE setting_key = 'enforce_approval_limits'`);
+    res.json({ enforce_approval_limits: r.rows[0]?.setting_value === 'true' });
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+router.put('/purchase-workflow', authenticate, hasUserPerm('system.settings.edit'), auditLog('Settings', 'Update Purchase Workflow'), async (req: AuthRequest, res: Response) => {
+  try {
+    const { enforce_approval_limits } = req.body;
+    const val = enforce_approval_limits ? 'true' : 'false';
+    await query(
+      `INSERT INTO system_settings (setting_key, setting_value) VALUES ('enforce_approval_limits', $1)
+       ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value`,
+      [val],
+    );
+    res.json({ enforce_approval_limits: val === 'true' });
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+router.get('/accounting-lock', authenticate, async (req: AuthRequest, res: Response) => {
+  try {
+    const accounting_lock_date = await getAccountingLockDate();
+    res.json({ accounting_lock_date });
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+router.put('/accounting-lock', authenticate, hasUserPerm('system.settings.edit'), auditLog('Settings', 'Update Period Lock'), async (req: AuthRequest, res: Response) => {
+  try {
+    const { accounting_lock_date } = req.body;
+    if (accounting_lock_date && !/^\d{4}-\d{2}-\d{2}$/.test(accounting_lock_date)) {
+      return res.status(400).json({ error: 'Date must be YYYY-MM-DD or empty to unlock' });
+    }
+    await setAccountingLockDate(accounting_lock_date || null);
+    res.json({ accounting_lock_date: accounting_lock_date || null });
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+router.post('/import/opening-balances', authenticate, hasUserPerm('system.settings.edit'), auditLog('Settings', 'Import Opening Balances'), async (req: AuthRequest, res: Response) => {
+  try {
+    const { type, csv, entry_date } = req.body;
+    if (!type || !csv) return res.status(400).json({ error: 'type and csv are required' });
+    const result = await runOpeningBalanceImport(String(type), String(csv), req.user!.id, entry_date);
+    res.json(result);
+  } catch (error: any) {
+    res.status(error instanceof AppError ? error.statusCode : 500).json({ error: error.message });
+  }
+});
+
+const sigStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => {
+    const dir = path.join('uploads', 'signatures');
+    fs.mkdirSync(dir, { recursive: true });
+    cb(null, dir);
+  },
+  filename: (req, file, cb) => {
+    const role = req.params.role || 'sig';
+    cb(null, `${role}${path.extname(file.originalname)}`);
+  },
+});
+
+const sigUpload = multer({
+  storage: sigStorage,
+  limits: { fileSize: 2 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(file.mimetype)) cb(null, true);
+    else cb(new Error('Only PNG, JPG, GIF, WEBP images allowed') as any);
+  },
+});
+
+router.post('/upload-signature/:role', authenticate, hasUserPerm('system.settings.edit'), sigUpload.single('signature'), async (req: AuthRequest, res: Response) => {
+  try {
+    const role = req.params.role;
+    if (!['prepared', 'approved'].includes(role)) return res.status(400).json({ error: 'role must be prepared or approved' });
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const col = role === 'prepared' ? 'prepared_by_signature_url' : 'approved_by_signature_url';
+    const url = `/api/settings/signature/${role}`;
+    await query(`UPDATE business_details SET ${col} = $1, updated_at = CURRENT_TIMESTAMP WHERE id = 1`, [url]);
+    res.json({ signature_url: url });
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+router.get('/signature/:role', async (req, res: Response) => {
+  try {
+    const role = req.params.role;
+    if (!['prepared', 'approved'].includes(role)) return res.status(404).end();
+    const dir = path.join(__dirname, '..', '..', '..', 'uploads', 'signatures');
+    if (!fs.existsSync(dir)) return res.status(404).end();
+    const files = fs.readdirSync(dir).filter((f) => f.startsWith(role));
+    if (files.length === 0) return res.status(404).end();
+    const file = path.join(dir, files[0]);
+    const ext = path.extname(files[0]).toLowerCase();
+    const mime = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : ext === '.gif' ? 'image/gif' : 'image/jpeg';
+    res.setHeader('Content-Type', mime);
+    res.sendFile(file);
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 

@@ -1,18 +1,20 @@
 import { Router, Response } from 'express';
 import { query } from '../../config/database';
-import { authenticate, AuthRequest } from '../../middleware/auth';
+import { authenticate, AuthRequest, hasUserPerm } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
 import { AppError } from '../../middleware/errorHandler';
 import { v4 as uuidv4 } from 'uuid';
 
 const router = Router();
 
+const stView = hasUserPerm('inventory.stock-transfer.view');
+
 const generateRefNumber = async (): Promise<string> => {
   const result = await query("SELECT COALESCE(MAX(CAST(SUBSTRING(transfer_number, 4) AS INTEGER)), 0) + 1 as next FROM stock_transfers WHERE transfer_number ~ '^ST-'");
   return `ST-${String(result.rows[0]?.next || 1).padStart(5, '0')}`;
 };
 
-router.get('/', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/', authenticate, stView, async (req: AuthRequest, res: Response) => {
   try {
     const result = await query(
       `SELECT st.*, sl.name as source_location, dl.name as destination_location, u.full_name as created_by_name
@@ -28,7 +30,7 @@ router.get('/', authenticate, async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.post('/', authenticate, auditLog('Stock Transfer', 'Create'), async (req: AuthRequest, res: Response) => {
+router.post('/', authenticate, hasUserPerm('inventory.stock-transfer.create'), auditLog('Stock Transfer', 'Create'), async (req: AuthRequest, res: Response) => {
   try {
     const transfer_number = await generateRefNumber();
     const { source_location_id, destination_location_id, items, notes } = req.body;
@@ -86,7 +88,7 @@ router.post('/', authenticate, auditLog('Stock Transfer', 'Create'), async (req:
 });
 
 // Send transfer
-router.patch('/:id/send', authenticate, async (req: AuthRequest, res: Response) => {
+router.patch('/:id/send', authenticate, hasUserPerm('inventory.stock-transfer.edit'), async (req: AuthRequest, res: Response) => {
   try {
     const transfer = await query('SELECT * FROM stock_transfers WHERE id = $1', [req.params.id]);
     if (transfer.rows.length === 0) return res.status(404).json({ error: 'Transfer not found' });
@@ -121,7 +123,7 @@ router.patch('/:id/send', authenticate, async (req: AuthRequest, res: Response) 
 });
 
 // Receive transfer
-router.patch('/:id/receive', authenticate, async (req: AuthRequest, res: Response) => {
+router.patch('/:id/receive', authenticate, hasUserPerm('inventory.stock-transfer.approve'), async (req: AuthRequest, res: Response) => {
   try {
     const transfer = await query('SELECT * FROM stock_transfers WHERE id = $1', [req.params.id]);
     if (transfer.rows.length === 0) return res.status(404).json({ error: 'Transfer not found' });
@@ -164,7 +166,7 @@ router.patch('/:id/receive', authenticate, async (req: AuthRequest, res: Respons
 });
 
 // Cancel transfer
-router.patch('/:id/cancel', authenticate, async (req: AuthRequest, res: Response) => {
+router.patch('/:id/cancel', authenticate, hasUserPerm('inventory.stock-transfer.edit'), async (req: AuthRequest, res: Response) => {
   try {
     const existing = await query('SELECT id FROM stock_transfers WHERE id = $1', [req.params.id]);
     if (existing.rows.length === 0) return res.status(404).json({ error: 'Transfer not found' });

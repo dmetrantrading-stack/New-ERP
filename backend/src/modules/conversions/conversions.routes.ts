@@ -1,6 +1,6 @@
 import { Router, Response } from 'express';
 import { query } from '../../config/database';
-import { authenticate, AuthRequest } from '../../middleware/auth';
+import { authenticate, AuthRequest, hasUserPerm } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
 import { AppError } from '../../middleware/errorHandler';
 import { v4 as uuidv4 } from 'uuid';
@@ -8,7 +8,7 @@ import { v4 as uuidv4 } from 'uuid';
 const router = Router();
 
 // Get unit conversions for a product
-router.get('/:productId', authenticate, async (req: AuthRequest, res: Response) => {
+router.get('/:productId', authenticate, hasUserPerm('inventory.inventory.view'), async (req: AuthRequest, res: Response) => {
   try {
     const result = await query(
       'SELECT * FROM unit_conversions WHERE product_id = $1 AND is_active = true ORDER BY from_unit',
@@ -86,21 +86,22 @@ router.post('/convert', authenticate, auditLog('Conversions', 'Convert'), async 
     // Actually for proper conversion, the parent and child should be different products
     // But here we track by unit_of_measure on the same product
 
+    const refId = uuidv4();
     const unitCost = parseFloat(inv.rows[0].unit_cost);
     const newChildCost = unitCost / factor;
 
-    // Record parent deduction in ledger
     await query(
-      `INSERT INTO inventory_ledger (id, product_id, location_id, reference_type, transaction_type, quantity, running_quantity, unit_cost, total_cost, notes, created_by)
+      `INSERT INTO inventory_ledger (id, product_id, location_id, reference_type, reference_id, transaction_type, quantity, running_quantity, unit_cost, total_cost, notes, created_by)
        VALUES ($1, $2, $3, 'Unit Conversion', $4, 'CONVERSION_OUT', $5, $6, $7, $8, $9, $10)`,
-      [uuidv4(), product_id, locId, `Conversion ${from_unit}->${to_unit}`, deductQty, newParentQty, unitCost, deductQty * unitCost, `Converted ${deductQty} ${from_unit} to ${addQty} ${to_unit}`, req.user!.id]
+      [uuidv4(), product_id, locId, refId, deductQty, newParentQty, unitCost, deductQty * unitCost,
+       `Converted ${deductQty} ${from_unit} to ${addQty} ${to_unit}`, req.user!.id]
     );
 
-    // Record child addition in ledger
     await query(
-      `INSERT INTO inventory_ledger (id, product_id, location_id, reference_type, transaction_type, quantity, running_quantity, unit_cost, total_cost, notes, created_by)
+      `INSERT INTO inventory_ledger (id, product_id, location_id, reference_type, reference_id, transaction_type, quantity, running_quantity, unit_cost, total_cost, notes, created_by)
        VALUES ($1, $2, $3, 'Unit Conversion', $4, 'CONVERSION_IN', $5, $6, $7, $8, $9, $10)`,
-      [uuidv4(), product_id, locId, `Conversion ${from_unit}->${to_unit}`, addQty, newParentQty + addQty, newChildCost, addQty * newChildCost, `Added ${addQty} ${to_unit} from conversion`, req.user!.id]
+      [uuidv4(), product_id, locId, refId, addQty, newParentQty + addQty, newChildCost, addQty * newChildCost,
+       `Added ${addQty} ${to_unit} from conversion`, req.user!.id]
     );
 
     res.json({
