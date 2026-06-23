@@ -261,6 +261,36 @@ const migrate = async () => {
       )
     `);
 
+    // ==================== EMPLOYEES (before sales_invoices FK) ====================
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS employees (
+        id SERIAL PRIMARY KEY,
+        employee_code VARCHAR(50) UNIQUE NOT NULL,
+        first_name VARCHAR(255) NOT NULL,
+        last_name VARCHAR(255) NOT NULL,
+        middle_name VARCHAR(255),
+        address TEXT,
+        phone VARCHAR(50),
+        email VARCHAR(255),
+        position VARCHAR(255),
+        department VARCHAR(255),
+        daily_rate DECIMAL(15,2) DEFAULT 0,
+        monthly_rate DECIMAL(15,2) DEFAULT 0,
+        sss VARCHAR(50),
+        philhealth VARCHAR(50),
+        pagibig VARCHAR(50),
+        tin VARCHAR(50),
+        employment_type VARCHAR(50) DEFAULT 'Regular' CHECK (employment_type IN ('Regular', 'Contractual', 'Probationary', 'Part-time')),
+        hire_date DATE,
+        cash_advance_balance DECIMAL(15,2) DEFAULT 0,
+        grocery_credit_balance DECIMAL(15,2) DEFAULT 0,
+        credit_limit DECIMAL(15,2) DEFAULT 0,
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
     // ==================== PURCHASES ====================
     await client.query(`
       CREATE TABLE IF NOT EXISTS purchase_requisitions (
@@ -784,6 +814,39 @@ const migrate = async () => {
       )
     `);
 
+    // ==================== BANK ACCOUNTS (before collection_receipts FK) ====================
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS bank_accounts (
+        id SERIAL PRIMARY KEY,
+        account_code VARCHAR(50) UNIQUE,
+        bank_name VARCHAR(255) NOT NULL,
+        account_name VARCHAR(255) NOT NULL,
+        account_number VARCHAR(100) NOT NULL,
+        account_type VARCHAR(50),
+        gl_account_code VARCHAR(10),
+        pos_payment_method VARCHAR(50),
+        balance DECIMAL(15,2) DEFAULT 0,
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS bank_transactions (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        bank_account_id INTEGER REFERENCES bank_accounts(id),
+        transaction_type VARCHAR(50) NOT NULL CHECK (transaction_type IN ('Deposit', 'Withdrawal', 'Transfer')),
+        amount DECIMAL(15,2) NOT NULL,
+        reference_type VARCHAR(50),
+        reference_id UUID,
+        transaction_date DATE NOT NULL DEFAULT CURRENT_DATE,
+        notes TEXT,
+        created_by UUID REFERENCES users(id),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
     // ==================== ACCOUNTS RECEIVABLE ====================
     await client.query(`
       CREATE TABLE IF NOT EXISTS collection_receipts (
@@ -805,26 +868,6 @@ const migrate = async () => {
     `);
 
     // ==================== ACCOUNTS PAYABLE ====================
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS payment_vouchers (
-        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-        voucher_number VARCHAR(50) UNIQUE NOT NULL,
-        supplier_id INTEGER REFERENCES suppliers(id),
-        po_id UUID REFERENCES purchase_orders(id),
-        apv_id UUID REFERENCES ap_vouchers(id),
-        payment_date DATE NOT NULL DEFAULT CURRENT_DATE,
-        payment_method VARCHAR(50),
-        reference_number VARCHAR(100),
-        amount DECIMAL(15,2) NOT NULL,
-        status VARCHAR(50) DEFAULT 'Draft' CHECK (status IN ('Draft', 'Posted', 'Void')),
-        notes TEXT,
-        created_by UUID REFERENCES users(id),
-        approved_by UUID REFERENCES users(id),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
     await client.query(`
       CREATE TABLE IF NOT EXISTS ap_vouchers (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -867,6 +910,26 @@ const migrate = async () => {
         discount_amount DECIMAL(15,2) DEFAULT 0,
         net_amount DECIMAL(15,2) DEFAULT 0,
         vat_amount DECIMAL(15,2) DEFAULT 0
+      )
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS payment_vouchers (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        voucher_number VARCHAR(50) UNIQUE NOT NULL,
+        supplier_id INTEGER REFERENCES suppliers(id),
+        po_id UUID REFERENCES purchase_orders(id),
+        apv_id UUID REFERENCES ap_vouchers(id),
+        payment_date DATE NOT NULL DEFAULT CURRENT_DATE,
+        payment_method VARCHAR(50),
+        reference_number VARCHAR(100),
+        amount DECIMAL(15,2) NOT NULL,
+        status VARCHAR(50) DEFAULT 'Draft' CHECK (status IN ('Draft', 'Posted', 'Void')),
+        notes TEXT,
+        created_by UUID REFERENCES users(id),
+        approved_by UUID REFERENCES users(id),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
@@ -929,36 +992,7 @@ const migrate = async () => {
     `);
     await client.query(`ALTER TABLE cash_transactions ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'Posted'`);
 
-    // ==================== BANK MANAGEMENT ====================
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS bank_accounts (
-        id SERIAL PRIMARY KEY,
-        account_code VARCHAR(50) UNIQUE,
-        bank_name VARCHAR(255) NOT NULL,
-        account_name VARCHAR(255) NOT NULL,
-        account_number VARCHAR(100) NOT NULL,
-        account_type VARCHAR(50),
-        balance DECIMAL(15,2) DEFAULT 0,
-        is_active BOOLEAN DEFAULT true,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS bank_transactions (
-        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-        bank_account_id INTEGER REFERENCES bank_accounts(id),
-        transaction_type VARCHAR(50) NOT NULL CHECK (transaction_type IN ('Deposit', 'Withdrawal', 'Transfer')),
-        amount DECIMAL(15,2) NOT NULL,
-        reference_type VARCHAR(50),
-        reference_id UUID,
-        transaction_date DATE NOT NULL DEFAULT CURRENT_DATE,
-        notes TEXT,
-        created_by UUID REFERENCES users(id),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
+    // bank_accounts + bank_transactions created before ACCOUNTS RECEIVABLE
 
     // ==================== EXPENSES ====================
     await client.query(`
@@ -991,35 +1025,6 @@ const migrate = async () => {
     `);
 
     // ==================== HR / PAYROLL ====================
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS employees (
-        id SERIAL PRIMARY KEY,
-        employee_code VARCHAR(50) UNIQUE NOT NULL,
-        first_name VARCHAR(255) NOT NULL,
-        last_name VARCHAR(255) NOT NULL,
-        middle_name VARCHAR(255),
-        address TEXT,
-        phone VARCHAR(50),
-        email VARCHAR(255),
-        position VARCHAR(255),
-        department VARCHAR(255),
-        daily_rate DECIMAL(15,2) DEFAULT 0,
-        monthly_rate DECIMAL(15,2) DEFAULT 0,
-        sss VARCHAR(50),
-        philhealth VARCHAR(50),
-        pagibig VARCHAR(50),
-        tin VARCHAR(50),
-        employment_type VARCHAR(50) DEFAULT 'Regular' CHECK (employment_type IN ('Regular', 'Contractual', 'Probationary', 'Part-time')),
-        hire_date DATE,
-        cash_advance_balance DECIMAL(15,2) DEFAULT 0,
-        grocery_credit_balance DECIMAL(15,2) DEFAULT 0,
-        credit_limit DECIMAL(15,2) DEFAULT 0,
-        is_active BOOLEAN DEFAULT true,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
     await client.query(`
       CREATE TABLE IF NOT EXISTS attendance (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -1304,6 +1309,8 @@ const migrate = async () => {
     `);
     await client.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS price_type VARCHAR(50) DEFAULT 'VAT Inclusive'`);
     await client.query(`ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS account_code VARCHAR(50)`);
+    await client.query(`ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS gl_account_code VARCHAR(10)`);
+    await client.query(`ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS pos_payment_method VARCHAR(50)`);
     await client.query(`ALTER TABLE sales_quotations ADD COLUMN IF NOT EXISTS terms_conditions TEXT`);
     await client.query(`ALTER TABLE sales_quotations ADD COLUMN IF NOT EXISTS payment_terms VARCHAR(100)`);
 

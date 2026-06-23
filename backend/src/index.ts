@@ -51,9 +51,14 @@ if (config.trustProxy) {
   app.set('trust proxy', 1);
 }
 
-// Middleware
+// Security headers — LAN HTTP must not send HSTS or CSP upgrade-insecure-requests
 app.use(helmet({
   crossOriginResourcePolicy: { policy: 'cross-origin' },
+  strictTransportSecurity: config.useHttpsSecurityHeaders,
+  crossOriginOpenerPolicy: config.useHttpsSecurityHeaders,
+  originAgentCluster: config.useHttpsSecurityHeaders,
+  // Default CSP includes upgrade-insecure-requests → breaks http://192.168.x.x:5000
+  contentSecurityPolicy: config.useHttpsSecurityHeaders,
 }));
 app.use(cors({
   origin: config.corsOrigins,

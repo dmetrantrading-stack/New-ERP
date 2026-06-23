@@ -26,6 +26,8 @@ export const config = {
   serveFrontend: process.env.SERVE_FRONTEND === 'true' || isProduction,
   frontendDist: process.env.FRONTEND_DIST || path.join(__dirname, '..', '..', '..', 'frontend', 'dist'),
   trustProxy: process.env.TRUST_PROXY === 'true',
+  /** When false (LAN HTTP), Helmet must not send HSTS or HTTPS-only headers. */
+  useHttpsSecurityHeaders: process.env.TRUST_PROXY === 'true',
   corsOrigins: parseCorsOrigins(),
   loginRateLimit: {
     windowMs: parseInt(process.env.LOGIN_RATE_WINDOW_MS || '900000', 10),
