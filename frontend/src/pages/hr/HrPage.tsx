@@ -8,7 +8,7 @@ import { useAuth } from '../../store/auth';
 import {
   Plus, Edit2, DollarSign, FileText, X, Wallet, ShoppingCart,
   CheckCircle, XCircle, Shield, UserCheck, CreditCard, Printer,
-  Briefcase, RefreshCw, Eye, ArrowLeft, Users,
+  Briefcase, RefreshCw, Eye, ArrowLeft, Users, Upload, Download,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { canAccessHrTab } from '../../lib/hrPermissions';
@@ -36,6 +36,8 @@ export default function HrPage() {
   const { hasPerm, hasAnyPerm } = useAuth();
   const canEmpCreate = hasPerm('hr.employees.create');
   const canEmpEdit = hasPerm('hr.employees.edit');
+  const canEmpExport = hasPerm('hr.employees.export');
+  const canEmpImport = hasAnyPerm(['hr.employees.create', 'hr.employees.import']);
   const canCaCreate = hasPerm('hr.cash-advances.create');
   const canCaEdit = hasPerm('hr.cash-advances.edit');
   const canPayrollCreate = hasPerm('hr.payroll.create');
@@ -72,6 +74,11 @@ export default function HrPage() {
 
   // Modals
   const [showEmployeeModal, setShowEmployeeModal] = useState(false);
+  const [showEmpImportModal, setShowEmpImportModal] = useState(false);
+  const [empImportFile, setEmpImportFile] = useState<File | null>(null);
+  const [empImportPreview, setEmpImportPreview] = useState<any>(null);
+  const [empImporting, setEmpImporting] = useState(false);
+  const [showExportMenu, setShowExportMenu] = useState(false);
   const [showPayrollModal, setShowPayrollModal] = useState(false);
   const [showCashAdvModal, setShowCashAdvModal] = useState(false);
   const [showLedgerModal, setShowLedgerModal] = useState(false);
@@ -226,6 +233,58 @@ export default function HrPage() {
       setShowEmployeeModal(false);
       api.get('/hr/employees').then((res) => setEmployees(res.data));
     } catch (err: any) { toast.error(err.response?.data?.error || 'Error'); }
+  };
+
+  const downloadEmployeeTemplate = () => {
+    const token = localStorage.getItem('token');
+    window.open(`/api/hr/employees/export/template?token=${token}`, '_blank');
+  };
+
+  const exportEmployees = (format: 'csv' | 'xlsx') => {
+    const token = localStorage.getItem('token');
+    window.open(`/api/hr/employees/export?format=${format}&active=all&token=${token}`, '_blank');
+    setShowExportMenu(false);
+  };
+
+  const handleEmpImportPreview = async () => {
+    if (!empImportFile) { toast.error('Select a file'); return; }
+    setEmpImportPreview(null);
+    setEmpImporting(true);
+    try {
+      const formData = new FormData();
+      formData.append('file', empImportFile);
+      const res = await api.post('/hr/employees/import/preview', formData, { headers: { 'Content-Type': 'multipart/form-data' } });
+      setEmpImportPreview(res.data);
+    } catch (err: any) { toast.error(err.response?.data?.error || 'Preview failed'); }
+    setEmpImporting(false);
+  };
+
+  const handleEmpImportExecute = async () => {
+    if (!empImportFile) return;
+    if (!window.confirm(`Import ${empImportPreview?.valid_rows || 0} employees? Rows with errors will be skipped.`)) return;
+    setEmpImporting(true);
+    try {
+      const formData = new FormData();
+      formData.append('file', empImportFile);
+      const res = await api.post('/hr/employees/import/execute', formData, { headers: { 'Content-Type': 'multipart/form-data' } });
+      const { imported = 0, updated = 0, errors = [], total = 0 } = res.data;
+      if (imported > 0 || updated > 0) {
+        const skipped = errors.length ? ` (${errors.length} row(s) skipped)` : '';
+        toast.success(`Imported ${imported} new, updated ${updated}${skipped}`);
+        setShowEmpImportModal(false);
+        setEmpImportFile(null);
+        setEmpImportPreview(null);
+        api.get('/hr/employees').then((r) => setEmployees(r.data));
+      } else if (errors.length > 0) {
+        toast.error(`Import failed for all ${errors.length} row(s). Row ${errors[0].row}: ${errors[0].message}`);
+        setEmpImportPreview((prev: any) => prev ? { ...prev, execute_errors: errors } : prev);
+      } else if (total === 0) {
+        toast.error('No data rows found in the file');
+      } else {
+        toast.error('No employees were imported or updated');
+      }
+    } catch (err: any) { toast.error(err.response?.data?.error || 'Import failed'); }
+    setEmpImporting(false);
   };
 
   const viewLedger = async (id: number) => {
@@ -703,6 +762,26 @@ export default function HrPage() {
             <RefreshCw size={14} />
             Refresh
           </button>
+          {activeTab === 'employees' && canEmpImport && (
+            <button type="button" onClick={() => { setShowEmpImportModal(true); setEmpImportFile(null); setEmpImportPreview(null); }}
+              className="flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded-md bg-white/10 text-white hover:bg-white/20">
+              <Upload size={14} /> Import
+            </button>
+          )}
+          {activeTab === 'employees' && canEmpExport && (
+            <div className="relative">
+              <button type="button" onClick={() => setShowExportMenu((v) => !v)}
+                className="flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded-md bg-white/10 text-white hover:bg-white/20">
+                <Download size={14} /> Export
+              </button>
+              {showExportMenu && (
+                <div className="absolute right-0 mt-1 z-20 bg-white text-gray-800 rounded-lg shadow-lg border text-xs py-1 min-w-[120px]">
+                  <button type="button" onClick={() => exportEmployees('csv')} className="block w-full text-left px-3 py-1.5 hover:bg-gray-50">CSV</button>
+                  <button type="button" onClick={() => exportEmployees('xlsx')} className="block w-full text-left px-3 py-1.5 hover:bg-gray-50">Excel</button>
+                </div>
+              )}
+            </div>
+          )}
           {activeTab === 'employees' && canEmpCreate && (
             <button type="button" onClick={openCreateEmployee} className="flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded-md bg-white text-blue-900 hover:bg-blue-50">
               <Plus size={14} /> Add Employee
@@ -1046,6 +1125,85 @@ export default function HrPage() {
       </div>
 
       {/* ========== MODALS ========== */}
+
+      {showEmpImportModal && (
+        <ModalOverlay onClose={() => { setShowEmpImportModal(false); setEmpImportFile(null); setEmpImportPreview(null); }}>
+          <div className="modal-content max-w-3xl">
+            <div className="p-6">
+              <h2 className="text-lg font-semibold mb-4">Import Employees</h2>
+              {empImportPreview ? (
+                <div>
+                  <div className="flex flex-wrap gap-2 mb-3 text-xs">
+                    <span className="text-green-700 bg-green-50 px-2 py-0.5 rounded">{empImportPreview.valid_rows} valid</span>
+                    {empImportPreview.error_rows > 0 && <span className="text-red-700 bg-red-50 px-2 py-0.5 rounded">{empImportPreview.error_rows} errors</span>}
+                  </div>
+                  <div className="max-h-64 overflow-auto border rounded-lg mb-3 text-xs">
+                    <table className="w-full">
+                      <thead className="bg-gray-50 sticky top-0"><tr>
+                        <th className="px-2 py-1 text-left">#</th><th className="px-2 py-1 text-left">Name</th><th className="px-2 py-1 text-left">Code</th><th className="px-2 py-1 text-center">Action</th>
+                      </tr></thead>
+                      <tbody>
+                        {empImportPreview.rows?.map((r: any) => (
+                          <tr key={r.row} className={r.has_errors ? 'bg-red-50' : ''}>
+                            <td className="px-2 py-1">{r.row}</td>
+                            <td className="px-2 py-1">{r.last_name}, {r.first_name}</td>
+                            <td className="px-2 py-1 font-mono">{r.employee_code || '—'}</td>
+                            <td className="px-2 py-1 text-center">{r.has_errors ? <span className="text-red-600">Error</span> : r.action}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {(empImportPreview.errors?.length > 0 || empImportPreview.execute_errors?.length > 0) && (
+                    <div className="max-h-24 overflow-y-auto mb-3 space-y-1">
+                      {(empImportPreview.execute_errors || empImportPreview.errors || []).map((e: any, i: number) => (
+                        <p key={i} className="text-xs text-red-600 bg-red-50 px-2 py-1 rounded">Row {e.row}: {e.message}</p>
+                      ))}
+                    </div>
+                  )}
+                  <div className="flex justify-end gap-3">
+                    <button onClick={() => setEmpImportPreview(null)} className="px-4 py-2 border rounded-lg text-sm">Back</button>
+                    <button onClick={handleEmpImportExecute} disabled={empImporting || empImportPreview.valid_rows === 0}
+                      className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm disabled:opacity-50">
+                      {empImporting ? 'Importing…' : `Import ${empImportPreview.valid_rows} Employees`}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div>
+                  <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center mb-4"
+                    onDragOver={(e) => e.preventDefault()}
+                    onDrop={(e) => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f && (f.name.endsWith('.csv') || f.name.endsWith('.xlsx'))) setEmpImportFile(f); else toast.error('CSV or Excel only'); }}>
+                    {empImportFile ? (
+                      <div>
+                        <FileText size={32} className="mx-auto text-blue-500 mb-2" />
+                        <p className="text-sm font-medium">{empImportFile.name}</p>
+                        <button type="button" onClick={() => setEmpImportFile(null)} className="text-xs text-red-500 mt-2">Remove</button>
+                      </div>
+                    ) : (
+                      <div>
+                        <Upload size={32} className="mx-auto text-gray-400 mb-2" />
+                        <label className="inline-block mt-2 px-4 py-2 bg-blue-600 text-white rounded text-sm cursor-pointer hover:bg-blue-700">
+                          Browse Files
+                          <input type="file" accept=".csv,.xlsx" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) setEmpImportFile(f); }} />
+                        </label>
+                      </div>
+                    )}
+                  </div>
+                  <button type="button" onClick={downloadEmployeeTemplate} className="text-xs text-blue-600 hover:underline mb-4">Download import template</button>
+                  <div className="flex justify-end gap-3">
+                    <button onClick={() => { setShowEmpImportModal(false); setEmpImportFile(null); }} className="px-4 py-2 border rounded-lg text-sm">Cancel</button>
+                    <button onClick={handleEmpImportPreview} disabled={!empImportFile || empImporting}
+                      className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm disabled:opacity-50">
+                      {empImporting ? 'Reading…' : 'Preview Import'}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </ModalOverlay>
+      )}
 
       {/* Employee Modal */}
       {showEmployeeModal && (

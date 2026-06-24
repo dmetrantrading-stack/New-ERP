@@ -90,6 +90,38 @@ router.get('/sales-by-cashier', authenticate, hasUserPerm('reports.view'), async
   }
 });
 
+// POS shift register (end-of-shift summaries)
+router.get('/pos-shifts', authenticate, hasUserPerm('reports.view'), async (req: AuthRequest, res: Response) => {
+  try {
+    const from = req.query.from as string || new Date().toISOString().split('T')[0];
+    const to = req.query.to as string || new Date().toISOString().split('T')[0];
+
+    const result = await query(
+      `SELECT ps.shift_number, u.full_name as cashier_name, ps.status,
+              ps.opening_date, ps.closing_date,
+              COALESCE(ps.opening_cash, 0) as opening_cash,
+              COALESCE(ps.closing_cash, 0) as closing_cash,
+              COALESCE(ps.expected_cash, 0) as expected_cash,
+              COALESCE(ps.net_sales, 0) as net_sales,
+              COALESCE(ps.cash_sales, 0) as cash_sales,
+              COALESCE(ps.card_sales, 0) as card_sales,
+              COALESCE(ps.gcash_sales, 0) as gcash_sales,
+              COALESCE(ps.maya_sales, 0) as maya_sales,
+              COALESCE(ps.charge_sales, 0) as charge_sales,
+              COALESCE(ps.void_total, 0) as void_total,
+              COALESCE(ps.closing_cash, 0) - COALESCE(ps.expected_cash, 0) as cash_variance
+       FROM pos_shifts ps
+       LEFT JOIN users u ON ps.user_id = u.id
+       WHERE ps.opening_date::date >= $1 AND ps.opening_date::date <= $2
+       ORDER BY ps.opening_date DESC`,
+      [from, to],
+    );
+    res.json(result.rows);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Sales by customer
 router.get('/sales-by-customer', authenticate, hasUserPerm('reports.view'), async (req: AuthRequest, res: Response) => {
   try {

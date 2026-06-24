@@ -28,7 +28,7 @@ const generateJENumber = async (): Promise<string> => {
 
 const generateCtNumber = async (): Promise<string> => {
   const r = await query(
-    "SELECT COALESCE(MAX(CAST(SUBSTRING(transaction_number FROM 4) AS INTEGER)), 0) + 1 as next FROM cash_transactions WHERE transaction_number ~ '^CT-'",
+    "SELECT COALESCE(MAX(CAST(SUBSTRING(transaction_number FROM 4) AS INTEGER)), 0) + 1 as next FROM cash_transactions WHERE transaction_number ~ '^CT-[0-9]+$'",
   );
   return `CT-${String(r.rows[0]?.next || 1).padStart(5, '0')}`;
 };

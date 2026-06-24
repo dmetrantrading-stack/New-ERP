@@ -10,12 +10,13 @@ Use this before production cutover. Mark each item **Pass / Fail / N/A** and not
 
 | # | Task | Pass | Notes |
 |---|------|:----:|-------|
-| A1 | Run DB migration: `cd backend && npm run migrate` | ☐ | |
+| A1 | Run DB migration: `cd backend && npm run migrate` | ☐ | See [DEPLOY.md](./DEPLOY.md) |
 | A2 | Seed / verify chart of accounts, default locations (Store, Warehouse) | ☐ | |
 | A3 | Business details filled (Settings → Business): name, TIN, address, logo | ☐ | |
 | A4 | Sales workflow set (Settings → Workflow): `ordered` vs `delivered` for SI copy | ☐ | |
 | A5 | User accounts created; permissions assigned per role (Settings → Permissions) | ☐ | |
 | A6 | Backend builds without errors: `cd backend && npm run build` | ☐ | Fix any TS errors first |
+| A6b | Restart Node after build; verify `GET /api/health` → `migrations_ok: true` | ☐ | See [DEPLOY.md](./DEPLOY.md) |
 | A7 | Smoke test passes: `cd backend && node scripts/smoke-test.mjs` (API running) | ☐ | |
 | A8 | Backups configured (PostgreSQL dump schedule + restore test) | ☐ | |
 | A9 | `.env` secured: `JWT_SECRET`, DB password, not committed to git | ☐ | |

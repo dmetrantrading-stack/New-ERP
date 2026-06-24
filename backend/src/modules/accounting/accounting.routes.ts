@@ -5,7 +5,12 @@ import { authenticate, AuthRequest, hasUserPerm } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
 import { auditAfter, auditBefore, auditSnapshot, AUDIT_FIELDS } from '../../utils/auditHelpers';
 import { getApAgingReport, getArAgingReport } from '../../utils/financeAging';
-import { COA_PERIOD_BALANCE_SUBQUERY, listChartOfAccountsWithBalance } from '../../utils/chartOfAccountsBalance';
+import {
+  COA_PERIOD_BALANCE_SUBQUERY,
+  ComparativePeriodColumn,
+  listChartOfAccountsWithBalance,
+} from '../../utils/chartOfAccountsBalance';
+import { normalizeComparativeColumns, runComparativeIncomeStatement } from '../../utils/comparativeIncomeStatement';
 import { findDuplicateCogsInvoices, repairDuplicateInvoiceCogs } from '../../utils/glIntegrity';
 
 const router = Router();
@@ -284,6 +289,181 @@ router.get('/income-statement', authenticate, hasUserPerm('finance.accounting.vi
       gross_margin_pct: totalIncome > 0 ? (grossProfit / totalIncome) * 100 : 0,
       net_margin_pct: totalIncome > 0 ? (netIncome / totalIncome) * 100 : 0,
       include_zero: includeZero,
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Comparative income statement (accrual, multiple period columns)
+router.post('/income-statement/comparative', authenticate, hasUserPerm('finance.accounting.view'), async (req: AuthRequest, res: Response) => {
+  try {
+    const report = await runComparativeIncomeStatement({
+      columns: req.body?.columns as ComparativePeriodColumn[],
+      excludeZero: req.body?.exclude_zero,
+      basis: req.body?.basis,
+    });
+    res.json(report);
+  } catch (error: any) {
+    const status = error.message?.includes('Column') || error.message?.includes('required') || error.message?.includes('Maximum')
+      ? 400
+      : 500;
+    res.status(status).json({ error: error.message });
+  }
+});
+
+type PlReportOptions = {
+  exclude_zero?: boolean;
+  show_account_codes?: boolean;
+  footer?: string;
+};
+
+function parsePlReportRow(row: any) {
+  const columns = Array.isArray(row.columns_json) ? row.columns_json : [];
+  const options = (row.options_json || {}) as PlReportOptions;
+  const fromDates = columns.map((c: { from?: string }) => c.from).filter(Boolean);
+  const toDates = columns.map((c: { to?: string }) => c.to).filter(Boolean);
+  return {
+    id: row.id,
+    title: row.title,
+    description: row.description || '',
+    basis: row.basis || 'accrual',
+    columns,
+    options: {
+      exclude_zero: options.exclude_zero !== false,
+      show_account_codes: options.show_account_codes !== false,
+      footer: options.footer || '',
+    },
+    period_from: fromDates.length ? fromDates.sort()[0] : null,
+    period_to: toDates.length ? toDates.sort().slice(-1)[0] : null,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    created_by_name: row.created_by_name || null,
+  };
+}
+
+// Saved profit & loss report configurations
+router.get('/profit-loss-reports', authenticate, hasUserPerm('finance.accounting.view'), async (req: AuthRequest, res: Response) => {
+  try {
+    const search = String(req.query.search || '').trim();
+    let sql = `
+      SELECT r.*, u.full_name AS created_by_name
+      FROM profit_loss_report_configs r
+      LEFT JOIN users u ON r.created_by = u.id
+      WHERE 1=1
+    `;
+    const params: string[] = [];
+    if (search) {
+      params.push(`%${search}%`);
+      sql += ` AND (r.title ILIKE $${params.length} OR COALESCE(r.description, '') ILIKE $${params.length})`;
+    }
+    sql += ' ORDER BY r.updated_at DESC, r.title ASC';
+    const result = await query(sql, params);
+    res.json(result.rows.map(parsePlReportRow));
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/profit-loss-reports/:id', authenticate, hasUserPerm('finance.accounting.view'), async (req: AuthRequest, res: Response) => {
+  try {
+    const result = await query(
+      `SELECT r.*, u.full_name AS created_by_name
+       FROM profit_loss_report_configs r
+       LEFT JOIN users u ON r.created_by = u.id
+       WHERE r.id = $1`,
+      [req.params.id],
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Report not found' });
+    res.json(parsePlReportRow(result.rows[0]));
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/profit-loss-reports', authenticate, hasUserPerm('finance.accounting.edit'), auditLog('Accounting', 'Create P&L Report'), async (req: AuthRequest, res: Response) => {
+  try {
+    const title = String(req.body?.title || 'Profit and Loss Statement').trim();
+    const description = String(req.body?.description || '').trim() || null;
+    const basis = req.body?.basis === 'cash' ? 'cash' : 'accrual';
+    const columns = normalizeComparativeColumns(req.body?.columns || []);
+    const options = {
+      exclude_zero: req.body?.options?.exclude_zero !== false,
+      show_account_codes: req.body?.options?.show_account_codes !== false,
+      footer: String(req.body?.options?.footer || '').trim(),
+    };
+
+    const result = await query(
+      `INSERT INTO profit_loss_report_configs (title, description, basis, columns_json, options_json, created_by, updated_by)
+       VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $6)
+       RETURNING *`,
+      [title, description, basis, JSON.stringify(columns), JSON.stringify(options), req.user!.id],
+    );
+    res.status(201).json(parsePlReportRow(result.rows[0]));
+  } catch (error: any) {
+    const status = error.message?.includes('Column') || error.message?.includes('required') || error.message?.includes('Maximum')
+      ? 400
+      : 500;
+    res.status(status).json({ error: error.message });
+  }
+});
+
+router.put('/profit-loss-reports/:id', authenticate, hasUserPerm('finance.accounting.edit'), auditLog('Accounting', 'Update P&L Report'), async (req: AuthRequest, res: Response) => {
+  try {
+    const existing = await query('SELECT id FROM profit_loss_report_configs WHERE id = $1', [req.params.id]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Report not found' });
+
+    const title = String(req.body?.title || 'Profit and Loss Statement').trim();
+    const description = String(req.body?.description || '').trim() || null;
+    const basis = req.body?.basis === 'cash' ? 'cash' : 'accrual';
+    const columns = normalizeComparativeColumns(req.body?.columns || []);
+    const options = {
+      exclude_zero: req.body?.options?.exclude_zero !== false,
+      show_account_codes: req.body?.options?.show_account_codes !== false,
+      footer: String(req.body?.options?.footer || '').trim(),
+    };
+
+    const result = await query(
+      `UPDATE profit_loss_report_configs
+       SET title = $1, description = $2, basis = $3, columns_json = $4::jsonb, options_json = $5::jsonb,
+           updated_by = $6, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $7
+       RETURNING *`,
+      [title, description, basis, JSON.stringify(columns), JSON.stringify(options), req.user!.id, req.params.id],
+    );
+    res.json(parsePlReportRow(result.rows[0]));
+  } catch (error: any) {
+    const status = error.message?.includes('Column') || error.message?.includes('required') || error.message?.includes('Maximum')
+      ? 400
+      : 500;
+    res.status(status).json({ error: error.message });
+  }
+});
+
+router.delete('/profit-loss-reports/:id', authenticate, hasUserPerm('finance.accounting.edit'), auditLog('Accounting', 'Delete P&L Report'), async (req: AuthRequest, res: Response) => {
+  try {
+    const result = await query('DELETE FROM profit_loss_report_configs WHERE id = $1 RETURNING id', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Report not found' });
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/profit-loss-reports/:id/run', authenticate, hasUserPerm('finance.accounting.view'), async (req: AuthRequest, res: Response) => {
+  try {
+    const result = await query('SELECT * FROM profit_loss_report_configs WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Report not found' });
+    const row = result.rows[0];
+    const options = (row.options_json || {}) as PlReportOptions;
+    const report = await runComparativeIncomeStatement({
+      columns: row.columns_json || [],
+      excludeZero: options.exclude_zero,
+      basis: row.basis,
+    });
+    res.json({
+      config: parsePlReportRow(row),
+      report,
     });
   } catch (error: any) {
     res.status(500).json({ error: error.message });

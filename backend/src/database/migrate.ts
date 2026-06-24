@@ -1314,6 +1314,23 @@ const migrate = async () => {
     await client.query(`ALTER TABLE sales_quotations ADD COLUMN IF NOT EXISTS terms_conditions TEXT`);
     await client.query(`ALTER TABLE sales_quotations ADD COLUMN IF NOT EXISTS payment_terms VARCHAR(100)`);
 
+    await client.query(`ALTER TABLE expenses ADD COLUMN IF NOT EXISTS bank_account_id INTEGER REFERENCES bank_accounts(id)`);
+    await client.query(`ALTER TABLE expenses ADD COLUMN IF NOT EXISTS payment_date DATE`);
+    await client.query(`
+      DO $$
+      DECLARE cname text;
+      BEGIN
+        SELECT conname INTO cname FROM pg_constraint
+        WHERE conrelid = 'expenses'::regclass AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%status%';
+        IF cname IS NOT NULL THEN
+          EXECUTE 'ALTER TABLE expenses DROP CONSTRAINT ' || quote_ident(cname);
+        END IF;
+        ALTER TABLE expenses ADD CONSTRAINT expenses_status_check
+          CHECK (status IN ('Draft', 'Posted', 'Void', 'Cancelled'));
+      EXCEPTION WHEN duplicate_object THEN NULL;
+      END $$;
+    `);
+
     // Reconcile journal entry header totals with actual line sums (e.g. SI from DR with skip_inventory)
     await client.query(`
       UPDATE journal_entries je
@@ -1411,6 +1428,12 @@ const migrate = async () => {
     await client.query(`
       INSERT INTO system_settings (setting_key, setting_value)
       VALUES ('auto_update_cost_from_rr', 'false')
+      ON CONFLICT (setting_key) DO NOTHING
+    `);
+
+    await client.query(`
+      INSERT INTO system_settings (setting_key, setting_value)
+      VALUES ('auto_reprice_on_gr', 'false')
       ON CONFLICT (setting_key) DO NOTHING
     `);
 
@@ -1702,6 +1725,21 @@ const migrate = async () => {
       ON CONFLICT (user_id, permission_key) DO NOTHING
     `);
 
+    await client.query(`
+      INSERT INTO user_permissions (user_id, permission_key)
+      SELECT DISTINCT user_id, 'hr.employees.export'
+      FROM user_permissions
+      WHERE permission_key IN ('hr.employees.create', 'hr.employees.edit')
+      ON CONFLICT (user_id, permission_key) DO NOTHING
+    `);
+    await client.query(`
+      INSERT INTO user_permissions (user_id, permission_key)
+      SELECT DISTINCT user_id, 'hr.employees.import'
+      FROM user_permissions
+      WHERE permission_key IN ('hr.employees.create', 'hr.employees.edit')
+      ON CONFLICT (user_id, permission_key) DO NOTHING
+    `);
+
     const expenseCategorySeeds: [string, string][] = [
       ['6110', 'Christmas Bonus'],
       ['6111', 'Purchaser Commissions'],
@@ -1730,6 +1768,88 @@ const migrate = async () => {
     await client.query(`ALTER TABLE delivery_notes ADD COLUMN IF NOT EXISTS driver_name VARCHAR(255)`);
     await client.query(`ALTER TABLE delivery_notes ADD COLUMN IF NOT EXISTS vehicle_plate VARCHAR(50)`);
     await client.query(`ALTER TABLE delivery_notes ADD COLUMN IF NOT EXISTS dispatch_notes TEXT`);
+
+    // ==================== LOANS PAYABLE (borrowed from bank / lender) ====================
+    await client.query(`
+      INSERT INTO chart_of_accounts (account_code, account_name, account_type)
+      VALUES ('6130', 'Interest Expense', 'Expense')
+      ON CONFLICT (account_code) DO NOTHING
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS loans_payable (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        loan_number VARCHAR(50) UNIQUE NOT NULL,
+        lender_name VARCHAR(255) NOT NULL,
+        lender_type VARCHAR(50) DEFAULT 'Bank' CHECK (lender_type IN ('Bank', 'Individual', 'Other')),
+        loan_date DATE NOT NULL DEFAULT CURRENT_DATE,
+        maturity_date DATE,
+        principal_amount DECIMAL(15,2) NOT NULL,
+        outstanding_principal DECIMAL(15,2) NOT NULL DEFAULT 0,
+        accrued_interest_balance DECIMAL(15,2) NOT NULL DEFAULT 0,
+        interest_rate_monthly DECIMAL(8,4) NOT NULL DEFAULT 0,
+        last_interest_accrual_date DATE,
+        status VARCHAR(50) DEFAULT 'Active' CHECK (status IN ('Active', 'Paid Off', 'Cancelled')),
+        deposit_account_type VARCHAR(50) DEFAULT 'bank' CHECK (deposit_account_type IN ('cash', 'bank')),
+        deposit_bank_account_id INTEGER REFERENCES bank_accounts(id),
+        notes TEXT,
+        created_by UUID REFERENCES users(id),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS loan_payable_transactions (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        loan_id UUID NOT NULL REFERENCES loans_payable(id) ON DELETE CASCADE,
+        txn_type VARCHAR(50) NOT NULL CHECK (txn_type IN ('Disbursement', 'Interest Accrual', 'Payment')),
+        txn_date DATE NOT NULL DEFAULT CURRENT_DATE,
+        amount DECIMAL(15,2) NOT NULL,
+        principal_component DECIMAL(15,2) NOT NULL DEFAULT 0,
+        interest_component DECIMAL(15,2) NOT NULL DEFAULT 0,
+        payment_account_type VARCHAR(50),
+        payment_bank_account_id INTEGER REFERENCES bank_accounts(id),
+        notes TEXT,
+        created_by UUID REFERENCES users(id),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await client.query(`
+      INSERT INTO user_permissions (user_id, permission_key)
+      SELECT DISTINCT user_id, 'finance.loans.view'
+      FROM user_permissions
+      WHERE permission_key IN ('finance.bank-cash.view', 'finance.expenses.view', 'finance.accounting.view')
+      ON CONFLICT (user_id, permission_key) DO NOTHING
+    `);
+    await client.query(`
+      INSERT INTO user_permissions (user_id, permission_key)
+      SELECT DISTINCT user_id, 'finance.loans.create'
+      FROM user_permissions
+      WHERE permission_key IN ('finance.bank-cash.create', 'finance.expenses.create')
+      ON CONFLICT (user_id, permission_key) DO NOTHING
+    `);
+    await client.query(`
+      INSERT INTO user_permissions (user_id, permission_key)
+      SELECT DISTINCT user_id, 'finance.loans.edit'
+      FROM user_permissions
+      WHERE permission_key IN ('finance.bank-cash.edit', 'finance.expenses.edit')
+      ON CONFLICT (user_id, permission_key) DO NOTHING
+    `);
+
+    // ==================== SAVED PROFIT & LOSS REPORT CONFIGS ====================
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS profit_loss_report_configs (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        title VARCHAR(255) NOT NULL DEFAULT 'Profit and Loss Statement',
+        description TEXT,
+        basis VARCHAR(20) NOT NULL DEFAULT 'accrual' CHECK (basis IN ('accrual', 'cash')),
+        columns_json JSONB NOT NULL DEFAULT '[]',
+        options_json JSONB NOT NULL DEFAULT '{}',
+        created_by UUID REFERENCES users(id),
+        updated_by UUID REFERENCES users(id),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
 
     // ==================== PHASE 3: Compliance & scale ====================
     await client.query(`

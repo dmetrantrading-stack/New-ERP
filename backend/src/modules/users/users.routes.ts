@@ -76,15 +76,7 @@ router.put('/:id', authenticate, hasUserPerm('system.users.edit'), auditLog('Use
   }
 });
 
-// Roles
-router.get('/roles', authenticate, async (req: AuthRequest, res: Response) => {
-  try {
-    const result = await query('SELECT * FROM roles ORDER BY name');
-    res.json(result.rows);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
-});
+// Roles — GET /roles defined once under ROLES MANAGEMENT below
 
 router.delete('/:id', authenticate, hasUserPerm('system.users.delete'), auditLog('Users', 'Delete'), async (req: AuthRequest, res: Response) => {
   try {

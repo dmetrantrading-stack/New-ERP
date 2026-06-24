@@ -24,6 +24,7 @@ export const ALL_REPORTS: ReportDef[] = [
   { id: 'daily-sales', label: 'Daily Sales', section: 'sales', perm: 'reports.view', singleDate: true },
   { id: 'sales-by-item', label: 'Sales by Item', section: 'sales', perm: 'reports.view' },
   { id: 'sales-by-cashier', label: 'Sales by Cashier', section: 'sales', perm: 'reports.view' },
+  { id: 'pos-shifts', label: 'POS Shift Register', section: 'sales', perm: 'reports.view', exportable: true },
   { id: 'sales-by-customer', label: 'Credit Sales by Customer', section: 'sales', perm: 'reports.view' },
   { id: 'sales-invoice-register', label: 'Sales Invoice Register', section: 'sales', perm: 'reports.view', exportable: true },
   { id: 'consolidated-sales', label: 'Consolidated Sales & GP', section: 'sales', perm: 'reports.view', exportable: true },
@@ -74,6 +75,7 @@ export function reportEndpoint(id: string, from: string, to: string): string {
     case 'daily-sales': return `/reports/daily-sales?date=${from}`;
     case 'sales-by-item': return `/reports/sales-by-item?from=${from}&to=${to}`;
     case 'sales-by-cashier': return `/reports/sales-by-cashier?from=${from}&to=${to}`;
+    case 'pos-shifts': return `/reports/pos-shifts?from=${from}&to=${to}`;
     case 'sales-by-customer': return `/reports/sales-by-customer?from=${from}&to=${to}`;
     case 'sales-invoice-register': return `/reports/sales-invoice-register?from=${from}&to=${to}`;
     case 'consolidated-sales': return `/reports/consolidated-sales?from=${from}&to=${to}`;
@@ -136,6 +138,19 @@ export function exportDailyReceivables(data: any, date: string) {
       r.receipt_number, r.payment_date, r.customer_name || '', r.payment_method,
       r.reference_number || '', r.check_bank || '', r.check_date || '',
       r.amount_received, r.created_by_name || '',
+    ]),
+  );
+}
+
+export function exportPosShifts(data: any, from: string, to: string) {
+  if (!Array.isArray(data) || data.length === 0) return;
+  downloadCsv(
+    `pos-shifts-${from}-to-${to}.csv`,
+    ['Shift #', 'Cashier', 'Opened', 'Closed', 'Status', 'Net Sales', 'Cash Sales', 'Card', 'GCash', 'Maya', 'Charge', 'Opening Cash', 'Expected', 'Closing', 'Variance', 'Void Total'],
+    data.map((s: any) => [
+      s.shift_number, s.cashier_name || '', s.opening_date || '', s.closing_date || '', s.status,
+      s.net_sales, s.cash_sales, s.card_sales, s.gcash_sales, s.maya_sales, s.charge_sales,
+      s.opening_cash, s.expected_cash, s.closing_cash, s.cash_variance, s.void_total,
     ]),
   );
 }

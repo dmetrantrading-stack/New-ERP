@@ -21,6 +21,34 @@ export const COA_PERIOD_BALANCE_SUBQUERY = (dateFromParam: string, dateToParam: 
   ), 0)
 `;
 
+const COA_SIGNED_BALANCE_JELP = COA_SIGNED_BALANCE_SQL.replace(/jel\./g, 'jelp.');
+
+export type ComparativePeriodColumn = { from: string; to: string; label?: string };
+
+/** Build SELECT expressions for multiple period columns on chart_of_accounts (alias `coa`). */
+export function buildComparativePeriodBalanceSelect(columns: ComparativePeriodColumn[]): {
+  selectSql: string;
+  params: string[];
+} {
+  const params: string[] = [];
+  const parts = columns.map((_col, i) => {
+    const fromIdx = params.length + 1;
+    params.push(_col.from, _col.to);
+    const fromParam = `$${fromIdx}`;
+    const toParam = `$${fromIdx + 1}`;
+    return `COALESCE((
+      SELECT SUM(${COA_SIGNED_BALANCE_JELP})
+      FROM journal_entry_lines jelp
+      JOIN journal_entries je ON jelp.entry_id = je.id
+        AND je.status = 'Posted'
+        AND je.entry_date >= ${fromParam}
+        AND je.entry_date <= ${toParam}
+      WHERE jelp.account_id = coa.id
+    ), 0) AS col_${i}`;
+  });
+  return { selectSql: parts.join(',\n             '), params };
+}
+
 export const COA_LIFETIME_BALANCE_SUBQUERY = `
   COALESCE((
     SELECT SUM(${COA_SIGNED_BALANCE_SQL.replace(/jel\./g, 'jell.')})

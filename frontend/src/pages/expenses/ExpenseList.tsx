@@ -3,7 +3,7 @@ import ModalOverlay from '../../components/ModalOverlay';
 import api from '../../lib/api';
 import { formatCurrency, formatDate, formatDateTime, parseNumericField } from '../../lib/utils';
 import NumericInput from '../../components/NumericInput';
-import { Plus, Trash2, Edit2, Receipt } from 'lucide-react';
+import { Plus, Trash2, Edit2, Receipt, Banknote } from 'lucide-react';
 import Pagination from '../../components/Pagination';
 import toast from 'react-hot-toast';
 import {
@@ -28,7 +28,14 @@ export default function ExpenseList() {
   const [showModal, setShowModal] = useState(false);
   const [showEditModal, setShowEditModal] = useState(false);
   const [editForm, setEditForm] = useState<any>(null);
-  const [form, setForm] = useState({ category_id: '', description: '', amount: '', expense_date: new Date().toISOString().split('T')[0], payment_method: 'Cash', reference_number: '', notes: '' });
+  const [form, setForm] = useState({
+    category_id: '', description: '', amount: '', expense_date: new Date().toISOString().split('T')[0],
+    payment_method: 'Cash', reference_number: '', notes: '', pay_now: false, bank_account_id: '',
+  });
+  const [bankAccounts, setBankAccounts] = useState<any[]>([]);
+  const [showPayModal, setShowPayModal] = useState(false);
+  const [payForm, setPayForm] = useState<any>(null);
+  const [paying, setPaying] = useState(false);
   const [page, setPage] = useState(1);
   const [total, setTotal] = useState(0);
   const [showCatModal, setShowCatModal] = useState(false);
@@ -41,7 +48,10 @@ export default function ExpenseList() {
   };
 
   useEffect(() => { loadExpenses(); }, [page]);
-  useEffect(() => { api.get('/expenses/categories').then((res) => setCategories(res.data)).catch((err) => toast.error(err.response?.data?.error || 'Failed to load data')); }, []);
+  useEffect(() => {
+    api.get('/expenses/categories').then((res) => setCategories(res.data)).catch((err) => toast.error(err.response?.data?.error || 'Failed to load data'));
+    api.get('/bank-cash/accounts').then((res) => setBankAccounts(res.data || [])).catch(() => {});
+  }, []);
 
   const handleDelete = async (id: string) => {
     if (!confirm('Cancel this expense?')) return;
@@ -52,16 +62,64 @@ export default function ExpenseList() {
   const handleSave = async () => {
     if (!form.category_id) { toast.error('Please select a category'); return; }
     if (!form.amount || parseNumericField(form.amount) <= 0) { toast.error('Amount must be greater than 0'); return; }
+    const isBank = form.payment_method === 'Check' || form.payment_method === 'Bank Transfer';
+    if (form.pay_now && isBank && !form.bank_account_id) { toast.error('Select a bank account'); return; }
     try {
-      await api.post('/expenses', { ...form, amount: parseNumericField(form.amount) });
-      toast.success('Expense recorded');
+      await api.post('/expenses', {
+        ...form,
+        amount: parseNumericField(form.amount),
+        bank_account_id: form.pay_now && isBank ? form.bank_account_id : undefined,
+      });
+      toast.success(form.pay_now ? 'Expense recorded and paid' : 'Expense saved — use Pay when ready');
       setShowModal(false);
-      setForm({ category_id: '', description: '', amount: '', expense_date: new Date().toISOString().split('T')[0], payment_method: 'Cash', reference_number: '', notes: '' });
+      setForm({
+        category_id: '', description: '', amount: '', expense_date: new Date().toISOString().split('T')[0],
+        payment_method: 'Cash', reference_number: '', notes: '', pay_now: false, bank_account_id: '',
+      });
       loadExpenses();
     } catch (err: any) { toast.error(err.response?.data?.error || 'Error'); }
   };
 
-  const openEdit = (e: any) => { setEditForm({ ...e }); setShowEditModal(true); };
+  const openPay = (e: any) => {
+    setPayForm({
+      id: e.id,
+      expense_number: e.expense_number,
+      amount: e.amount,
+      payment_method: 'Cash',
+      reference_number: '',
+      payment_date: new Date().toISOString().split('T')[0],
+      bank_account_id: '',
+      notes: '',
+    });
+    setShowPayModal(true);
+  };
+
+  const submitPay = async () => {
+    if (!payForm) return;
+    const isBank = payForm.payment_method === 'Check' || payForm.payment_method === 'Bank Transfer';
+    if (isBank && !payForm.bank_account_id) { toast.error('Select a bank account'); return; }
+    setPaying(true);
+    try {
+      await api.post(`/expenses/${payForm.id}/pay`, {
+        payment_method: payForm.payment_method,
+        reference_number: payForm.reference_number,
+        payment_date: payForm.payment_date,
+        bank_account_id: isBank ? payForm.bank_account_id : undefined,
+        notes: payForm.notes || undefined,
+      });
+      toast.success('Payment recorded');
+      setShowPayModal(false);
+      setPayForm(null);
+      loadExpenses();
+    } catch (err: any) { toast.error(err.response?.data?.error || 'Payment failed'); }
+    setPaying(false);
+  };
+
+  const openEdit = (e: any) => {
+    if (e.status === 'Cancelled') return;
+    setEditForm({ ...e });
+    setShowEditModal(true);
+  };
   const saveEdit = async () => {
     if (!editForm?.amount || parseNumericField(editForm.amount) <= 0) { toast.error('Amount must be greater than 0'); return; }
     try {
@@ -91,6 +149,7 @@ export default function ExpenseList() {
   });
   const pageTotal = filtered.reduce((s, e) => s + parseFloat(e.amount || 0), 0);
   const postedCount = expenses.filter((e) => e.status === 'Posted').length;
+  const unpaidCount = expenses.filter((e) => e.status === 'Draft').length;
 
   return (
     <FinancePageShell>
@@ -106,6 +165,7 @@ export default function ExpenseList() {
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
             <FinanceKpiCard label="Total records" value={total} hint="All expense entries" />
             <FinanceKpiCard label="Posted (page)" value={postedCount} tone="green" />
+            <FinanceKpiCard label="Unpaid (page)" value={unpaidCount} tone="amber" />
             <FinanceKpiCard label="Page total" value={formatCurrency(pageTotal)} tone="red" hint="Current page only" />
             <FinanceKpiCard label="Categories" value={categories.length} tone="blue" />
           </div>
@@ -140,11 +200,20 @@ export default function ExpenseList() {
                     <td className="px-4 py-2.5 text-right font-semibold tabular-nums text-red-700">{formatCurrency(e.amount)}</td>
                     <td className="px-4 py-2.5 text-xs text-slate-600">{formatDate(e.expense_date)}</td>
                     <td className="px-4 py-2.5 text-xs text-slate-500 tabular-nums whitespace-nowrap">{e.created_at ? formatDateTime(e.created_at) : '—'}</td>
-                    <td className="px-4 py-2.5 text-xs text-slate-600">{e.payment_method}</td>
-                    <td className="px-4 py-2.5 text-center"><FinanceStatusBadge status={e.status} /></td>
-                    <td className="px-4 py-2.5 text-right">
-                      <button onClick={() => openEdit(e)} className="p-1.5 hover:bg-blue-50 rounded-lg text-blue-600" title="Edit"><Edit2 size={14} /></button>
-                      <button onClick={() => handleDelete(e.id)} className="p-1.5 hover:bg-red-50 rounded-lg text-red-600" title="Cancel"><Trash2 size={14} /></button>
+                    <td className="px-4 py-2.5 text-xs text-slate-600">{e.payment_method || (e.status === 'Draft' ? 'Unpaid' : '—')}</td>
+                    <td className="px-4 py-2.5 text-center"><FinanceStatusBadge status={e.status === 'Draft' ? 'Draft' : e.status} /></td>
+                    <td className="px-4 py-2.5 text-right whitespace-nowrap">
+                      {e.status === 'Draft' && (
+                        <button
+                          onClick={() => openPay(e)}
+                          className="inline-flex items-center gap-1 px-2 py-1 mr-1 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg"
+                          title="Record payment"
+                        >
+                          <Banknote size={12} /> Pay
+                        </button>
+                      )}
+                      <button onClick={() => openEdit(e)} disabled={e.status === 'Cancelled'} className="p-1.5 hover:bg-blue-50 rounded-lg text-blue-600 disabled:opacity-40" title="Edit"><Edit2 size={14} /></button>
+                      <button onClick={() => handleDelete(e.id)} disabled={e.status === 'Cancelled'} className="p-1.5 hover:bg-red-50 rounded-lg text-red-600 disabled:opacity-40" title="Cancel"><Trash2 size={14} /></button>
                     </td>
                   </tr>
                 ))}
@@ -164,7 +233,7 @@ export default function ExpenseList() {
             { to: '/petty-cash', label: 'Petty Cash →' },
             { to: '/bank-cash', label: 'Bank & Cash →' },
           ]} />
-          <p className="text-[11px] text-slate-500 leading-relaxed">Expenses post journal entries automatically when saved. Cancelled expenses reverse the entry.</p>
+          <p className="text-[11px] text-slate-500 leading-relaxed">Save as unpaid (Draft) and use Pay later, or check Pay immediately on create. Draft expenses accrue to Accounts Payable until paid.</p>
         </FinanceSidebar>
       </div>
 
@@ -192,15 +261,39 @@ export default function ExpenseList() {
                 <div><label className="block text-sm font-medium mb-1">Date</label>
                   <input type="date" value={form.expense_date} onChange={(e) => setForm({ ...form, expense_date: e.target.value })}
                     className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" /></div>
+                <div className="col-span-2">
+                  <label className="flex items-center gap-2 text-sm cursor-pointer">
+                    <input type="checkbox" checked={form.pay_now} onChange={(e) => setForm({ ...form, pay_now: e.target.checked })}
+                      className="rounded border-gray-300" />
+                    Pay immediately (cash/bank out today)
+                  </label>
+                  <p className="text-xs text-slate-500 mt-1">Leave unchecked to save as <strong>Unpaid (Draft)</strong> — then use the green <strong>Pay</strong> button in the list.</p>
+                </div>
+                {form.pay_now && (
+                  <>
                 <div><label className="block text-sm font-medium mb-1">Payment Method</label>
                   <select value={form.payment_method} onChange={(e) => setForm({ ...form, payment_method: e.target.value })}
                     className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
-                    <option value="Cash">Cash</option><option value="Check">Check</option>
+                    <option value="Cash">Cash</option>
+                    <option value="Check">Check</option>
+                    <option value="Bank Transfer">Bank Transfer</option>
                   </select></div>
-                <div className="col-span-2"><label className="block text-sm font-medium mb-1">Reference Number</label>
+                {(form.payment_method === 'Check' || form.payment_method === 'Bank Transfer') && (
+                  <div><label className="block text-sm font-medium mb-1">Bank Account</label>
+                    <select value={form.bank_account_id} onChange={(e) => setForm({ ...form, bank_account_id: e.target.value })}
+                      className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
+                      <option value="">Select account</option>
+                      {bankAccounts.map((b: any) => (
+                        <option key={b.id} value={b.id}>{b.bank_name} — {b.account_name}</option>
+                      ))}
+                    </select></div>
+                )}
+                <div className={form.payment_method === 'Cash' ? 'col-span-2' : ''}><label className="block text-sm font-medium mb-1">Reference Number</label>
                   <input type="text" value={form.reference_number} onChange={(e) => setForm({ ...form, reference_number: e.target.value })}
                     placeholder="OR #, check #, transaction ref..."
                     className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" /></div>
+                  </>
+                )}
                 <div className="col-span-2"><label className="block text-sm font-medium mb-1">Notes</label>
                   <input type="text" value={form.notes || ''} onChange={(e) => setForm({ ...form, notes: e.target.value })}
                     className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" /></div>
@@ -208,6 +301,53 @@ export default function ExpenseList() {
               <div className="flex justify-end gap-3 mt-6">
                 <button onClick={() => setShowModal(false)} className="px-4 py-2 border rounded-lg text-sm">Cancel</button>
                 <button onClick={handleSave} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700">Save</button>
+              </div>
+            </div>
+          </div>
+        </ModalOverlay>
+      )}
+
+      {/* Pay Expense Modal */}
+      {showPayModal && payForm && (
+        <ModalOverlay onClose={() => { setShowPayModal(false); setPayForm(null); }}>
+          <div className="modal-content max-w-md">
+            <div className="p-6">
+              <h2 className="text-lg font-semibold mb-1">Pay Expense</h2>
+              <p className="text-sm text-slate-500 mb-4">{payForm.expense_number} — {formatCurrency(payForm.amount)}</p>
+              <div className="grid grid-cols-2 gap-3">
+                <div><label className="block text-sm font-medium mb-1">Payment Date</label>
+                  <input type="date" value={payForm.payment_date} onChange={(e) => setPayForm({ ...payForm, payment_date: e.target.value })}
+                    className="w-full px-3 py-2 border rounded-lg text-sm" /></div>
+                <div><label className="block text-sm font-medium mb-1">Payment Method</label>
+                  <select value={payForm.payment_method} onChange={(e) => setPayForm({ ...payForm, payment_method: e.target.value })}
+                    className="w-full px-3 py-2 border rounded-lg text-sm">
+                    <option value="Cash">Cash</option>
+                    <option value="Check">Check</option>
+                    <option value="Bank Transfer">Bank Transfer</option>
+                  </select></div>
+                {(payForm.payment_method === 'Check' || payForm.payment_method === 'Bank Transfer') && (
+                  <div className="col-span-2"><label className="block text-sm font-medium mb-1">Bank Account</label>
+                    <select value={payForm.bank_account_id} onChange={(e) => setPayForm({ ...payForm, bank_account_id: e.target.value })}
+                      className="w-full px-3 py-2 border rounded-lg text-sm">
+                      <option value="">Select account</option>
+                      {bankAccounts.map((b: any) => (
+                        <option key={b.id} value={b.id}>{b.bank_name} — {b.account_name}</option>
+                      ))}
+                    </select></div>
+                )}
+                <div className="col-span-2"><label className="block text-sm font-medium mb-1">Reference Number</label>
+                  <input type="text" value={payForm.reference_number} onChange={(e) => setPayForm({ ...payForm, reference_number: e.target.value })}
+                    placeholder="OR #, check #, transaction ref..."
+                    className="w-full px-3 py-2 border rounded-lg text-sm" /></div>
+                <div className="col-span-2"><label className="block text-sm font-medium mb-1">Notes</label>
+                  <input type="text" value={payForm.notes} onChange={(e) => setPayForm({ ...payForm, notes: e.target.value })}
+                    className="w-full px-3 py-2 border rounded-lg text-sm" /></div>
+              </div>
+              <div className="flex justify-end gap-3 mt-6">
+                <button onClick={() => { setShowPayModal(false); setPayForm(null); }} className="px-4 py-2 border rounded-lg text-sm">Cancel</button>
+                <button onClick={submitPay} disabled={paying} className="px-4 py-2 bg-emerald-600 text-white rounded-lg text-sm hover:bg-emerald-700 disabled:opacity-50">
+                  {paying ? 'Processing…' : 'Record payment'}
+                </button>
               </div>
             </div>
           </div>
@@ -239,15 +379,23 @@ export default function ExpenseList() {
                 <div><label className="block text-sm font-medium mb-1">Date</label>
                   <input type="date" value={editForm.expense_date?.split('T')[0] || ''} onChange={(e) => setEditForm({ ...editForm, expense_date: e.target.value })}
                     className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" /></div>
+                {editForm.status === 'Posted' && (
+                  <>
                 <div><label className="block text-sm font-medium mb-1">Payment Method</label>
-                  <select value={editForm.payment_method} onChange={(e) => setEditForm({ ...editForm, payment_method: e.target.value })}
+                  <select value={editForm.payment_method || 'Cash'} onChange={(e) => setEditForm({ ...editForm, payment_method: e.target.value })}
                     className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
                     <option value="Cash">Cash</option><option value="Check">Check</option>
+                    <option value="Bank Transfer">Bank Transfer</option>
                   </select></div>
                 <div className="col-span-2"><label className="block text-sm font-medium mb-1">Reference Number</label>
                   <input type="text" value={editForm.reference_number || ''} onChange={(e) => setEditForm({ ...editForm, reference_number: e.target.value })}
                     placeholder="OR #, check #, transaction ref..."
                     className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" /></div>
+                  </>
+                )}
+                {editForm.status === 'Draft' && (
+                  <div className="col-span-2 text-xs text-amber-700 bg-amber-50 rounded-lg px-3 py-2">Unpaid — use the Pay button after saving edits.</div>
+                )}
                 <div className="col-span-2"><label className="block text-sm font-medium mb-1">Notes</label>
                   <input type="text" value={editForm.notes || ''} onChange={(e) => setEditForm({ ...editForm, notes: e.target.value })}
                     className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" /></div>

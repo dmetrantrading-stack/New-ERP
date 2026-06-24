@@ -8,7 +8,8 @@ import { PRIMARY, FINANCE_FONT, financeTabClass, ACCOUNTING_TABS } from '../../l
 import toast from 'react-hot-toast';
 import DrillDownModal from '../../components/reports/DrillDownModal';
 import JournalEntryModal from '../../components/accounting/JournalEntryModal';
-import IncomeStatementReport, { IncomeStatementToolbar } from '../../components/accounting/IncomeStatementReport';
+import IncomeStatementTab from './IncomeStatementTab';
+import type { ComparativeIncomeStatementData } from '../../components/accounting/ComparativeIncomeStatementReport';
 import ChartOfAccountsReport from '../../components/accounting/ChartOfAccountsReport';
 import TrialBalanceReport from '../../components/accounting/TrialBalanceReport';
 import BalanceSheetReport from '../../components/accounting/BalanceSheetReport';
@@ -24,7 +25,8 @@ export default function AccountingPage() {
   const [accounts, setAccounts] = useState<any[]>([]);
   const [trialBalance, setTrialBalance] = useState<any[]>([]);
   const [balanceSheet, setBalanceSheet] = useState<any>(null);
-  const [incomeStatement, setIncomeStatement] = useState<any>(null);
+  const [incomeStatement, setIncomeStatement] = useState<ComparativeIncomeStatementData | null>(null);
+  const [isDrillRange, setIsDrillRange] = useState<{ from: string; to: string } | null>(null);
   const [journalEntries, setJournalEntries] = useState<any[]>([]);
   const [selectedEntry, setSelectedEntry] = useState<any>(null);
   const [generalLedger, setGeneralLedger] = useState<any[]>([]);
@@ -58,9 +60,6 @@ export default function AccountingPage() {
   const [glIntegrity, setGlIntegrity] = useState<any>(null);
   const [glIntegrityLoading, setGlIntegrityLoading] = useState(false);
   const [glRepairingId, setGlRepairingId] = useState<string | null>(null);
-  const [isFrom, setIsFrom] = useState(() => `${new Date().getFullYear()}-01-01`);
-  const [isTo, setIsTo] = useState(() => new Date().toISOString().split('T')[0]);
-  const [isLoading, setIsLoading] = useState(false);
   const [businessName, setBusinessName] = useState('');
 
   useEffect(() => {
@@ -123,7 +122,6 @@ export default function AccountingPage() {
     }
     if (activeTab === 'trial-balance') fetchTrialBalance();
     if (activeTab === 'balance-sheet') fetchBalanceSheet();
-    if (activeTab === 'income-statement') fetchIncomeStatement();
     if (activeTab === 'general-ledger') fetchGeneralLedger();
     if (activeTab === 'cash-flow') fetchCashFlow();
     if (activeTab === 'ar-aging') api.get('/accounting/ar-aging').then((r) => setArAging(r.data)).catch((err) => toast.error(err.response?.data?.error || 'Failed to load AR aging'));
@@ -134,22 +132,6 @@ export default function AccountingPage() {
     if (activeTab === 'journal-entries') fetchJournalEntries();
     if (activeTab === 'gl-integrity') fetchGlIntegrity();
   }, [activeTab, fetchJournalEntries]);
-
-  const fetchIncomeStatement = async () => {
-    setIsLoading(true);
-    try {
-      const [reportRes, bizRes] = await Promise.all([
-        api.get('/accounting/income-statement', { params: { from: isFrom, to: isTo } }),
-        businessName ? Promise.resolve({ data: { business_name: businessName } }) : api.get('/settings/business-details'),
-      ]);
-      setIncomeStatement(reportRes.data);
-      if (bizRes.data?.business_name) setBusinessName(bizRes.data.business_name);
-    } catch (err: any) {
-      toast.error(err.response?.data?.error || 'Failed to load income statement');
-    } finally {
-      setIsLoading(false);
-    }
-  };
 
   const fetchTransactionAudit = async () => {
     setAuditLoading(true);
@@ -322,25 +304,15 @@ export default function AccountingPage() {
         />
       )}
       {activeTab === 'income-statement' && (
-        <div className="space-y-4 max-w-4xl">
-          <IncomeStatementToolbar
-            from={isFrom}
-            to={isTo}
-            loading={isLoading}
-            onFromChange={setIsFrom}
-            onToChange={setIsTo}
-            onRefresh={fetchIncomeStatement}
-          />
-          {incomeStatement && !isLoading ? (
-            <IncomeStatementReport
-              data={incomeStatement}
-              businessName={businessName}
-              onAccountClick={setDrillDownAccount}
-            />
-          ) : (
-            <p className="text-gray-400 text-center py-12">{isLoading ? 'Loading income statement…' : 'Apply a date range to load the report.'}</p>
-          )}
-        </div>
+        <IncomeStatementTab
+          businessName={businessName}
+          canEdit={hasPerm('finance.accounting.edit')}
+          onReportSummaryChange={setIncomeStatement}
+          onAccountClick={(account) => {
+            setIsDrillRange({ from: account.drillFrom, to: account.drillTo });
+            setDrillDownAccount(account);
+          }}
+        />
       )}
 
       {/* Journal Entries */}
@@ -576,14 +548,17 @@ export default function AccountingPage() {
           {incomeStatement && activeTab === 'income-statement' && (
             <>
               <div>
-                <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Net Income</div>
-                <p className={`text-xl font-bold ${incomeStatement.net_income >= 0 ? 'text-green-700' : 'text-red-700'}`}>{formatCurrency(incomeStatement.net_income)}</p>
-                <p className="text-[11px] text-gray-500 mt-1">Margin {(incomeStatement.net_margin_pct ?? 0).toFixed(1)}%</p>
+                <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Net Income (total)</div>
+                <p className={`text-xl font-bold ${incomeStatement.totals.grand_total.net_income >= 0 ? 'text-green-700' : 'text-red-700'}`}>
+                  {formatCurrency(incomeStatement.totals.grand_total.net_income)}
+                </p>
+                <p className="text-[11px] text-gray-500 mt-1">
+                  {incomeStatement.columns.length} period{incomeStatement.columns.length === 1 ? '' : 's'}
+                </p>
               </div>
               <div>
-                <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Gross Profit</div>
-                <p className="text-lg font-bold text-slate-800">{formatCurrency(incomeStatement.gross_profit)}</p>
-                <p className="text-[11px] text-gray-500 mt-1">Margin {(incomeStatement.gross_margin_pct ?? 0).toFixed(1)}%</p>
+                <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Gross Profit (total)</div>
+                <p className="text-lg font-bold text-slate-800">{formatCurrency(incomeStatement.totals.grand_total.gross_profit)}</p>
               </div>
             </>
           )}
@@ -721,8 +696,15 @@ export default function AccountingPage() {
     {drillDownAccount && (
       <DrillDownModal
         account={drillDownAccount}
-        onClose={() => setDrillDownAccount(null)}
-        dateRange={activeTab === 'income-statement' ? { from: isFrom, to: isTo } : undefined}
+        onClose={() => {
+          setDrillDownAccount(null);
+          setIsDrillRange(null);
+        }}
+        dateRange={
+          activeTab === 'income-statement' && isDrillRange
+            ? isDrillRange
+            : undefined
+        }
       />
     )}
     </>

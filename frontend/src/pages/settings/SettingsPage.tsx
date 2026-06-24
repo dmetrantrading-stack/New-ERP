@@ -42,6 +42,7 @@ export default function SettingsPage() {
   const [biz, setBiz] = useState<any>({ ...DEFAULT_BIZ });
   const [salesWorkflow, setSalesWorkflow] = useState<{ invoice_copy_mode: 'ordered' | 'delivered' }>({ invoice_copy_mode: 'delivered' });
   const [purchaseWorkflow, setPurchaseWorkflow] = useState({ enforce_approval_limits: true });
+  const [inventoryCost, setInventoryCost] = useState({ auto_update_cost_from_rr: false, auto_reprice_on_gr: false });
   const [roles, setRoles] = useState<any[]>([]);
   const [savingRoles, setSavingRoles] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -85,16 +86,21 @@ export default function SettingsPage() {
   const loadAll = useCallback(async () => {
     setLoading(true);
     try {
-      const [bizRes, wfRes, lockRes, pwRes, rolesRes] = await Promise.all([
+      const [bizRes, wfRes, lockRes, pwRes, invCostRes, rolesRes] = await Promise.all([
         api.get('/settings/business-details'),
         api.get('/settings/sales-workflow'),
         api.get('/settings/accounting-lock'),
         api.get('/settings/purchase-workflow'),
+        api.get('/settings/inventory-cost'),
         api.get('/users/roles'),
       ]);
       if (bizRes.data) setBiz({ ...DEFAULT_BIZ, ...bizRes.data });
       setSalesWorkflow({ invoice_copy_mode: wfRes.data?.invoice_copy_mode || 'delivered' });
       setPurchaseWorkflow({ enforce_approval_limits: pwRes.data?.enforce_approval_limits !== false });
+      setInventoryCost({
+        auto_update_cost_from_rr: invCostRes.data?.auto_update_cost_from_rr === true,
+        auto_reprice_on_gr: invCostRes.data?.auto_reprice_on_gr === true,
+      });
       setRoles(rolesRes.data || []);
       setAccountingLockDate(lockRes.data?.accounting_lock_date || '');
     } catch { /* */ }
@@ -198,6 +204,16 @@ export default function SettingsPage() {
     try {
       await api.put('/settings/purchase-workflow', purchaseWorkflow);
       toast.success('Purchase approval settings saved');
+    } catch (err: any) { toast.error(err.response?.data?.error || 'Failed to save'); }
+    finally { setSavingWorkflow(false); }
+  };
+
+  const saveInventoryCost = async () => {
+    if (!canEdit) return;
+    setSavingWorkflow(true);
+    try {
+      await api.put('/settings/inventory-cost', inventoryCost);
+      toast.success('Inventory cost settings saved');
     } catch (err: any) { toast.error(err.response?.data?.error || 'Failed to save'); }
     finally { setSavingWorkflow(false); }
   };
@@ -696,6 +712,42 @@ export default function SettingsPage() {
                           <Save size={14} /> {savingRoles ? 'Saving...' : 'Save Role Limits'}
                         </button>
                       </div>
+                    )}
+                  </div>
+
+                  <div className="bg-white rounded-xl border border-gray-200 p-6 space-y-4">
+                    <div>
+                      <h2 className="text-sm font-semibold text-gray-800">Inventory Cost on Goods Receipt</h2>
+                      <p className="text-xs text-gray-500 mt-0.5">When a goods receipt is completed, optionally update product cost from weighted average inventory cost and reprice using existing markup ratios.</p>
+                    </div>
+                    <label className="flex items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={inventoryCost.auto_update_cost_from_rr}
+                        onChange={(e) => setInventoryCost((prev) => ({
+                          ...prev,
+                          auto_update_cost_from_rr: e.target.checked,
+                          auto_reprice_on_gr: e.target.checked ? prev.auto_reprice_on_gr : false,
+                        }))}
+                        disabled={!canEdit}
+                        className="rounded"
+                      />
+                      Auto-update product cost from receiving
+                    </label>
+                    <label className="flex items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={inventoryCost.auto_reprice_on_gr}
+                        onChange={(e) => setInventoryCost((prev) => ({ ...prev, auto_reprice_on_gr: e.target.checked }))}
+                        disabled={!canEdit || !inventoryCost.auto_update_cost_from_rr}
+                        className="rounded"
+                      />
+                      Auto-reprice retail / wholesale / distributor from implied markup
+                    </label>
+                    {canEdit && (
+                      <button type="button" onClick={saveInventoryCost} disabled={savingWorkflow} className="flex items-center gap-2 px-4 py-2 bg-blue-700 text-white rounded-lg text-sm font-semibold hover:bg-blue-800 disabled:opacity-50">
+                        <Save size={14} /> {savingWorkflow ? 'Saving...' : 'Save Inventory Cost Settings'}
+                      </button>
                     )}
                   </div>
                 </div>

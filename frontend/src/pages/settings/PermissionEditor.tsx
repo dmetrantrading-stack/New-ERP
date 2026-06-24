@@ -39,9 +39,10 @@ const MODULE_TREE = [
     { name: 'Bank & Cash', key: 'finance.bank-cash', actions: ['view','create','edit','delete','print','approve','export'] },
     { name: 'Expenses', key: 'finance.expenses', actions: ['view','create','edit','delete','print','approve','export'] },
     { name: 'Petty Cash', key: 'finance.petty-cash', actions: ['view','create','edit','delete','print','approve','export','replenish'] },
+    { name: 'Loans Payable', key: 'finance.loans', actions: ['view','create','edit','delete','print','approve','export'] },
   ]},
   { module: 'HR & Payroll', submodules: [
-    { name: 'Employees', key: 'hr.employees', actions: ['view','create','edit','delete','print','approve','export'] },
+    { name: 'Employees', key: 'hr.employees', actions: ['view','create','edit','delete','print','approve','export','import'] },
     { name: 'Attendance', key: 'hr.attendance', actions: ['view','create','edit','delete','print','approve','export'] },
     { name: 'Payroll & Payslip', key: 'hr.payroll', actions: ['view','create','edit','delete','print','approve','export'], note: 'Covers payroll, payslips, and SSS. Legacy hr.payslip.* keys are treated as hr.payroll.*.' },
     { name: 'Cash Advances', key: 'hr.cash-advances', actions: ['view','create','edit','delete','print','approve','export'] },

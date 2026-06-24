@@ -46,7 +46,13 @@ export default function ExecutiveDashboard() {
     setRefreshing(true);
     api.get('/dashboard/executive')
       .then(r => setData(r.data))
-      .catch(() => toast.error('Failed to load dashboard'))
+      .catch((err) => {
+        if (err.response?.status === 403) {
+          toast.error('You do not have permission to view the dashboard');
+        } else {
+          toast.error('Failed to load dashboard');
+        }
+      })
       .finally(() => { setLoading(false); setRefreshing(false); });
   };
 

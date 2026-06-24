@@ -25,6 +25,9 @@ const esc = (v: any) => {
   return /[,"\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 };
 
+const importCell = (row: string[], hm: Record<string, number>, col: string, fallback = '') =>
+  String(hm[col] !== undefined ? row[hm[col]] ?? fallback : fallback).trim();
+
 const parseFile = (buffer: Buffer, originalName: string): { headers: string[]; rows: string[][] } => {
   if (originalName.endsWith('.xlsx')) {
     const wb = XLSX.read(buffer, { type: 'buffer' });
@@ -222,18 +225,18 @@ router.post('/import/execute', authenticate, hasUserPerm('purchases.suppliers.ed
       const row = rows[ri];
       const rowNum = ri + 2;
       try {
-        const supplier_name = (hm['Supplier Name'] !== undefined ? row[hm['Supplier Name']] : '').trim();
+        const supplier_name = importCell(row, hm, 'Supplier Name');
         if (!supplier_name) { errors.push({ row: rowNum, message: 'Supplier name is required' }); continue; }
 
-        const contact_person = (hm['Contact Person'] !== undefined ? row[hm['Contact Person']] : '').trim() || null;
-        const address = (hm['Address'] !== undefined ? row[hm['Address']] : '').trim() || null;
-        const phone = (hm['Phone'] !== undefined ? row[hm['Phone']] : '').trim() || null;
-        const email = (hm['Email'] !== undefined ? row[hm['Email']] : '').trim() || null;
-        const payment_terms = (hm['Payment Terms'] !== undefined ? row[hm['Payment Terms']] : '').trim() || null;
-        const tin = (hm['TIN'] !== undefined ? row[hm['TIN']] : '').trim() || null;
-        const discountVal = (hm['Default Discount Percent'] !== undefined ? row[hm['Default Discount Percent']] : '0').trim();
+        const contact_person = importCell(row, hm, 'Contact Person') || null;
+        const address = importCell(row, hm, 'Address') || null;
+        const phone = importCell(row, hm, 'Phone') || null;
+        const email = importCell(row, hm, 'Email') || null;
+        const payment_terms = importCell(row, hm, 'Payment Terms') || null;
+        const tin = importCell(row, hm, 'TIN') || null;
+        const discountVal = importCell(row, hm, 'Default Discount Percent', '0');
         const default_discount_percent = parseFloat(discountVal) || 0;
-        const activeVal = (hm['Active'] !== undefined ? row[hm['Active']] : '').toLowerCase();
+        const activeVal = importCell(row, hm, 'Active').toLowerCase();
         const is_active = activeVal ? activeVal === 'yes' || activeVal === 'true' || activeVal === '1' || activeVal === 't' : undefined;
 
         const match = byName.get(supplier_name.toLowerCase());

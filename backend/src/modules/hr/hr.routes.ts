@@ -1,7 +1,10 @@
 import { Router, Response } from 'express';
+import multer from 'multer';
+import XLSX from 'xlsx';
 import { query, getClient } from '../../config/database';
 import { authenticate, AuthRequest, hasUserPerm, hasUserAnyPerm } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
+import { AppError } from '../../middleware/errorHandler';
 import { v4 as uuidv4 } from 'uuid';
 import jwt from 'jsonwebtoken';
 import { config } from '../../config';
@@ -31,6 +34,204 @@ import {
 } from '../../utils/payrollCompute';
 
 const router = Router();
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const ok = file.mimetype === 'text/csv'
+      || file.originalname.endsWith('.csv')
+      || file.mimetype === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      || file.originalname.endsWith('.xlsx');
+    cb(null, ok);
+  },
+});
+
+const empExport = hasUserPerm('hr.employees.export');
+const empImport = hasUserAnyPerm(['hr.employees.create', 'hr.employees.import']);
+
+const escCsv = (v: unknown) => {
+  const s = v == null ? '' : String(v);
+  return /[,"\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+
+const importCell = (row: string[], headerMap: Record<string, number>, col: string, fallback = '') =>
+  String(headerMap[col] !== undefined ? row[headerMap[col]] ?? fallback : fallback).trim();
+
+const parseImportNumber = (raw: string) => {
+  const n = parseFloat(String(raw).replace(/[₱$,\s]/g, ''));
+  return n;
+};
+
+const cellToImportString = (cell: unknown): string => {
+  if (cell instanceof Date && !isNaN(cell.getTime())) {
+    return cell.toISOString().slice(0, 10);
+  }
+  return String(cell ?? '').trim();
+};
+
+const EMPLOYMENT_TYPES = new Set(['Regular', 'Contractual', 'Probationary', 'Part-time']);
+
+const normalizeEmploymentType = (raw: string): string => {
+  const key = raw.trim().toLowerCase().replace(/\s+/g, ' ');
+  const map: Record<string, string> = {
+    regular: 'Regular',
+    contractual: 'Contractual',
+    probationary: 'Probationary',
+    'part-time': 'Part-time',
+    'part time': 'Part-time',
+    parttime: 'Part-time',
+  };
+  return map[key] || raw.trim();
+};
+
+const parseImportDate = (raw: string): string | null => {
+  const s = String(raw).trim();
+  if (!s) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+
+  const slash = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+  if (slash) {
+    const month = parseInt(slash[1], 10);
+    const day = parseInt(slash[2], 10);
+    const year = slash[3];
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    }
+  }
+
+  const n = parseFloat(s.replace(/,/g, ''));
+  if (!isNaN(n) && n >= 1 && n < 1000000) {
+    const dc = XLSX.SSF.parse_date_code(n);
+    if (dc && dc.y >= 1900 && dc.y <= 2100) {
+      return `${dc.y}-${String(dc.m).padStart(2, '0')}-${String(dc.d).padStart(2, '0')}`;
+    }
+  }
+
+  return null;
+};
+
+const parseEmployeeFile = (buffer: Buffer, originalName: string): { headers: string[]; rows: string[][] } => {
+  if (originalName.endsWith('.xlsx')) {
+    const wb = XLSX.read(buffer, { type: 'buffer', cellDates: true });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const aoa: unknown[][] = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+    if (aoa.length < 2) throw new AppError('File must have a header row and at least one data row');
+    const headers = aoa[0].map((h) => String(h).trim());
+    const rows = aoa.slice(1).filter((r) => (r as unknown[]).some((c) => cellToImportString(c)));
+    return { headers, rows: rows.map((r) => (r as unknown[]).map((c) => cellToImportString(c))) };
+  }
+  const content = buffer.toString('utf-8').replace(/^\uFEFF/, '');
+  const lines = content.split(/\r?\n/).filter((l) => l.trim());
+  if (lines.length < 2) throw new AppError('File must have a header row and at least one data row');
+  const parseLine = (line: string): string[] => {
+    const result: string[] = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (inQuotes) {
+        if (ch === '"' && line[i + 1] === '"') { current += '"'; i++; }
+        else if (ch === '"') { inQuotes = false; }
+        else { current += ch; }
+      } else if (ch === '"') { inQuotes = true; }
+      else if (ch === ',') { result.push(current.trim()); current = ''; }
+      else { current += ch; }
+    }
+    result.push(current.trim());
+    return result;
+  };
+  return { headers: parseLine(lines[0]), rows: lines.slice(1).map(parseLine) };
+};
+
+const buildEmployeeHeaderMap = (headers: string[]): Record<string, number> => {
+  const headerMap: Record<string, number> = {};
+  for (let i = 0; i < headers.length; i++) {
+    const h = headers[i].toLowerCase();
+    if (h === 'employee code' || h === 'code') headerMap['Employee Code'] = i;
+    else if (h === 'first name') headerMap['First Name'] = i;
+    else if (h === 'last name') headerMap['Last Name'] = i;
+    else if (h === 'middle name') headerMap['Middle Name'] = i;
+    else if (h === 'address') headerMap['Address'] = i;
+    else if (h === 'phone') headerMap['Phone'] = i;
+    else if (h === 'email') headerMap['Email'] = i;
+    else if (h === 'position') headerMap['Position'] = i;
+    else if (h === 'department') headerMap['Department'] = i;
+    else if (h === 'daily rate') headerMap['Daily Rate'] = i;
+    else if (h === 'monthly rate') headerMap['Monthly Rate'] = i;
+    else if (h === 'sss') headerMap['SSS'] = i;
+    else if (h === 'philhealth') headerMap['PhilHealth'] = i;
+    else if (h === 'pag-ibig' || h === 'pagibig') headerMap['Pag-IBIG'] = i;
+    else if (h === 'tin') headerMap['TIN'] = i;
+    else if (h === 'employment type') headerMap['Employment Type'] = i;
+    else if (h === 'hire date') headerMap['Hire Date'] = i;
+    else if (h === 'credit limit') headerMap['Credit Limit'] = i;
+    else if (h === 'sss default amount' || h === 'sss default') headerMap['SSS Default Amount'] = i;
+    else if (h === 'active' || h === 'is_active') headerMap['Active'] = i;
+  }
+  return headerMap;
+};
+
+const parseEmployeeRow = (row: string[], headerMap: Record<string, number>) => {
+  const entry: any = {
+    employee_code: importCell(row, headerMap, 'Employee Code'),
+    first_name: importCell(row, headerMap, 'First Name'),
+    last_name: importCell(row, headerMap, 'Last Name'),
+    middle_name: importCell(row, headerMap, 'Middle Name'),
+    address: importCell(row, headerMap, 'Address'),
+    phone: importCell(row, headerMap, 'Phone'),
+    email: importCell(row, headerMap, 'Email'),
+    position: importCell(row, headerMap, 'Position'),
+    department: importCell(row, headerMap, 'Department'),
+    daily_rate: importCell(row, headerMap, 'Daily Rate', '0'),
+    monthly_rate: importCell(row, headerMap, 'Monthly Rate', '0'),
+    sss: importCell(row, headerMap, 'SSS'),
+    philhealth: importCell(row, headerMap, 'PhilHealth'),
+    pagibig: importCell(row, headerMap, 'Pag-IBIG'),
+    tin: importCell(row, headerMap, 'TIN'),
+    employment_type: normalizeEmploymentType(importCell(row, headerMap, 'Employment Type', 'Regular') || 'Regular'),
+    hire_date: importCell(row, headerMap, 'Hire Date'),
+    credit_limit: importCell(row, headerMap, 'Credit Limit', '0'),
+    sss_default_amount: importCell(row, headerMap, 'SSS Default Amount', '0'),
+    active_raw: importCell(row, headerMap, 'Active', 'yes'),
+    has_errors: false,
+    errors: [] as string[],
+  };
+
+  if (!entry.first_name) { entry.has_errors = true; entry.errors.push('First name is required'); }
+  if (!entry.last_name) { entry.has_errors = true; entry.errors.push('Last name is required'); }
+
+  ['daily_rate', 'monthly_rate', 'credit_limit', 'sss_default_amount'].forEach((f) => {
+    if (entry[f] && isNaN(parseImportNumber(entry[f]))) {
+      entry.has_errors = true;
+      entry.errors.push(`${f} must be a number`);
+    }
+  });
+
+  const et = entry.employment_type;
+  if (et && !EMPLOYMENT_TYPES.has(et)) {
+    entry.has_errors = true;
+    entry.errors.push(`Employment type must be Regular, Contractual, Probationary, or Part-time`);
+  }
+
+  if (entry.hire_date) {
+    const parsedDate = parseImportDate(entry.hire_date);
+    if (!parsedDate) {
+      entry.has_errors = true;
+      entry.errors.push('Hire date must be YYYY-MM-DD or a valid Excel date');
+    } else {
+      entry.hire_date = parsedDate;
+    }
+  }
+
+  return entry;
+};
+
+const EMPLOYEE_EXPORT_HEADERS = [
+  'Employee Code', 'First Name', 'Last Name', 'Middle Name', 'Address', 'Phone', 'Email',
+  'Position', 'Department', 'Daily Rate', 'Monthly Rate', 'SSS', 'PhilHealth', 'Pag-IBIG', 'TIN',
+  'Employment Type', 'Hire Date', 'Credit Limit', 'SSS Default Amount', 'Active',
+];
 
 interface EmployeeLedgerRow {
   date: string;
@@ -152,6 +353,217 @@ router.get('/employees/all', authenticate, hasUserPerm('hr.employees.view'), asy
     const result = await query('SELECT * FROM employees ORDER BY last_name, first_name');
     res.json(result.rows);
   } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+router.get('/employees/export/template', authenticate, empExport, async (_req: AuthRequest, res: Response) => {
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename=employee_import_template.csv');
+  res.send(`\uFEFF${EMPLOYEE_EXPORT_HEADERS.map(escCsv).join(',')}\n`);
+});
+
+router.get('/employees/export', authenticate, empExport, async (req: AuthRequest, res: Response) => {
+  try {
+    const format = (req.query.format as string) || 'csv';
+    const activeOnly = req.query.active !== 'all';
+    const where = activeOnly ? 'WHERE is_active = true' : '';
+    const result = await query(`SELECT * FROM employees ${where} ORDER BY last_name, first_name`);
+
+    if (format === 'xlsx') {
+      const rows = result.rows.map((r: any) => ({
+        'Employee Code': r.employee_code,
+        'First Name': r.first_name,
+        'Last Name': r.last_name,
+        'Middle Name': r.middle_name,
+        Address: r.address,
+        Phone: r.phone,
+        Email: r.email,
+        Position: r.position,
+        Department: r.department,
+        'Daily Rate': r.daily_rate,
+        'Monthly Rate': r.monthly_rate,
+        SSS: r.sss,
+        PhilHealth: r.philhealth,
+        'Pag-IBIG': r.pagibig,
+        TIN: r.tin,
+        'Employment Type': r.employment_type,
+        'Hire Date': r.hire_date,
+        'Credit Limit': r.credit_limit,
+        'SSS Default Amount': r.sss_default_amount,
+        Active: r.is_active ? 'Yes' : 'No',
+      }));
+      const wb = XLSX.utils.book_new();
+      const ws = XLSX.utils.json_to_sheet(rows);
+      XLSX.utils.book_append_sheet(wb, ws, 'Employees');
+      const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', 'attachment; filename=employees_export.xlsx');
+      return res.send(buf);
+    }
+
+    const csv = `\uFEFF${EMPLOYEE_EXPORT_HEADERS.join(',')}\n${result.rows.map((r: any) => [
+      escCsv(r.employee_code), escCsv(r.first_name), escCsv(r.last_name), escCsv(r.middle_name),
+      escCsv(r.address), escCsv(r.phone), escCsv(r.email), escCsv(r.position), escCsv(r.department),
+      r.daily_rate, r.monthly_rate, escCsv(r.sss), escCsv(r.philhealth), escCsv(r.pagibig), escCsv(r.tin),
+      escCsv(r.employment_type), r.hire_date || '', r.credit_limit, r.sss_default_amount, r.is_active ? 'Yes' : 'No',
+    ].join(',')).join('\n')}`;
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename=employees_export.csv');
+    res.send(csv);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/employees/import/preview', authenticate, empImport, upload.single('file'), async (req: AuthRequest, res: Response) => {
+  try {
+    if (!req.file) throw new AppError('No file uploaded');
+    const { headers, rows } = parseEmployeeFile(req.file.buffer, req.file.originalname);
+    const headerMap = buildEmployeeHeaderMap(headers);
+    if (!('First Name' in headerMap) || !('Last Name' in headerMap)) {
+      throw new AppError('Missing required columns: First Name, Last Name');
+    }
+
+    const existing = await query('SELECT id, employee_code, email, first_name, last_name FROM employees');
+    const byCode = new Map(existing.rows.map((r: any) => [r.employee_code?.toLowerCase(), r]));
+    const byEmail = new Map(existing.rows.filter((r: any) => r.email).map((r: any) => [r.email.toLowerCase(), r]));
+    const byName = new Map(existing.rows.map((r: any) => [`${r.last_name}|${r.first_name}`.toLowerCase(), r]));
+
+    const previewRows: any[] = [];
+    const errors: { row: number; message: string }[] = [];
+    let validRows = 0;
+
+    for (let ri = 0; ri < rows.length; ri++) {
+      const entry = parseEmployeeRow(rows[ri], headerMap);
+      const rowNum = ri + 2;
+      entry.row = rowNum;
+
+      let match: any = null;
+      const code = entry.employee_code.trim();
+      const email = entry.email.trim().toLowerCase();
+      if (code) match = byCode.get(code.toLowerCase());
+      if (!match && email) match = byEmail.get(email);
+      if (!match) match = byName.get(`${entry.last_name}|${entry.first_name}`.toLowerCase());
+      entry.action = match ? 'Update' : 'Create';
+
+      if (!entry.has_errors) validRows++;
+      else errors.push({ row: rowNum, message: entry.errors.join('; ') });
+      previewRows.push(entry);
+    }
+
+    res.json({
+      file_name: req.file.originalname,
+      total_rows: rows.length,
+      valid_rows: validRows,
+      error_rows: errors.length,
+      rows: previewRows,
+      errors,
+    });
+  } catch (error: any) {
+    res.status(error instanceof AppError ? error.statusCode : 500).json({ error: error.message });
+  }
+});
+
+router.post('/employees/import/execute', authenticate, empImport, auditLog('HR', 'Import Employees'), upload.single('file'), async (req: AuthRequest, res: Response) => {
+  try {
+    if (!req.file) throw new AppError('No file uploaded');
+    const { headers, rows } = parseEmployeeFile(req.file.buffer, req.file.originalname);
+    const headerMap = buildEmployeeHeaderMap(headers);
+    if (!('First Name' in headerMap) || !('Last Name' in headerMap)) {
+      throw new AppError('Missing required columns: First Name, Last Name');
+    }
+
+    const existing = await query('SELECT id, employee_code, email, first_name, last_name FROM employees');
+    const byCode = new Map(existing.rows.map((r: any) => [r.employee_code?.toLowerCase(), r]));
+    const byEmail = new Map(existing.rows.filter((r: any) => r.email).map((r: any) => [r.email.toLowerCase(), r]));
+    const byName = new Map(existing.rows.map((r: any) => [`${r.last_name}|${r.first_name}`.toLowerCase(), r]));
+
+    let created = 0;
+    let updated = 0;
+    const errors: { row: number; message: string }[] = [];
+
+    for (let ri = 0; ri < rows.length; ri++) {
+      const rowNum = ri + 2;
+      try {
+        const entry = parseEmployeeRow(rows[ri], headerMap);
+        if (entry.has_errors) {
+          errors.push({ row: rowNum, message: entry.errors.join('; ') });
+          continue;
+        }
+
+        const activeVal = entry.active_raw.toLowerCase();
+        const is_active = !activeVal || activeVal === 'yes' || activeVal === 'true' || activeVal === '1' || activeVal === 'active';
+
+        let match: any = null;
+        const code = entry.employee_code.trim();
+        const email = entry.email.trim().toLowerCase();
+        if (code) match = byCode.get(code.toLowerCase());
+        if (!match && email) match = byEmail.get(email);
+        if (!match) match = byName.get(`${entry.last_name}|${entry.first_name}`.toLowerCase());
+
+        const payload = {
+          first_name: entry.first_name,
+          last_name: entry.last_name,
+          middle_name: entry.middle_name || null,
+          address: entry.address || null,
+          phone: entry.phone || null,
+          email: entry.email || null,
+          position: entry.position || null,
+          department: entry.department || null,
+          daily_rate: parseImportNumber(entry.daily_rate) || 0,
+          monthly_rate: parseImportNumber(entry.monthly_rate) || 0,
+          sss: entry.sss || null,
+          philhealth: entry.philhealth || null,
+          pagibig: entry.pagibig || null,
+          tin: entry.tin || null,
+          employment_type: entry.employment_type || 'Regular',
+          hire_date: entry.hire_date || null,
+          credit_limit: parseImportNumber(entry.credit_limit) || 0,
+          sss_default_amount: parseImportNumber(entry.sss_default_amount) || 0,
+          is_active,
+        };
+
+        if (match) {
+          await query(
+            `UPDATE employees SET first_name=$1, last_name=$2, middle_name=$3, address=$4, phone=$5, email=$6,
+              position=$7, department=$8, daily_rate=$9, monthly_rate=$10, sss=$11, philhealth=$12, pagibig=$13,
+              tin=$14, employment_type=$15, hire_date=$16, credit_limit=$17, sss_default_amount=$18, is_active=$19,
+              updated_at=CURRENT_TIMESTAMP WHERE id=$20`,
+            [
+              payload.first_name, payload.last_name, payload.middle_name, payload.address, payload.phone, payload.email,
+              payload.position, payload.department, payload.daily_rate, payload.monthly_rate, payload.sss, payload.philhealth,
+              payload.pagibig, payload.tin, payload.employment_type, payload.hire_date, payload.credit_limit,
+              payload.sss_default_amount, payload.is_active, match.id,
+            ],
+          );
+          updated++;
+        } else {
+          const employee_code = code || await getNextCode('employees', 'employee_code', 'DME-', 5);
+          const ins = await query(
+            `INSERT INTO employees (employee_code, first_name, last_name, middle_name, address, phone, email, position, department,
+              daily_rate, monthly_rate, sss, philhealth, pagibig, tin, employment_type, hire_date, credit_limit, sss_default_amount, is_active)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING id, employee_code, email, first_name, last_name`,
+            [
+              employee_code, payload.first_name, payload.last_name, payload.middle_name, payload.address, payload.phone,
+              payload.email, payload.position, payload.department, payload.daily_rate, payload.monthly_rate, payload.sss,
+              payload.philhealth, payload.pagibig, payload.tin, payload.employment_type, payload.hire_date,
+              payload.credit_limit, payload.sss_default_amount, payload.is_active,
+            ],
+          );
+          const row = ins.rows[0];
+          byCode.set(row.employee_code.toLowerCase(), row);
+          if (row.email) byEmail.set(row.email.toLowerCase(), row);
+          byName.set(`${row.last_name}|${row.first_name}`.toLowerCase(), row);
+          created++;
+        }
+      } catch (err: any) {
+        errors.push({ row: rowNum, message: err.message });
+      }
+    }
+
+    res.json({ imported: created, updated, errors, total: rows.length });
+  } catch (error: any) {
+    res.status(error instanceof AppError ? error.statusCode : 500).json({ error: error.message });
+  }
 });
 
 router.get('/employees/:id/ledger', authenticate, hasUserPerm('hr.employees.view'), async (req: AuthRequest, res: Response) => {

@@ -162,8 +162,10 @@ export const financeTableHeadClass = 'border-b border-slate-200 bg-slate-50/80 t
 
 export function FinanceStatusBadge({ status }: { status: string }) {
   const styles: Record<string, string> = {
+    Draft: 'bg-amber-50 text-amber-800 ring-amber-100',
     Posted: 'bg-emerald-50 text-emerald-800 ring-emerald-100',
     Active: 'bg-emerald-50 text-emerald-800 ring-emerald-100',
+    'Paid Off': 'bg-emerald-50 text-emerald-800 ring-emerald-100',
     Replenished: 'bg-emerald-50 text-emerald-800 ring-emerald-100',
     Paid: 'bg-emerald-50 text-emerald-800 ring-emerald-100',
     Unreplenished: 'bg-amber-50 text-amber-800 ring-amber-100',

@@ -19,6 +19,7 @@ import {
 } from '../../components/sales/SalesDocumentLayout';
 import { useAuth } from '../../store/auth';
 import { computeSalesDocLine, computeSalesDocTotals } from '../../lib/invoiceTax';
+import { getProductPriceForCustomer } from '../../lib/customerPricing';
 import { printDocument, printFromIframe } from '../../lib/printDocument';
 
 const STATUS_FILTERS = [
@@ -50,6 +51,7 @@ export default function SalesQuotations() {
   const [viewSq, setViewSq] = useState<any>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [selectedCustomer, setSelectedCustomer] = useState<any>(null);
+  const [customerPriceMap, setCustomerPriceMap] = useState<Record<string, number>>({});
   const [form, setForm] = useState<any>({ customer_id: '', validity_days: 7, valid_until: '', notes: '', items: [] });
   const [loading, setLoading] = useState(false);
   const [autoFocusItem, setAutoFocusItem] = useState(false);
@@ -74,6 +76,20 @@ export default function SalesQuotations() {
   useEffect(() => { api.get('/products?limit=200').then(r => setProducts(r.data?.data || r.data || [])).catch(() => {}); }, []);
 
   useEffect(() => {
+    if (!selectedCustomer?.id) {
+      setCustomerPriceMap({});
+      return;
+    }
+    api.get(`/customers/${selectedCustomer.id}/prices`)
+      .then((r) => {
+        const map: Record<string, number> = {};
+        (r.data || []).forEach((row: any) => { map[row.product_id] = parseFloat(row.unit_price); });
+        setCustomerPriceMap(map);
+      })
+      .catch(() => setCustomerPriceMap({}));
+  }, [selectedCustomer?.id]);
+
+  useEffect(() => {
     if (!creating || !form.customer_id || customers.length === 0) return;
     const c = customers.find((x: any) => String(x.id) === String(form.customer_id));
     if (c) setSelectedCustomer(c);
@@ -83,18 +99,14 @@ export default function SalesQuotations() {
     try { const r = await api.get(`/products/search/quick?q=${encodeURIComponent(q)}`); return r.data || []; } catch { return []; }
   };
 
-  const getPrice = (p: any) => {
-    const ct = selectedCustomer?.customer_type || 'Retail';
-    if (ct === 'Wholesale') return parseFloat(p.wholesale_price || 0);
-    if (ct === 'Distributor') return parseFloat(p.distributor_price || 0);
-    return parseFloat(p.retail_price || p.price || p.cost || 0);
-  };
+  const getPrice = (p: any) => getProductPriceForCustomer(selectedCustomer, p, customerPriceMap);
 
   const blankSqItem = () => ({ product_id: '', product_name: '', description: '', quantity: 1, unit_price: 0, discount: 0, tax_type: 'VAT', vat_amount: 0 });
 
   const selectCustomer = (cid: string) => {
     if (!cid) {
       setSelectedCustomer(null);
+      setCustomerPriceMap({});
       setForm((prev: any) => ({ ...prev, customer_id: '' }));
       return;
     }

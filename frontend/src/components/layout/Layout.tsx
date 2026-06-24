@@ -88,6 +88,7 @@ const menuSections: MenuSection[] = [
           { label: 'Bank & Cash', path: '/bank-cash' },
           { label: 'Expenses', path: '/expenses' },
           { label: 'Petty Cash', path: '/petty-cash' },
+          { label: 'Loans Payable', path: '/loans-payable' },
         ],
       },
     ],
@@ -131,6 +132,7 @@ const menuKeyToPerm: Record<string, string> = {
   '/bank-cash': 'finance.bank-cash.view',
   '/expenses': 'finance.expenses.view',
   '/petty-cash': 'finance.petty-cash.view',
+  '/loans-payable': 'finance.loans.view',
   '/hr': 'hr.employees.view',
   '/reports': 'reports.view',
   '/users': 'system.users.view',
@@ -169,6 +171,8 @@ export default function Layout({ children }: { children: React.ReactNode }) {
 
   const canAccessPath = (path: string) => {
     if (path === '/payables') return hasAnyPerm(['purchases.apv.view', 'purchases.payment-voucher.view']);
+    if (path === '/purchase-memos') return hasAnyPerm(['purchases.apv.view', 'purchases.apv.create']);
+    if (path === '/sales-memos') return hasPerm('sales.sales-invoice.view');
     if (path === '/hr') return hasAnyPerm([...HR_PAGE_ACCESS_PERMS]);
     if (path === '/pos') return hasAnyPerm(['pos.view', 'pos.write']);
     if (path === '/settings') return hasAnyPerm(['system.settings.view', 'system.users.view', 'system.users.edit']);
@@ -192,7 +196,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
     }
     if (path === '/stock-ops') {
       return location.pathname === '/stock-ops'
-        || ['/inventory', '/unit-conversions', '/production', '/inventory-count', '/stock-transfers'].includes(location.pathname);
+        || ['/inventory', '/unit-conversions', '/production', '/bom', '/inventory-count', '/stock-transfers'].includes(location.pathname);
     }
     if (path === '/products') {
       return location.pathname === '/products' || location.pathname === '/categories' || location.pathname === '/brands';

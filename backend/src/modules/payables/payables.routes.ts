@@ -52,8 +52,10 @@ const generateRefNumber = async (): Promise<string> => {
 };
 
 const getNextCode = async (table: string, field: string, prefix: string, startPos: number) => {
+  const numericOnly = table === 'cash_transactions' && prefix === 'CT-';
+  const pattern = numericOnly ? `^${prefix}[0-9]+$` : `^${prefix}`;
   const r = await query(
-    `SELECT COALESCE(MAX(CAST(SUBSTRING(${field} FROM ${startPos}) AS INTEGER)), 0) + 1 as next FROM ${table} WHERE ${field} ~ '^${prefix}'`
+    `SELECT COALESCE(MAX(CAST(SUBSTRING(${field} FROM ${startPos}) AS INTEGER)), 0) + 1 as next FROM ${table} WHERE ${field} ~ '${pattern}'`
   );
   return `${prefix}${String(r.rows[0]?.next || 1).padStart(5, '0')}`;
 };
@@ -469,7 +471,7 @@ router.post('/vouchers', authenticate, hasUserPerm('purchases.payment-voucher.cr
         [id, voucher_number, supplier_id, payDate, payment_method, reference_number, totalAmount, notes, terms_conditions || null, bank_account_id || null, check_date || null, check_bank || null, req.user!.id]
       );
 
-      await createAccounting(id, voucher_number, supplier_id, totalAmount, creditAccount, isBankPayment, bank_account_id, req.user!.id, client);
+      await createAccounting(id, voucher_number, supplier_id, totalAmount, creditAccount, isBankPayment, bank_account_id, req.user!.id, client, payDate);
       await syncSupplierBalanceFromApv(supplier_id, client);
 
       await client.query('COMMIT');
@@ -565,7 +567,7 @@ router.post('/vouchers', authenticate, hasUserPerm('purchases.payment-voucher.cr
       }
     }
 
-    await createAccounting(voucherIds[0], `Bulk-${voucherIds.length}-Payments`, supplier_id, totalAmount, creditAccount, isBankPayment, bank_account_id, req.user!.id, client);
+    await createAccounting(voucherIds[0], `Bulk-${voucherIds.length}-Payments`, supplier_id, totalAmount, creditAccount, isBankPayment, bank_account_id, req.user!.id, client, payDate);
     await syncSupplierBalanceFromApv(supplier_id, client);
 
     await client.query('COMMIT');
@@ -586,16 +588,17 @@ async function createAccounting(
   refId: string, refLabel: string, supplierId: number, amount: number,
   creditAccount: string, isBank: boolean, bankAccountId: string | undefined,
   createdBy: string,
-  db: { query: typeof query } = { query }
+  db: { query: typeof query } = { query },
+  entryDate?: string,
 ) {
-  // Journal entry: Debit AP (2000), Credit Cash/Bank
+  const txnDate = entryDate || new Date().toISOString().split('T')[0];
   const entryId = uuidv4();
   const entryNumber = await getNextCode('journal_entries', 'entry_number', 'JE-', 4);
 
   await db.query(
     `INSERT INTO journal_entries (id, entry_number, entry_date, reference_type, reference_id, description, total_debit, total_credit, created_by)
-     VALUES ($1, $2, CURRENT_DATE, 'Payment Voucher', $3, $4, $5, $5, $6)`,
-    [entryId, entryNumber, refId, `Payment to supplier ${supplierId}`, amount, createdBy]
+     VALUES ($1, $2, $3, 'Payment Voucher', $4, $5, $6, $6, $7)`,
+    [entryId, entryNumber, txnDate, refId, `Payment to supplier ${supplierId}`, amount, createdBy]
   );
 
   await db.query(
@@ -606,19 +609,19 @@ async function createAccounting(
      uuidv4(), creditAccount, `AP Payment ${refLabel}`]
   );
 
-  await db.query(
-    `INSERT INTO cash_transactions (id, transaction_number, transaction_type, amount, reference_type, reference_id, notes, created_by)
-     VALUES ($1, $2, 'Disbursement', $3, 'Payment Voucher', $4, $5, $6)`,
-    [uuidv4(), await getNextCode('cash_transactions', 'transaction_number', 'CT-', 4), amount, refId, `Payment ${refLabel}`, createdBy]
-  );
-
   if (isBank && bankAccountId) {
     await db.query(
-      `INSERT INTO bank_transactions (id, bank_account_id, transaction_type, amount, transaction_date, notes, created_by)
-       VALUES ($1, $2, 'Withdrawal', $3, CURRENT_DATE, $4, $5)`,
-      [uuidv4(), bankAccountId, amount, `Payment ${refLabel}`, createdBy]
+      `INSERT INTO bank_transactions (id, bank_account_id, transaction_type, amount, transaction_date, reference_type, reference_id, notes, created_by)
+       VALUES ($1, $2, 'Withdrawal', $3, $4, 'Payment Voucher', $5, $6, $7)`,
+      [uuidv4(), bankAccountId, amount, txnDate, refId, `Payment ${refLabel}`, createdBy]
     );
     await db.query(`UPDATE bank_accounts SET balance = balance - $1 WHERE id = $2`, [amount, bankAccountId]);
+  } else {
+    await db.query(
+      `INSERT INTO cash_transactions (id, transaction_number, transaction_type, amount, reference_type, reference_id, notes, created_by)
+       VALUES ($1, $2, 'Disbursement', $3, 'Payment Voucher', $4, $5, $6)`,
+      [uuidv4(), await getNextCode('cash_transactions', 'transaction_number', 'CT-', 4), amount, refId, `Payment ${refLabel}`, createdBy]
+    );
   }
 }
 
@@ -631,10 +634,11 @@ async function createApvJournalEntry(client: any, apv: any, createdBy: string) {
   const entryId = uuidv4();
   const entryNumber = await getNextCode('journal_entries', 'entry_number', 'JE-', 4);
 
+  const entryDate = apv.apv_date || new Date().toISOString().split('T')[0];
   await client.query(
     `INSERT INTO journal_entries (id, entry_number, entry_date, reference_type, reference_id, description, total_debit, total_credit, created_by)
-     VALUES ($1, $2, CURRENT_DATE, 'AP Voucher', $3, $4, $5, $5, $6)`,
-    [entryId, entryNumber, apv.id, `APV ${apv.apv_number}`, total, createdBy]
+     VALUES ($1, $2, $3, 'AP Voucher', $4, $5, $6, $6, $7)`,
+    [entryId, entryNumber, entryDate, apv.id, `APV ${apv.apv_number}`, total, createdBy]
   );
 
   if (inventoryDebit > 0) {

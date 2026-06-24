@@ -197,6 +197,42 @@ router.put('/purchase-workflow', authenticate, hasUserPerm('system.settings.edit
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
+router.get('/inventory-cost', authenticate, async (_req: AuthRequest, res: Response) => {
+  try {
+    const r = await query(`SELECT setting_key, setting_value FROM system_settings WHERE setting_key IN ('auto_update_cost_from_rr', 'auto_reprice_on_gr')`);
+    const map = Object.fromEntries(r.rows.map((row: any) => [row.setting_key, row.setting_value]));
+    res.json({
+      auto_update_cost_from_rr: map.auto_update_cost_from_rr === 'true',
+      auto_reprice_on_gr: map.auto_reprice_on_gr === 'true',
+    });
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+router.put('/inventory-cost', authenticate, hasUserPerm('system.settings.edit'), auditLog('Settings', 'Update Inventory Cost'), async (req: AuthRequest, res: Response) => {
+  try {
+    const { auto_update_cost_from_rr, auto_reprice_on_gr } = req.body;
+    const upsert = async (key: string, val: boolean) => {
+      await query(
+        `INSERT INTO system_settings (setting_key, setting_value) VALUES ($1, $2)
+         ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value`,
+        [key, val ? 'true' : 'false'],
+      );
+    };
+    if (typeof auto_update_cost_from_rr === 'boolean') {
+      await upsert('auto_update_cost_from_rr', auto_update_cost_from_rr);
+    }
+    if (typeof auto_reprice_on_gr === 'boolean') {
+      await upsert('auto_reprice_on_gr', auto_reprice_on_gr);
+    }
+    const r = await query(`SELECT setting_key, setting_value FROM system_settings WHERE setting_key IN ('auto_update_cost_from_rr', 'auto_reprice_on_gr')`);
+    const map = Object.fromEntries(r.rows.map((row: any) => [row.setting_key, row.setting_value]));
+    res.json({
+      auto_update_cost_from_rr: map.auto_update_cost_from_rr === 'true',
+      auto_reprice_on_gr: map.auto_reprice_on_gr === 'true',
+    });
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
 router.get('/accounting-lock', authenticate, async (req: AuthRequest, res: Response) => {
   try {
     const accounting_lock_date = await getAccountingLockDate();

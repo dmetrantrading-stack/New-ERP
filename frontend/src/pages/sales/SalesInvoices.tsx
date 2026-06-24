@@ -609,7 +609,7 @@ export default function SalesInvoices() {
                               onSelect={(p) => {
                                 if (!products.find(x => x.id === p.id)) setProducts(prev => [...prev, p]);
                                 const items = [...form.items];
-                                const price = getPrice(selectedCustomer?.customer_type, p);
+                                const price = getPrice(selectedCustomer, p);
                                 items[i].product_id = p.id;
                                 items[i].unit_price = price || 0;
                                 items[i].unit_cost = p.cost || 0;

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../../store/auth';
+import { getLandingPathForUser } from '../../lib/defaultLandingPath';
 import {
   Eye, EyeOff, Lock, Shield, User, LogIn, UserPlus,
   ShoppingCart, Package, BarChart3, Users,
@@ -55,7 +56,7 @@ export default function LoginPage() {
 
   useEffect(() => {
     setFadeIn(true);
-    if (user) navigate('/');
+    if (user) navigate(getLandingPathForUser(user));
   }, [user, navigate]);
 
   useEffect(() => {
@@ -89,11 +90,11 @@ export default function LoginPage() {
     }
     setLoading(true);
     try {
-      await login(username, password);
+      const userData = await login(username, password);
       if (rememberMe) localStorage.setItem('remembered_user', username);
       else localStorage.removeItem('remembered_user');
       toast.success('Welcome back!');
-      navigate('/');
+      navigate(getLandingPathForUser(userData));
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
       toast.error(msg || 'Invalid credentials. Please try again.');

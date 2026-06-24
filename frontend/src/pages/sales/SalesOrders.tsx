@@ -19,6 +19,7 @@ import { useSearchParams } from 'react-router-dom';
 import { useAuth } from '../../store/auth';
 import { computeSalesDocLine, computeSalesDocTotals } from '../../lib/invoiceTax';
 import { printDocument } from '../../lib/printDocument';
+import { getProductPriceForCustomer } from '../../lib/customerPricing';
 
 const STATUS_COLORS: Record<string, string> = {
   Draft: 'bg-gray-100 text-gray-700',
@@ -48,6 +49,7 @@ export default function SalesOrders() {
   const [viewSo, setViewSo] = useState<any>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [selectedCustomer, setSelectedCustomer] = useState<any>(null);
+  const [customerPriceMap, setCustomerPriceMap] = useState<Record<string, number>>({});
   const [form, setForm] = useState<any>({ customer_id: '', order_date: new Date().toISOString().split('T')[0], delivery_address: '', payment_terms: '', notes: '', terms_conditions: '', sq_id: '', sq_number: '', items: [] });
   const [loading, setLoading] = useState(false);
   const [autoFocusItem, setAutoFocusItem] = useState(false);
@@ -64,6 +66,20 @@ export default function SalesOrders() {
   useEffect(() => { loadOrders(); }, [page, statusFilter]);
   useEffect(() => { api.get('/customers?limit=200').then(r => setCustomers(r.data?.data || r.data || [])).catch(() => {}); }, []);
   useEffect(() => { api.get('/products?limit=200').then(r => setProducts(r.data?.data || r.data || [])).catch(() => {}); }, []);
+
+  useEffect(() => {
+    if (!selectedCustomer?.id) {
+      setCustomerPriceMap({});
+      return;
+    }
+    api.get(`/customers/${selectedCustomer.id}/prices`)
+      .then((r) => {
+        const map: Record<string, number> = {};
+        (r.data || []).forEach((row: any) => { map[row.product_id] = parseFloat(row.unit_price); });
+        setCustomerPriceMap(map);
+      })
+      .catch(() => setCustomerPriceMap({}));
+  }, [selectedCustomer?.id]);
 
   const applySqCopyPayload = (payload: any) => {
     setSelectedCustomer(buildSelectedCustomerFromSqCopy(payload, customers));
@@ -103,12 +119,7 @@ export default function SalesOrders() {
     try { const r = await api.get(`/products/search/quick?q=${encodeURIComponent(query)}`); return r.data || []; } catch { return []; }
   };
 
-  const getPrice = (p: any) => {
-    const ct = selectedCustomer?.customer_type || 'Retail';
-    if (ct === 'Wholesale') return parseFloat(p.wholesale_price || 0);
-    if (ct === 'Distributor') return parseFloat(p.distributor_price || 0);
-    return parseFloat(p.retail_price || p.price || p.cost || 0);
-  };
+  const getPrice = (p: any) => getProductPriceForCustomer(selectedCustomer, p, customerPriceMap);
 
   const addItem = () => setForm({ ...form, items: [...form.items, { product_id: '', description: '', quantity: 1, unit_price: 0, discount: 0, tax_type: 'VAT', vat_amount: 0 }] });
 
@@ -139,7 +150,7 @@ export default function SalesOrders() {
   };
 
   const selectCustomer = (cid: string) => {
-    if (!cid) { setSelectedCustomer(null); return; }
+    if (!cid) { setSelectedCustomer(null); setCustomerPriceMap({}); return; }
     const c = customers.find((x: any) => x.id == cid);
     if (!c) return;
     setSelectedCustomer(c);

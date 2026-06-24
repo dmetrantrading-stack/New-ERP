@@ -5,6 +5,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import { config } from './config';
+import { query } from './config/database';
 import { errorHandler, notFound } from './middleware/errorHandler';
 import { loginRateLimiter } from './middleware/rateLimit';
 
@@ -37,6 +38,7 @@ import productionRoutes from './modules/production/production.routes';
 import attachmentRoutes from './modules/attachments/attachment.routes';
 import supplierPriceHistoryRoutes from './modules/supplier-price-history/supplier-price-history.routes';
 import pettyCashRoutes from './modules/pettyCash/pettyCash.routes';
+import loansPayableRoutes from './modules/loans/loansPayable.routes';
 import orderRoutes from './modules/order.routes';
 import deliveryRoutes from './modules/delivery.routes';
 import quotationRoutes from './modules/quotation.routes';
@@ -102,6 +104,7 @@ app.use('/api/production', productionRoutes);
 app.use('/api/attachments', attachmentRoutes);
 app.use('/api/supplier-price-history', supplierPriceHistoryRoutes);
 app.use('/api/petty-cash', pettyCashRoutes);
+app.use('/api/loans-payable', loansPayableRoutes);
 app.use('/api/sales/memos', salesMemosRoutes);
 app.use('/api/purchases/memos', purchaseMemosRoutes);
 app.use('/api/payables/bir-2307', bir2307Routes);
@@ -109,9 +112,30 @@ app.use('/api/sales-orders', orderRoutes);
 app.use('/api/delivery-notes', deliveryRoutes);
 app.use('/api/sales-quotations', quotationRoutes);
 
-// Health check
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+// Health check — includes migration sanity for deploy verification (A2 / D1)
+app.get('/api/health', async (req, res) => {
+  const payload: Record<string, unknown> = {
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    environment: config.nodeEnv,
+  };
+  try {
+    const r = await query(`
+      SELECT
+        to_regclass('public.profit_loss_report_configs') IS NOT NULL AS profit_loss_reports,
+        to_regclass('public.loans_payable') IS NOT NULL AS loans_payable
+    `);
+    const row = r.rows[0] || {};
+    const migrationsOk = !!(row.profit_loss_reports && row.loans_payable);
+    payload.migrations_ok = migrationsOk;
+    if (!migrationsOk) {
+      payload.migration_hint = 'Run: cd backend && npm run migrate';
+    }
+  } catch {
+    payload.migrations_ok = false;
+    payload.db = 'unreachable';
+  }
+  res.json(payload);
 });
 
 // Production / hybrid: serve React SPA from same origin (cloud ERP in browser)

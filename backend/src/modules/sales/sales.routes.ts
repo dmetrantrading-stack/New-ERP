@@ -964,8 +964,8 @@ router.post('/collections', authenticate, hasUserPerm('sales.collections.create'
 
       await query(
         `INSERT INTO journal_entries (id, entry_number, entry_date, reference_type, reference_id, description, total_debit, total_credit, created_by)
-         VALUES ($1,$2,CURRENT_DATE,'Collection',$3,$4,$5,$5,$6)`,
-        [entryId, entryNumber, receiptId, `Collection ${receipt_number}`, totalApplied, req.user!.id]
+         VALUES ($1,$2,$3,'Collection',$4,$5,$6,$6,$7)`,
+        [entryId, entryNumber, payDate, receiptId, `Collection ${receipt_number}`, totalApplied, req.user!.id]
       );
       if (totalCash > 0) {
         await query(
@@ -1004,8 +1004,8 @@ router.post('/collections', authenticate, hasUserPerm('sales.collections.create'
       if (isBank && bank_account_id && totalCash > 0) {
         await query(
           `INSERT INTO bank_transactions (id, bank_account_id, transaction_type, amount, transaction_date, notes, created_by)
-           VALUES ($1,$2,'Deposit',$3,CURRENT_DATE,$4,$5)`,
-          [uuidv4(), bank_account_id, totalCash, `Collection ${receipt_number}`, req.user!.id]
+           VALUES ($1,$2,'Deposit',$3,$4,$5,$6)`,
+          [uuidv4(), bank_account_id, totalCash, payDate, `Collection ${receipt_number}`, req.user!.id]
         );
         await query('UPDATE bank_accounts SET balance = balance + $1 WHERE id = $2', [totalCash, bank_account_id]);
       }
@@ -1091,8 +1091,8 @@ router.post('/collections', authenticate, hasUserPerm('sales.collections.create'
 
     await query(
       `INSERT INTO journal_entries (id, entry_number, entry_date, reference_type, reference_id, description, total_debit, total_credit, created_by)
-       VALUES ($1, $2, CURRENT_DATE, 'Collection', $3, $4, $5, $5, $6)`,
-      [entryId, entryNumber, id, `Collection ${receipt_number}`, appliedAmount, req.user!.id]
+       VALUES ($1, $2, $3, 'Collection', $4, $5, $6, $6, $7)`,
+      [entryId, entryNumber, payDate, id, `Collection ${receipt_number}`, appliedAmount, req.user!.id]
     );
 
     if (cashCollected > 0) {
@@ -1137,8 +1137,8 @@ router.post('/collections', authenticate, hasUserPerm('sales.collections.create'
     if (isBankPayment && bank_account_id && cashCollected > 0) {
       await query(
         `INSERT INTO bank_transactions (id, bank_account_id, transaction_type, amount, transaction_date, notes, created_by)
-         VALUES ($1, $2, 'Deposit', $3, CURRENT_DATE, $4, $5)`,
-        [uuidv4(), bank_account_id, cashCollected, `Collection ${receipt_number}`, req.user!.id]
+         VALUES ($1, $2, 'Deposit', $3, $4, $5, $6)`,
+        [uuidv4(), bank_account_id, cashCollected, payDate, `Collection ${receipt_number}`, req.user!.id]
       );
       await query(`UPDATE bank_accounts SET balance = balance + $1 WHERE id = $2`, [cashCollected, bank_account_id]);
     }

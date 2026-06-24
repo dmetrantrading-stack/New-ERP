@@ -96,6 +96,7 @@ const seed = async () => {
       { code: '6120', name: 'Legal Fees', type: 'Expense' },
       { code: '6121', name: 'Motor Vehicle Expense', type: 'Expense' },
       { code: '6122', name: 'Food Allowance Expense', type: 'Expense' },
+      { code: '6130', name: 'Interest Expense', type: 'Expense' },
     ];
     for (const acc of accounts) {
       await client.query(

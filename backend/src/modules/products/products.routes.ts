@@ -144,6 +144,14 @@ const esc = (v: any) => {
   return /[,"\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 };
 
+const importCell = (row: string[], headerMap: Record<string, number>, col: string, fallback = '') =>
+  String(headerMap[col] !== undefined ? row[headerMap[col]] ?? fallback : fallback).trim();
+
+const parseImportNumber = (raw: string) => {
+  const n = parseFloat(String(raw).replace(/[₱$,\s]/g, ''));
+  return n;
+};
+
 // Parse uploaded file (CSV or XLSX) into rows of arrays
 const parseFile = (buffer: Buffer, originalName: string): { headers: string[]; rows: string[][] } => {
   if (originalName.endsWith('.xlsx')) {
@@ -347,7 +355,9 @@ router.post('/import/preview', authenticate, hasUserPerm('inventory.inventory.ed
     const existingProds = await query('SELECT id, sku, barcode, name FROM products');
     const bySku = new Map(existingProds.rows.map((r: any) => [r.sku, r]));
     const byBarcode = new Map(existingProds.rows.map((r: any) => [r.barcode?.toLowerCase(), r]));
-    const byName = new Map(existingProds.rows.map((r: any) => [r.name.toLowerCase(), r]));
+    const byName = new Map(
+      existingProds.rows.filter((r: any) => r.name).map((r: any) => [r.name.toLowerCase(), r]),
+    );
 
     const previewRows: any[] = [];
     const errors: { row: number; message: string }[] = [];
@@ -376,9 +386,9 @@ router.post('/import/preview', authenticate, hasUserPerm('inventory.inventory.ed
 
       if (!entry.name) { entry.has_errors = true; entry.errors.push('Product name is required'); }
 
-      // Validate numeric fields
+      // Validate numeric fields (strip currency symbols from Excel exports)
       ['cost','retail_price','wholesale_price','distributor_price','reorder_level','chilled_price'].forEach(f => {
-        if (isNaN(parseFloat(entry[f]))) { entry.has_errors = true; entry.errors.push(`${f} must be a number`); }
+        if (isNaN(parseImportNumber(entry[f]))) { entry.has_errors = true; entry.errors.push(`${f} must be a number`); }
       });
 
       // Look up category
@@ -460,7 +470,7 @@ router.post('/import/execute', authenticate, hasUserPerm('inventory.inventory.ed
     const [catRows, brandRows, existingProds] = await Promise.all([
       query('SELECT id, LOWER(name) as name FROM categories'),
       query('SELECT id, LOWER(name) as name FROM brands'),
-      query('SELECT id, sku, barcode FROM products')
+      query('SELECT id, sku, barcode, name FROM products')
     ]);
     const catMap: Record<string, string> = {};
     catRows.rows.forEach((r: any) => { catMap[r.name] = r.id; });
@@ -470,7 +480,9 @@ router.post('/import/execute', authenticate, hasUserPerm('inventory.inventory.ed
     // Build lookup maps for matching
     const bySku = new Map(existingProds.rows.map((r: any) => [r.sku, r]));
     const byBarcode = new Map(existingProds.rows.map((r: any) => [r.barcode?.toLowerCase(), r]));
-    const byName = new Map(existingProds.rows.map((r: any) => [r.name.toLowerCase(), r]));
+    const byName = new Map(
+      existingProds.rows.filter((r: any) => r.name).map((r: any) => [r.name.toLowerCase(), r]),
+    );
 
     let created = 0, updated = 0;
     const errors: { row: number; message: string }[] = [];
@@ -479,26 +491,26 @@ router.post('/import/execute', authenticate, hasUserPerm('inventory.inventory.ed
       const row = rows[ri];
       const rowNum = ri + 2;
       try {
-        const name = (headerMap['Name'] !== undefined ? row[headerMap['Name']] : '').trim();
+        const name = importCell(row, headerMap, 'Name');
         if (!name) { errors.push({ row: rowNum, message: 'Product name is required' }); continue; }
 
-        const sku = (headerMap['SKU'] !== undefined ? row[headerMap['SKU']] : '').trim();
-        const barcode = (headerMap['Barcode'] !== undefined ? row[headerMap['Barcode']] : '').trim();
-        const catName = (headerMap['Category'] !== undefined ? row[headerMap['Category']] : '').trim().toLowerCase();
-        const brandName = (headerMap['Brand'] !== undefined ? row[headerMap['Brand']] : '').trim().toLowerCase();
-        const unit_of_measure = (headerMap['Unit of Measure'] !== undefined ? row[headerMap['Unit of Measure']] : 'pc').trim();
-        const cost = parseFloat(headerMap['Cost'] !== undefined ? row[headerMap['Cost']] : '0') || 0;
-        const retail_price = parseFloat(headerMap['Retail Price'] !== undefined ? row[headerMap['Retail Price']] : '0') || 0;
-        const wholesale_price = parseFloat(headerMap['Wholesale Price'] !== undefined ? row[headerMap['Wholesale Price']] : '0') || 0;
-        const distributor_price = parseFloat(headerMap['Distributor Price'] !== undefined ? row[headerMap['Distributor Price']] : '0') || 0;
-        const reorder_level = parseFloat(headerMap['Reorder Level'] !== undefined ? row[headerMap['Reorder Level']] : '0') || 0;
-        const tax_type = (headerMap['Tax Type'] !== undefined ? row[headerMap['Tax Type']] : 'VAT').trim() || 'VAT';
-        const price_type = (headerMap['Price Type'] !== undefined ? row[headerMap['Price Type']] : 'VAT Inclusive').trim() || 'VAT Inclusive';
-        const description = headerMap['Description'] !== undefined ? row[headerMap['Description']] : '';
-        const hasChilled = (headerMap['Has Chilled Variant'] !== undefined ? row[headerMap['Has Chilled Variant']] : '').toLowerCase();
+        const sku = importCell(row, headerMap, 'SKU');
+        const barcode = importCell(row, headerMap, 'Barcode');
+        const catName = importCell(row, headerMap, 'Category').toLowerCase();
+        const brandName = importCell(row, headerMap, 'Brand').toLowerCase();
+        const unit_of_measure = importCell(row, headerMap, 'Unit of Measure', 'pc') || 'pc';
+        const cost = parseImportNumber(importCell(row, headerMap, 'Cost', '0')) || 0;
+        const retail_price = parseImportNumber(importCell(row, headerMap, 'Retail Price', '0')) || 0;
+        const wholesale_price = parseImportNumber(importCell(row, headerMap, 'Wholesale Price', '0')) || 0;
+        const distributor_price = parseImportNumber(importCell(row, headerMap, 'Distributor Price', '0')) || 0;
+        const reorder_level = parseImportNumber(importCell(row, headerMap, 'Reorder Level', '0')) || 0;
+        const tax_type = importCell(row, headerMap, 'Tax Type', 'VAT') || 'VAT';
+        const price_type = importCell(row, headerMap, 'Price Type', 'VAT Inclusive') || 'VAT Inclusive';
+        const description = importCell(row, headerMap, 'Description');
+        const hasChilled = importCell(row, headerMap, 'Has Chilled Variant').toLowerCase();
         const has_chilled_variant = hasChilled === 'yes' || hasChilled === 'true' || hasChilled === '1';
-        const chilled_price = parseFloat(headerMap['Chilled Price'] !== undefined ? row[headerMap['Chilled Price']] : '0') || 0;
-        const isActiveVal = (headerMap['Active'] !== undefined ? row[headerMap['Active']] : '').toLowerCase();
+        const chilled_price = parseImportNumber(importCell(row, headerMap, 'Chilled Price', '0')) || 0;
+        const isActiveVal = importCell(row, headerMap, 'Active').toLowerCase();
         const is_active = isActiveVal ? isActiveVal === 'yes' || isActiveVal === 'true' || isActiveVal === '1' || isActiveVal === 't' : undefined;
         const category_id = catName ? catMap[catName] || null : null;
         const brand_id = brandName ? brandMap[brandName] || null : null;

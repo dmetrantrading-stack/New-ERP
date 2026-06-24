@@ -24,6 +24,7 @@ import {
 } from '../../utils/purchaseTax';
 import { auditAfter, auditBefore, auditSnapshot, AUDIT_FIELDS } from '../../utils/auditHelpers';
 import { assertApprovalLimit } from '../../utils/approvalLimit';
+import { repriceFromCostChange } from '../../utils/productPricing';
 
 const router = Router();
 
@@ -609,11 +610,17 @@ router.post('/receipts', authenticate, hasUserPerm('purchases.receiving-report.c
     }
 
     // Update product-level cost based on moving average across all locations (once per GR)
-    const autoSetting = await client.query(`SELECT setting_value FROM system_settings WHERE setting_key = 'auto_update_cost_from_rr'`);
-    const autoUpdate = autoSetting.rows.length > 0 && autoSetting.rows[0].setting_value === 'true';
+    const autoSetting = await client.query(`SELECT setting_key, setting_value FROM system_settings WHERE setting_key IN ('auto_update_cost_from_rr', 'auto_reprice_on_gr')`);
+    const settingsMap = Object.fromEntries(autoSetting.rows.map((r: any) => [r.setting_key, r.setting_value]));
+    const autoUpdate = settingsMap.auto_update_cost_from_rr === 'true';
+    const autoReprice = settingsMap.auto_reprice_on_gr === 'true';
     if (autoUpdate) {
       const uniqueProductIds = [...new Set(items.map((i: any) => i.product_id))];
       for (const pid of uniqueProductIds) {
+        const prod = await client.query(
+          'SELECT cost, retail_price, wholesale_price, distributor_price FROM products WHERE id = $1',
+          [pid],
+        );
         const inv = await client.query(
           `SELECT SUM(quantity) as total_qty, SUM(quantity * unit_cost) as total_value FROM inventory WHERE product_id = $1`,
           [pid]
@@ -621,10 +628,30 @@ router.post('/receipts', authenticate, hasUserPerm('purchases.receiving-report.c
         const totalQty = parseFloat(inv.rows[0]?.total_qty || 0);
         const totalValue = parseFloat(inv.rows[0]?.total_value || 0);
         if (totalQty > 0) {
-          await client.query(
-            `UPDATE products SET cost = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
-            [totalValue / totalQty, pid]
-          );
+          const oldCost = parseFloat(prod.rows[0]?.cost) || 0;
+          const newCost = totalValue / totalQty;
+          const priceUpdates = autoReprice
+            ? repriceFromCostChange(
+              oldCost,
+              newCost,
+              parseFloat(prod.rows[0]?.retail_price) || 0,
+              parseFloat(prod.rows[0]?.wholesale_price) || 0,
+              parseFloat(prod.rows[0]?.distributor_price) || 0,
+            )
+            : null;
+          if (priceUpdates) {
+            await client.query(
+              `UPDATE products SET cost = $1, retail_price = COALESCE($2, retail_price),
+               wholesale_price = COALESCE($3, wholesale_price), distributor_price = COALESCE($4, distributor_price),
+               updated_at = CURRENT_TIMESTAMP WHERE id = $5`,
+              [newCost, priceUpdates.retail_price ?? null, priceUpdates.wholesale_price ?? null, priceUpdates.distributor_price ?? null, pid],
+            );
+          } else {
+            await client.query(
+              `UPDATE products SET cost = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+              [newCost, pid]
+            );
+          }
         }
       }
     }

@@ -29,6 +29,7 @@ import AccountingPage from './pages/accounting/AccountingPage';
 import BankCashPage from './pages/bankCash/BankCashPage';
 import ExpenseList from './pages/expenses/ExpenseList';
 import PettyCashPage from './pages/pettyCash/PettyCashPage';
+import LoansPayablePage from './pages/loans/LoansPayablePage';
 import HrPage from './pages/hr/HrPage';
 import ReportsPage from './pages/reports/ReportsPage';
 import AuditPage from './pages/audit/AuditPage';
@@ -38,6 +39,7 @@ import PermissionEditor from './pages/settings/PermissionEditor';
 import PermissionsPage from './pages/settings/PermissionsPage';
 import { HR_PAGE_ACCESS_PERMS } from './lib/hrPermissions';
 import { STOCK_OPS_ACCESS_PERMS } from './lib/stockOpsUtils';
+import { getDefaultLandingPath } from './lib/defaultLandingPath';
 
 const ProtectedRoute = ({ children, perm, permAny }: { children: React.ReactNode; perm?: string; permAny?: string[] }) => {
   const { user, loading, hasPerm, hasAnyPerm } = useAuth();
@@ -48,6 +50,11 @@ const ProtectedRoute = ({ children, perm, permAny }: { children: React.ReactNode
   return <Layout>{children}</Layout>;
 };
 
+function DefaultRedirect() {
+  const { hasPerm, hasAnyPerm } = useAuth();
+  return <Navigate to={getDefaultLandingPath(hasPerm, hasAnyPerm)} replace />;
+}
+
 const perm = (key: string) => key;
 
 export default function App() {
@@ -55,7 +62,7 @@ export default function App() {
     <Routes>
       <Route path="/login" element={<LoginPage />} />
 
-      <Route path="/" element={<ProtectedRoute><ExecutiveDashboard /></ProtectedRoute>} />
+      <Route path="/" element={<ProtectedRoute perm={perm('dashboard.view')}><ExecutiveDashboard /></ProtectedRoute>} />
       <Route path="/products" element={<ProtectedRoute perm={perm('inventory.inventory.view')}><ProductsPage /></ProtectedRoute>} />
       <Route path="/categories" element={<Navigate to="/products?tab=categories" replace />} />
       <Route path="/brands" element={<Navigate to="/products?tab=brands" replace />} />
@@ -88,7 +95,9 @@ export default function App() {
       <Route path="/bank-cash" element={<ProtectedRoute perm={perm('finance.bank-cash.view')}><BankCashPage /></ProtectedRoute>} />
       <Route path="/expenses" element={<ProtectedRoute perm={perm('finance.expenses.view')}><ExpenseList /></ProtectedRoute>} />
       <Route path="/petty-cash" element={<ProtectedRoute perm={perm('finance.petty-cash.view')}><PettyCashPage /></ProtectedRoute>} />
+      <Route path="/loans-payable" element={<ProtectedRoute perm={perm('finance.loans.view')}><LoansPayablePage /></ProtectedRoute>} />
 
+      <Route path="/bom" element={<Navigate to="/stock-ops?tab=bom" replace />} />
       <Route path="/production" element={<Navigate to="/stock-ops?tab=production" replace />} />
       <Route path="/inventory-count" element={<Navigate to="/stock-ops?tab=counts" replace />} />
       <Route path="/stock-transfers" element={<Navigate to="/stock-ops?tab=transfers" replace />} />
@@ -103,7 +112,7 @@ export default function App() {
       <Route path="/settings" element={<ProtectedRoute permAny={['system.settings.view', 'system.users.view', 'system.users.edit']}><SettingsPage /></ProtectedRoute>} />
       <Route path="/settings/permissions/:userId" element={<ProtectedRoute permAny={['system.users.view', 'system.users.edit']}><PermissionEditor /></ProtectedRoute>} />
 
-      <Route path="*" element={<Navigate to="/" />} />
+      <Route path="*" element={<DefaultRedirect />} />
     </Routes>
   );
 }

@@ -9,7 +9,7 @@ import {
   exportDailyPayables, exportDailyReceivables,
   exportPurchaseRegister, exportSalesInvoiceRegister, exportArAging, exportApAging,
   exportConsolidatedSales, exportDeliveryFulfillment, exportDispatchList, exportReorderSuggestions,
-  exportCategoryMargin,
+  exportCategoryMargin, exportPosShifts,
   exportWithholdingTax, exportSlspSales, exportSlspPurchases,
   exportBir2550q, exportBranchSummary,
   exportStockMovement, exportSlowMoving, exportCountVariance,
@@ -33,6 +33,7 @@ const REPORT_ICONS: Record<string, React.ElementType> = {
   'daily-sales': BarChart3,
   'sales-by-item': TrendingUp,
   'sales-by-cashier': TrendingUp,
+  'pos-shifts': Clock,
   'sales-by-customer': TrendingUp,
   'sales-invoice-register': FileSpreadsheet,
   'consolidated-sales': TrendingUp,
@@ -261,6 +262,9 @@ export default function ReportsPage() {
       toast.success('Downloaded');
     } else if (activeReport === 'count-variance') {
       exportCountVariance(data, dateRange.from, dateRange.to);
+      toast.success('Downloaded');
+    } else if (activeReport === 'pos-shifts') {
+      exportPosShifts(data, dateRange.from, dateRange.to);
       toast.success('Downloaded');
     }
   };
@@ -539,6 +543,44 @@ export default function ReportsPage() {
                   <Td>{c.transaction_count}</Td>
                   <Td align="right">{formatCurrency(c.total_sales)}</Td>
                   <Td align="right">{formatCurrency(c.avg_sale)}</Td>
+                </tr>
+              ))}
+            </tbody>
+          </ReportTable>
+        );
+
+      case 'pos-shifts':
+        return (
+          <ReportTable empty={!Array.isArray(data) || data.length === 0}>
+            <thead>
+              <tr>
+                <Th>Shift #</Th>
+                <Th>Cashier</Th>
+                <Th>Opened</Th>
+                <Th>Closed</Th>
+                <Th>Status</Th>
+                <Th align="right">Net Sales</Th>
+                <Th align="right">Cash Sales</Th>
+                <Th align="right">Expected</Th>
+                <Th align="right">Actual</Th>
+                <Th align="right">Variance</Th>
+              </tr>
+            </thead>
+            <tbody>
+              {Array.isArray(data) && data.map((s: any) => (
+                <tr key={s.shift_number} className="hover:bg-blue-50/40">
+                  <Td><span className="font-mono text-xs">{s.shift_number}</span></Td>
+                  <Td>{s.cashier_name || '—'}</Td>
+                  <Td>{s.opening_date ? formatDate(s.opening_date) : '—'}</Td>
+                  <Td>{s.closing_date ? formatDate(s.closing_date) : '—'}</Td>
+                  <Td>{s.status}</Td>
+                  <Td align="right">{formatCurrency(s.net_sales)}</Td>
+                  <Td align="right">{formatCurrency(s.cash_sales)}</Td>
+                  <Td align="right">{formatCurrency(s.expected_cash)}</Td>
+                  <Td align="right">{formatCurrency(s.closing_cash)}</Td>
+                  <Td align="right" className={parseFloat(s.cash_variance) !== 0 ? 'text-amber-700 font-medium' : ''}>
+                    {formatCurrency(s.cash_variance)}
+                  </Td>
                 </tr>
               ))}
             </tbody>
