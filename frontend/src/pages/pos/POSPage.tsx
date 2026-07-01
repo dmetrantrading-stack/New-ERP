@@ -65,7 +65,7 @@ type PaymentCompleteResult = {
 };
 
 const SHORTCUTS = [
-  { key: 'F1', action: 'Adjust quantity (last item)' },
+  { key: 'F1', action: 'Adjust quantity (last item or next scan)' },
   { key: 'F2', action: 'Price override hint' },
   { key: 'F3', action: 'Suspend sale' },
   { key: 'F4', action: 'Cycle price mode (Retail → Wholesale → Distributor)' },
@@ -175,6 +175,7 @@ export default function POSPage() {
   const [shift, setShift] = useState<any>(null);
   const [showQtyModal, setShowQtyModal] = useState(false);
   const [qtyTarget, setQtyTarget] = useState<CartItem | null>(null);
+  const [pendingQty, setPendingQty] = useState<number | null>(null);
   const [newQty, setNewQty] = useState<string | number>('1');
   const qtyRef = useRef<HTMLInputElement>(null);
   const [showRecallModal, setShowRecallModal] = useState(false);
@@ -757,7 +758,9 @@ export default function POSPage() {
     const uomKey = selectedUom?.uom_id ? `_u${selectedUom.uom_id}` : '';
     const key = `${enriched.id}_${isChilled ? 'Chilled' : 'Regular'}${uomKey}`;
     const existing = cart.find((item) => item.cart_key === key);
-    const qty = existing ? existing.quantity + 1 : 1;
+    const nextPending = pendingQty;
+    const qty = existing ? existing.quantity + 1 : (nextPending ?? 1);
+    if (nextPending != null) setPendingQty(null);
     const baseQty = convertToBaseQty(qty, conv);
     const unitCost = getBaseUnitCostFromUoms(uoms, enriched.cost || 0);
     const cartLine: CartItem = {
@@ -849,6 +852,23 @@ export default function POSPage() {
       const conv = item.conversion_to_base || 1;
       return recalcItemTotal({ ...item, quantity: qty, base_qty: convertToBaseQty(qty, conv) });
     }));
+  };
+
+  const closeQtyModal = useCallback((focus = true) => {
+    setShowQtyModal(false);
+    setQtyTarget(null);
+    if (focus) focusSearchBar();
+  }, [focusSearchBar]);
+
+  const applyQtyModal = () => {
+    const q = parseIntegerField(newQty) || 1;
+    if (qtyTarget) {
+      updateQuantity(qtyTarget.cart_key, q);
+    } else {
+      setPendingQty(q);
+      toast.success(`Next item qty: ${q}`);
+    }
+    closeQtyModal();
   };
 
   const updateDiscount = (cartKey: string, disc: string | number) => {
@@ -1402,8 +1422,11 @@ export default function POSPage() {
         if (cart.length > 0) {
           setQtyTarget(cart[cart.length - 1]);
           setNewQty(cart[cart.length - 1].quantity);
-          setShowQtyModal(true);
+        } else {
+          setQtyTarget(null);
+          setNewQty(pendingQty ?? 1);
         }
+        setShowQtyModal(true);
       }
       if (e.key === 'F2') { e.preventDefault(); toast('Price override: click item price'); }
       if (e.key === 'F3') { e.preventDefault(); suspendSale(); }
@@ -1435,6 +1458,8 @@ export default function POSPage() {
         if (showPaymentComplete) { closePaymentComplete(); return; }
         setShowCustomerModal(false);
         setShowQtyModal(false);
+        setQtyTarget(null);
+        focusSearchBar();
         setPaymentModal(false);
         setShowRecallModal(false);
         setShowCloseShift(false);
@@ -1446,7 +1471,7 @@ export default function POSPage() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [cart, canWrite, suspendSale, loadSuspendedSales, openPaymentModal, paymentModal, showPaymentComplete, showReceiptPreview, closePaymentComplete, cyclePriceMode, clearCart, openPriceInquiry, openLoyaltyModal]);
+  }, [cart, canWrite, suspendSale, loadSuspendedSales, openPaymentModal, paymentModal, showPaymentComplete, showReceiptPreview, closePaymentComplete, cyclePriceMode, clearCart, openPriceInquiry, openLoyaltyModal, pendingQty, focusSearchBar]);
 
   const handleSearchKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     const max = selectableItems.length - 1;
@@ -2304,16 +2329,20 @@ export default function POSPage() {
         </ModalOverlay>
       )}
 
-      {showQtyModal && qtyTarget && (
-        <ModalOverlay onClose={() => setShowQtyModal(false)}>
+      {showQtyModal && (
+        <ModalOverlay onClose={() => closeQtyModal()}>
           <div className="modal-content max-w-sm">
             <div className="p-6 text-center">
               <h2 className="text-lg font-semibold mb-2">Adjust Quantity</h2>
-              <p className="text-sm text-gray-500 mb-4">{qtyTarget.name}</p>
-              <input type="number" value={newQty} onChange={(e) => setNewQty(e.target.value)} min={1} ref={qtyRef} onKeyDown={(e) => { if (e.key === 'Enter') { updateQuantity(qtyTarget.cart_key, parseIntegerField(newQty) || 1); setShowQtyModal(false); } }} className="w-32 text-center text-2xl font-bold px-4 py-3 border-2 border-blue-500 rounded-xl outline-none" />
+              {qtyTarget ? (
+                <p className="text-sm text-gray-500 mb-4">{qtyTarget.name}</p>
+              ) : (
+                <p className="text-sm text-gray-500 mb-4">Set quantity for next scanned item</p>
+              )}
+              <input type="number" value={newQty} onChange={(e) => setNewQty(e.target.value)} min={1} ref={qtyRef} onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); applyQtyModal(); } }} className="w-32 text-center text-2xl font-bold px-4 py-3 border-2 border-blue-500 rounded-xl outline-none" />
               <div className="flex justify-center gap-3 mt-4">
-                <button type="button" onClick={() => setShowQtyModal(false)} className="px-4 py-2 border rounded-lg text-sm">Cancel</button>
-                <button type="button" onClick={() => { updateQuantity(qtyTarget.cart_key, parseIntegerField(newQty) || 1); setShowQtyModal(false); }} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm">Apply</button>
+                <button type="button" onClick={() => closeQtyModal()} className="px-4 py-2 border rounded-lg text-sm">Cancel</button>
+                <button type="button" onClick={applyQtyModal} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm">Apply</button>
               </div>
             </div>
           </div>

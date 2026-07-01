@@ -254,7 +254,10 @@ export default function SalesInvoices() {
         ? loadFromDeliveryReceipt(drId)
         : loadFromInvoice(invoiceId!);
     loader
-      .catch((err: any) => toast.error(err.response?.data?.error || 'Failed to load copy data'))
+      .catch((err: any) => {
+        const msg = err.response?.data?.error || 'Failed to load copy data';
+        toast.error(msg, { duration: 7000 });
+      })
       .finally(() => endCopyNavigation(copyKey));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams]);
@@ -380,6 +383,10 @@ export default function SalesInvoices() {
 
   const removeItem = (index: number) => setForm({ ...form, items: form.items.filter((_: any, i: number) => i !== index) });
 
+  const isCharge = form.payment_method === 'Charge' || form.payment_method === 'Salary Deduction';
+  const isEmployee = customerType === 'Employee';
+  const activeInvoiceTaxType = effectiveInvoiceTaxType(invoiceTaxType, customerType, form.payment_method);
+
   const computeLine = (item: any) => computeInvoiceLine(item, activeInvoiceTaxType, isEmployee ? '0' : ewtRate);
 
   const totals = form.items.reduce((acc, item) => {
@@ -398,6 +405,11 @@ export default function SalesInvoices() {
 
   const createInvoice = async () => {
     if (form.items.length === 0) { toast.error('Add at least one item'); return; }
+    if (customerType === 'Employee') {
+      if (!form.employee_id) { toast.error('Select an employee'); return; }
+    } else if (!form.customer_id) {
+      toast.error('Select a customer'); return;
+    }
     for (const item of form.items) {
       if (!item.product_id) { toast.error('Select a product for every row'); return; }
       if (parseFloat(String(item.quantity)) <= 0) { toast.error('Quantity must be > 0'); return; }
@@ -405,7 +417,7 @@ export default function SalesInvoices() {
     try {
       const payload = {
         customer_type: customerType,
-        customer_id: customerType === 'Employee' ? undefined : form.customer_id,
+        customer_id: customerType === 'Employee' ? undefined : (form.customer_id || undefined),
         employee_id: customerType === 'Employee' ? form.employee_id : undefined,
         customer_name: selectedCustomer ? selectedCustomer.customer_name : selectedEmployee ? `${selectedEmployee.last_name}, ${selectedEmployee.first_name}` : form.customer_name,
         price_mode: resolveCustomerPriceMode(selectedCustomer), invoice_tax_type: activeInvoiceTaxType,
@@ -542,10 +554,6 @@ export default function SalesInvoices() {
     window.addEventListener('keydown', h);
     return () => window.removeEventListener('keydown', h);
   }, [creating, form]);
-
-  const isCharge = form.payment_method === 'Charge' || form.payment_method === 'Salary Deduction';
-  const isEmployee = customerType === 'Employee';
-  const activeInvoiceTaxType = effectiveInvoiceTaxType(invoiceTaxType, customerType, form.payment_method);
 
   // ========== FULL-PAGE VIEW (DOT-MATRIX PRINT LAYOUT) ==========
   if (viewing && viewInv) {

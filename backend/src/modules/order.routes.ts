@@ -112,8 +112,10 @@ router.get('/:id/copy-to-invoice', authenticate, hasUserPerm('sales.sales-invoic
       .filter((i: any) => i.quantity > 0);
 
     if (invoiceItems.length === 0) {
-      const hint = copyMode === 'delivered' ? 'No delivered items to invoice' : 'No ordered items on sales order';
-      return res.status(400).json({ error: hint });
+      const hint = copyMode === 'delivered'
+        ? 'No delivered items to invoice. Create a Delivery Receipt first, or change Settings → Sales → Copy to Sales Invoice to Ordered qty.'
+        : 'No ordered items on sales order';
+      return res.status(400).json({ error: hint, copy_mode: copyMode });
     }
 
     const row = so.rows[0];

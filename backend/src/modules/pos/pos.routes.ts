@@ -374,7 +374,7 @@ router.post('/transactions', authenticate, hasUserPerm('pos.write'), auditLog('P
         subtotal, discount_total, tax_total, total, payment_method, payment_details, amount_tendered, change_amount,
         loyalty_points_redeemed, loyalty_points_earned, loyalty_discount,
         status, cashier_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, 'Completed', $19)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'Completed', $18)`,
       [id, transaction_number, shift_id, customer_id, customer_name, price_mode || 'Retail',
         subtotal, discountTotal, vatAmount, saleTotal, payment_method,
         payment_details ? JSON.stringify(payment_details) : null,

@@ -110,12 +110,14 @@ router.get('/gr-items/:grId', authenticate, apvForm, async (req: AuthRequest, re
   try {
     const r = await query(
       `SELECT gri.*, p.name as product_name, p.sku,
-              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure,
+              COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure,
+              COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as uom_code,
               COALESCE(poi.tax_type, 'VAT') as tax_type
        FROM goods_receipt_items gri
        LEFT JOIN products p ON gri.product_id = p.id
        LEFT JOIN purchase_order_items poi ON gri.po_item_id = poi.id
-       WHERE gri.gr_id = $1`,
+       LEFT JOIN uoms u ON gri.uom_id = u.id
+       WHERE gri.gr_id = $1 ORDER BY gri.id`,
       [req.params.grId]
     ); res.json(r.rows);
   } catch (error: any) { res.status(500).json({ error: error.message }); }

@@ -224,8 +224,12 @@ export default function ApVouchersPanel({ suppliers, products, onRefresh }: Prop
     if (poId) requests.push(api.get('/purchases/orders/' + poId));
     Promise.all(requests).then(([itemsRes, poRes]) => {
       const items = (itemsRes.data || []).map((gi: any) => ({
-        product_id: gi.product_id, description: gi.product_name, qty: gi.quantity,
-        uom: gi.unit_of_measure || 'pc', unit_cost: gi.net_unit_cost || gi.unit_cost,
+        product_id: gi.product_id, description: gi.product_name,
+        qty: parseFloat(gi.entered_qty ?? gi.quantity),
+        uom: (gi.uom_code || gi.unit_of_measure || 'pc').toUpperCase(),
+        uom_id: gi.uom_id ?? null,
+        conversion_to_base: parseFloat(gi.conversion_to_base) || 1,
+        unit_cost: gi.net_unit_cost || gi.unit_cost,
         discount_amount: gi.discount_amount || 0, gr_id: grId, tax_type: gi.tax_type || 'VAT',
       }));
       setApvForm((f: any) => ({
