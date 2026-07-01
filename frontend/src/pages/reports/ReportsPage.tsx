@@ -21,6 +21,7 @@ import {
   ShoppingCart, Wallet, Package,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
+import ProfitLossReportTab from './ProfitLossReportTab';
 import { printDocument } from '../../lib/printDocument';
 
 const SECTION_ICONS: Record<ReportSectionKey, React.ElementType> = {
@@ -48,6 +49,7 @@ const REPORT_ICONS: Record<string, React.ElementType> = {
   vat: BarChart3,
   'bir-2550q': FileSpreadsheet,
   'branch-summary': Package,
+  'comparative-profit-loss': TrendingUp,
   'withholding-tax': Wallet,
   'slsp-sales': FileSpreadsheet,
   'slsp-purchases': FileSpreadsheet,
@@ -152,6 +154,7 @@ export default function ReportsPage() {
   const [dateRange, setDateRange] = useState({ from: today, to: today });
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(false);
+  const [businessName, setBusinessName] = useState('');
 
   const sections = useMemo(
     () => REPORT_SECTIONS.filter((s) => canAccessReportSection(hasAnyPerm, s.key)),
@@ -180,13 +183,23 @@ export default function ReportsPage() {
   }, [sections, activeSection]);
 
   useEffect(() => {
+    api.get('/settings/business-details').then((r) => {
+      if (r.data?.business_name) setBusinessName(r.data.business_name);
+    }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
     if (sectionReports.length > 0 && !sectionReports.some((r) => r.id === activeReport)) {
       setActiveReport(sectionReports[0].id);
     }
   }, [sectionReports, activeReport]);
 
   const loadReport = useCallback(() => {
-    if (!activeReport) return;
+    if (!activeReport || activeDef?.embedded) {
+      setLoading(false);
+      setData(null);
+      return;
+    }
     setLoading(true);
     setData(null);
     const endpoint = reportEndpoint(activeReport, dateRange.from, dateRange.to);
@@ -198,7 +211,7 @@ export default function ReportsPage() {
       .then((res) => setData(res.data))
       .catch((err) => toast.error(err.response?.data?.error || 'Failed to load report'))
       .finally(() => setLoading(false));
-  }, [activeReport, dateRange]);
+  }, [activeReport, activeDef, dateRange]);
 
   useEffect(() => {
     loadReport();
@@ -401,6 +414,17 @@ export default function ReportsPage() {
   }, [activeReport, data, loading]);
 
   const renderContent = () => {
+    if (activeReport === 'comparative-profit-loss') {
+      return (
+        <div className="p-4 h-full overflow-y-auto">
+          <ProfitLossReportTab
+            businessName={businessName}
+            canEdit={hasPerm('finance.accounting.edit')}
+          />
+        </div>
+      );
+    }
+
     if (loading) {
       return <div className="flex items-center justify-center py-20 text-sm text-gray-400">Loading report...</div>;
     }
@@ -1474,7 +1498,8 @@ export default function ReportsPage() {
         <button
           type="button"
           onClick={loadReport}
-          className="flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded-md bg-white/10 text-white hover:bg-white/20 flex-shrink-0 print:hidden"
+          disabled={activeDef?.embedded}
+          className="flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded-md bg-white/10 text-white hover:bg-white/20 flex-shrink-0 print:hidden disabled:opacity-40"
         >
           <RefreshCw size={14} />
           Refresh

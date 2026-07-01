@@ -3,9 +3,9 @@ import { PRIMARY, FINANCE_FONT, financeTabClass } from './financeUtils';
 export { PRIMARY, FINANCE_FONT, financeTabClass };
 
 export const PRODUCTS_TABS = [
-  { key: 'products', label: 'Catalog', perm: 'inventory.inventory.view' },
-  { key: 'categories', label: 'Categories', perm: 'inventory.inventory.view' },
-  { key: 'brands', label: 'Brands', perm: 'inventory.inventory.view' },
+  { key: 'products', label: 'Catalog', perm: 'inventory.inventory.view', description: 'Product master data, pricing, barcodes, and units of measure' },
+  { key: 'categories', label: 'Categories', perm: 'inventory.inventory.view', description: 'Category GL accounts for sales and COGS posting' },
+  { key: 'brands', label: 'Brands', perm: 'inventory.inventory.view', description: 'Brand master for product classification' },
 ] as const;
 
 export type ProductsTabKey = (typeof PRODUCTS_TABS)[number]['key'];

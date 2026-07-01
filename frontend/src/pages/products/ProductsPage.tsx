@@ -5,7 +5,7 @@ import { useAuth } from '../../store/auth';
 import {
   PRIMARY, FINANCE_FONT, financeTabClass,
   ProductsTabKey,
-  filterProductsTabs, parseProductsTab,
+  filterProductsTabs, parseProductsTab, PRODUCTS_TABS,
 } from '../../lib/productsUtils';
 import ProductList from './ProductList';
 import CategoryList from '../categories/CategoryList';
@@ -36,6 +36,11 @@ export default function ProductsPage() {
   const initialTab = parseProductsTab(searchParams.get('tab')) || tabs[0]?.key || 'products';
   const [activeTab, setActiveTab] = useState<ProductsTabKey>(initialTab);
 
+  const activeDef = useMemo(
+    () => PRODUCTS_TABS.find((t) => t.key === activeTab),
+    [activeTab],
+  );
+
   const setTab = useCallback((key: ProductsTabKey) => {
     setActiveTab(key);
     setSearchParams(key === 'products' ? {} : { tab: key }, { replace: true });
@@ -64,16 +69,11 @@ export default function ProductsPage() {
 
   useEffect(() => { loadStats(); }, [loadStats]);
 
-  const headerKpis = useMemo(() => {
-    switch (activeTab) {
-      case 'categories':
-        return [{ label: 'Categories', value: String(stats.categories) }];
-      case 'brands':
-        return [{ label: 'Brands', value: String(stats.brands) }];
-      default:
-        return [{ label: 'Products', value: String(stats.products) }];
-    }
-  }, [activeTab, stats]);
+  const headerKpis = useMemo(() => [
+    { label: 'Products', value: String(stats.products) },
+    { label: 'Categories', value: String(stats.categories) },
+    { label: 'Brands', value: String(stats.brands) },
+  ], [stats]);
 
   const renderTab = () => {
     switch (activeTab) {
@@ -97,29 +97,13 @@ export default function ProductsPage() {
 
   return (
     <div className="h-[calc(100vh-4rem)] -m-6 flex flex-col bg-gray-50" style={{ fontFamily: FINANCE_FONT }}>
+      {/* SAP shell bar */}
       <div className="flex-shrink-0 px-4 h-12 flex items-center justify-between gap-3" style={{ backgroundColor: PRIMARY }}>
-        <div className="flex items-center gap-3 min-w-0 flex-1">
+        <div className="flex items-center gap-3 min-w-0">
           <Package size={18} className="text-white/90 flex-shrink-0" />
-          <div className="flex items-center gap-1 bg-white/10 rounded-lg p-0.5 overflow-x-auto max-w-full">
-            {tabs.map((t) => {
-              const Icon = TAB_ICONS[t.key];
-              return (
-                <button
-                  key={t.key}
-                  type="button"
-                  onClick={() => setTab(t.key)}
-                  className={financeTabClass(activeTab === t.key)}
-                >
-                  <span className="inline-flex items-center gap-1">
-                    <Icon size={13} />
-                    {t.label}
-                  </span>
-                </button>
-              );
-            })}
-          </div>
+          <h1 className="text-white font-semibold text-sm tracking-wide flex-shrink-0 hidden sm:block">Product Master</h1>
         </div>
-        <div className="hidden md:flex items-center gap-2 flex-shrink-0">
+        <div className="hidden md:flex items-center gap-2 flex-shrink-0 overflow-x-auto max-w-[50%]">
           {headerKpis.map((k) => <KpiPill key={k.label} label={k.label} value={k.value} />)}
         </div>
         <button
@@ -132,7 +116,37 @@ export default function ProductsPage() {
         </button>
       </div>
 
-      <div className="flex-1 min-h-0 p-4 overflow-auto">
+      {/* Sub-navigation (SAP object page tabs) */}
+      <div className="flex-shrink-0 bg-white border-b border-gray-200 px-4 py-2.5">
+        <div className="flex flex-wrap gap-1.5">
+          {tabs.map((t) => {
+            const Icon = TAB_ICONS[t.key];
+            return (
+              <button
+                key={t.key}
+                type="button"
+                onClick={() => setTab(t.key)}
+                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                  activeTab === t.key
+                    ? 'bg-blue-700 text-white'
+                    : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                }`}
+              >
+                <Icon size={13} />
+                {t.label}
+              </button>
+            );
+          })}
+        </div>
+        {activeDef && (
+          <p className="text-[11px] text-gray-400 mt-2">
+            {activeDef.label}
+            {activeDef.description ? ` — ${activeDef.description}` : ''}
+          </p>
+        )}
+      </div>
+
+      <div className="flex-1 min-h-0 p-4 overflow-hidden flex flex-col">
         {renderTab()}
       </div>
     </div>

@@ -2,11 +2,12 @@ import { Router, Response } from 'express';
 import multer from 'multer';
 import * as XLSX from 'xlsx';
 import { v4 as uuidv4 } from 'uuid';
-import { query } from '../../config/database';
+import { query, getClient } from '../../config/database';
 import { authenticate, hasUserPerm, hasUserAnyPerm, AuthRequest } from '../../middleware/auth';
 import { AppError } from '../../middleware/errorHandler';
 import { auditLog } from '../../middleware/audit';
 import { auditAfter, auditBefore, auditSnapshot, AUDIT_FIELDS } from '../../utils/auditHelpers';
+import { adjustCustomerLoyaltyManual } from '../../utils/loyaltyService';
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 }, fileFilter: (_req, file, cb) => { const ok = file.mimetype === 'text/csv' || file.originalname.endsWith('.csv') || file.mimetype === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' || file.originalname.endsWith('.xlsx'); cb(null, ok); } });
@@ -359,7 +360,7 @@ router.delete('/:id/prices/:priceId', authenticate, hasUserPerm('sales.customers
   }
 });
 
-router.get('/:id', authenticate, customerView, async (req: AuthRequest, res: Response) => {
+router.get('/:id', authenticate, customerLookup, async (req: AuthRequest, res: Response) => {
   try {
     const result = await query('SELECT * FROM customers WHERE id = $1', [req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Customer not found' });
@@ -389,13 +390,18 @@ router.post('/', authenticate, hasUserPerm('sales.customers.create'), auditLog('
 });
 
 router.put('/:id', authenticate, hasUserPerm('sales.customers.edit'), auditLog('Customers', 'Update'), async (req: AuthRequest, res: Response) => {
+  const client = await getClient();
   try {
-    const existing = await query('SELECT * FROM customers WHERE id = $1', [req.params.id]);
-    if (existing.rows.length === 0) return res.status(404).json({ error: 'Customer not found' });
+    await client.query('BEGIN');
+    const existing = await client.query('SELECT * FROM customers WHERE id = $1', [req.params.id]);
+    if (existing.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Customer not found' });
+    }
     auditBefore(req, auditSnapshot(existing.rows[0], AUDIT_FIELDS.customer));
 
-    const { customer_name, contact_person, address, phone, email, customer_type, credit_limit, payment_terms, tax_type, tin, is_active, default_price_mode } = req.body;
-    const result = await query(
+    const { customer_name, contact_person, address, phone, email, customer_type, credit_limit, payment_terms, tax_type, tin, is_active, default_price_mode, loyalty_points } = req.body;
+    const result = await client.query(
       `UPDATE customers SET customer_name = COALESCE($1, customer_name), contact_person = COALESCE($2, contact_person),
         address = COALESCE($3, address), phone = COALESCE($4, phone), email = COALESCE($5, email),
         customer_type = COALESCE($6, customer_type), credit_limit = COALESCE($7, credit_limit),
@@ -405,11 +411,29 @@ router.put('/:id', authenticate, hasUserPerm('sales.customers.edit'), auditLog('
        WHERE id = $13 RETURNING *`,
       [customer_name, contact_person, address, phone, email, customer_type, credit_limit, payment_terms, tax_type, tin, is_active, default_price_mode, req.params.id]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Customer not found' });
+    if (result.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    if (loyalty_points !== undefined && loyalty_points !== null) {
+      await adjustCustomerLoyaltyManual(client, {
+        customerId: parseInt(req.params.id, 10),
+        newBalance: loyalty_points,
+        createdBy: req.user!.id,
+      });
+      const refreshed = await client.query('SELECT * FROM customers WHERE id = $1', [req.params.id]);
+      if (refreshed.rows.length > 0) result.rows[0] = refreshed.rows[0];
+    }
+
+    await client.query('COMMIT');
     auditAfter(req, auditSnapshot(result.rows[0], AUDIT_FIELDS.customer));
     res.json(result.rows[0]);
   } catch (error: any) {
+    await client.query('ROLLBACK');
     res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
   }
 });
 

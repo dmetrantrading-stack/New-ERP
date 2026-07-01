@@ -4,6 +4,7 @@ import { formatCurrency, formatDate } from '../../lib/utils';
 import { Plus, Eye, Edit2, CheckCircle, XCircle, Archive, ArrowLeft, Printer, Paperclip, Download, X, Search, FileText } from 'lucide-react';
 import toast from 'react-hot-toast';
 import ProductAutocomplete from '../../components/ProductAutocomplete';
+import CustomerAutocomplete, { formatCustomerLabel } from '../../components/CustomerAutocomplete';
 import Pagination from '../../components/Pagination';
 import AttachmentPanel from '../../components/AttachmentPanel';
 import CopyToMenu from '../../components/CopyToMenu';
@@ -20,6 +21,15 @@ import { useAuth } from '../../store/auth';
 import { computeSalesDocLine, computeSalesDocTotals } from '../../lib/invoiceTax';
 import { printDocument } from '../../lib/printDocument';
 import { getProductPriceForCustomer } from '../../lib/customerPricing';
+import {
+  applySalesUomToLine,
+  blankSalesDocLine,
+  buildSalesDocItemPayload,
+  hydrateSalesDocLinesFromApi,
+  lineBaseQty,
+  loadProductUoms,
+  pickSalesLineUom,
+} from '../../lib/salesDocUom';
 
 const STATUS_COLORS: Record<string, string> = {
   Draft: 'bg-gray-100 text-gray-700',
@@ -64,8 +74,38 @@ export default function SalesOrders() {
   };
 
   useEffect(() => { loadOrders(); }, [page, statusFilter]);
-  useEffect(() => { api.get('/customers?limit=200').then(r => setCustomers(r.data?.data || r.data || [])).catch(() => {}); }, []);
   useEffect(() => { api.get('/products?limit=200').then(r => setProducts(r.data?.data || r.data || [])).catch(() => {}); }, []);
+
+  useEffect(() => {
+    const cid = form.customer_id;
+    if (!cid) return;
+    if (String(selectedCustomer?.id) === String(cid)) return;
+    selectCustomer(String(cid));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form.customer_id]);
+
+  const applySqCopyPayload = async (payload: any) => {
+    const cust = buildSelectedCustomerFromSqCopy(payload, customers);
+    setCustomers((prev) => (prev.some((x) => String(x.id) === String(cust.id)) ? prev : [...prev, cust]));
+    setSelectedCustomer(cust);
+    const baseForm = buildOrderFormFromSqCopy(payload);
+    const priceTier = payload.customer_type || 'Retail';
+    const hydratedItems = await hydrateSalesDocLinesFromApi(baseForm.items, priceTier);
+    mergeProductsFromCopyItems(hydratedItems, setProducts);
+    ensureProductsLoaded(hydratedItems.map((i: any) => i.product_id).filter(Boolean), setProducts);
+    setEditingId(null);
+    setEditingMeta({});
+    setActiveTab('notes');
+    setForm({ ...baseForm, items: hydratedItems });
+    setCreating(true);
+  };
+
+  useEffect(() => {
+    if (!form.sq_id || !form.customer_id) return;
+    if (String(selectedCustomer?.id) === String(form.customer_id)) return;
+    selectCustomer(String(form.customer_id));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form.sq_id, form.customer_id]);
 
   useEffect(() => {
     if (!selectedCustomer?.id) {
@@ -80,24 +120,6 @@ export default function SalesOrders() {
       })
       .catch(() => setCustomerPriceMap({}));
   }, [selectedCustomer?.id]);
-
-  const applySqCopyPayload = (payload: any) => {
-    setSelectedCustomer(buildSelectedCustomerFromSqCopy(payload, customers));
-    const mappedItems = buildOrderFormFromSqCopy(payload).items;
-    mergeProductsFromCopyItems(mappedItems, setProducts);
-    ensureProductsLoaded(mappedItems.map((i: any) => i.product_id).filter(Boolean), setProducts);
-    setEditingId(null);
-    setEditingMeta({});
-    setActiveTab('notes');
-    setForm(buildOrderFormFromSqCopy(payload));
-    setCreating(true);
-  };
-
-  useEffect(() => {
-    if (!form.sq_id || !form.customer_id || customers.length === 0) return;
-    const c = customers.find((x: any) => String(x.id) === String(form.customer_id));
-    if (c) setSelectedCustomer(c);
-  }, [customers, form.sq_id, form.customer_id]);
 
   useEffect(() => {
     const sqId = searchParams.get('copy_from_sq');
@@ -119,17 +141,35 @@ export default function SalesOrders() {
     try { const r = await api.get(`/products/search/quick?q=${encodeURIComponent(query)}`); return r.data || []; } catch { return []; }
   };
 
-  const getPrice = (p: any) => getProductPriceForCustomer(selectedCustomer, p, customerPriceMap);
+  const searchCustomers = async (q: string) => {
+    try {
+      const r = await api.get(`/customers?search=${encodeURIComponent(q)}&limit=20`);
+      return r.data?.data || r.data || [];
+    } catch {
+      return [];
+    }
+  };
 
-  const addItem = () => setForm({ ...form, items: [...form.items, { product_id: '', description: '', quantity: 1, unit_price: 0, discount: 0, tax_type: 'VAT', vat_amount: 0 }] });
+  const getPrice = (p: any) => getProductPriceForCustomer(selectedCustomer, p, customerPriceMap);
+  const priceTier = selectedCustomer?.customer_type || 'Retail';
+  const blankSoItem = () => blankSalesDocLine();
+
+  const addItem = () => setForm({ ...form, items: [...form.items, blankSoItem()] });
 
   const recalcItem = (item: any) => {
     const calc = computeSalesDocLine(item);
     return { ...item, vat_amount: calc.vat_amount };
   };
 
-  const updateItem = (idx: number, field: string, value: any) => {
+  const updateItem = async (idx: number, field: string, value: any) => {
     const items = [...form.items];
+    if (field === 'uom_id' && value) {
+      const product = products.find((p: any) => p.id == items[idx].product_id);
+      Object.assign(items[idx], applySalesUomToLine(items[idx], items[idx].uoms || [], parseInt(String(value), 10), product, priceTier, getPrice(product)));
+      items[idx] = recalcItem(items[idx]);
+      setForm({ ...form, items });
+      return;
+    }
     items[idx] = recalcItem({ ...items[idx], [field]: value });
     setForm({ ...form, items });
   };
@@ -149,19 +189,41 @@ export default function SalesOrders() {
     setCreating(true);
   };
 
-  const selectCustomer = (cid: string) => {
-    if (!cid) { setSelectedCustomer(null); setCustomerPriceMap({}); return; }
-    const c = customers.find((x: any) => x.id == cid);
-    if (!c) return;
+  const applyCustomer = (c: any) => {
+    setCustomers((prev) => (prev.some((x) => String(x.id) === String(c.id)) ? prev : [...prev, c]));
     setSelectedCustomer(c);
     setForm((prev: any) => {
-      const next = { ...prev, customer_id: cid, delivery_address: c.address || '', payment_terms: c.payment_terms || '' };
+      const next = {
+        ...prev,
+        customer_id: c.id,
+        customer_name: c.customer_name,
+        customer_code: c.customer_code || '',
+        delivery_address: prev.delivery_address || c.address || '',
+        payment_terms: prev.payment_terms || c.payment_terms || '',
+      };
       if (prev.items.length === 0) {
-        next.items = [{ product_id: '', description: '', quantity: 1, unit_price: 0, discount: 0, tax_type: 'VAT', vat_amount: 0 }];
+        next.items = [blankSoItem()];
         setAutoFocusItem(true);
       }
       return next;
     });
+  };
+
+  const selectCustomer = (cid: string, customer?: any) => {
+    if (!cid) {
+      setSelectedCustomer(null);
+      setCustomerPriceMap({});
+      setForm((prev: any) => ({ ...prev, customer_id: '', customer_name: '', customer_code: '', delivery_address: '' }));
+      return;
+    }
+    const c = customer || customers.find((x: any) => x.id == cid);
+    if (c) {
+      applyCustomer(c);
+      return;
+    }
+    api.get(`/customers/${cid}`)
+      .then((r) => applyCustomer(r.data))
+      .catch(() => toast.error('Failed to load customer'));
   };
 
   const openEdit = async (id: string) => {
@@ -170,34 +232,52 @@ export default function SalesOrders() {
       const so = r.data;
       setEditingId(id);
       setEditingMeta({ so_number: so.so_number, status: so.status });
-      const c = customers.find((x: any) => x.id == so.customer_id);
-      if (c) setSelectedCustomer(c);
       setActiveTab('notes');
+      const hydrated = await hydrateSalesDocLinesFromApi(
+        (so.items || []).map((i: any) => ({ ...i, quantity: i.ordered_qty })),
+        so.customer_type || 'Retail',
+      );
       setForm({
-        customer_id: so.customer_id, order_date: so.order_date || new Date().toISOString().split('T')[0],
-        delivery_address: so.delivery_address || c?.address || '',
-        payment_terms: so.payment_terms || c?.payment_terms || '', notes: so.notes || '', terms_conditions: so.terms_conditions || '',
-        sq_id: so.sq_id || '', sq_number: so.sq_number || '',
-        items: (so.items || []).map((i: any) => ({
-          product_id: i.product_id, description: i.description || '', quantity: i.ordered_qty,
-          unit_price: i.unit_price, discount: i.discount || 0, tax_type: i.tax_type || 'VAT', vat_amount: i.vat_amount || 0,
-          uom: i.unit_of_measure || 'pc',
-        }))
+        customer_id: so.customer_id,
+        customer_name: so.customer_name || so.cust_name || '',
+        customer_code: so.customer_code || '',
+        order_date: so.order_date || new Date().toISOString().split('T')[0],
+        delivery_address: so.delivery_address || '',
+        payment_terms: so.payment_terms || '',
+        notes: so.notes || '',
+        terms_conditions: so.terms_conditions || '',
+        sq_id: so.sq_id || '',
+        sq_number: so.sq_number || '',
+        items: hydrated,
       });
+      if (so.customer_id) {
+        selectCustomer(String(so.customer_id), {
+          id: so.customer_id,
+          customer_name: so.customer_name || so.cust_name,
+          customer_code: so.customer_code,
+          address: so.delivery_address,
+          customer_type: so.customer_type,
+          payment_terms: so.payment_terms,
+        });
+      }
       setCreating(true);
     } catch { toast.error('Failed to load order'); }
   };
 
   const save = async () => {
     if (!form.customer_id || !form.items.length) { toast.error('Customer and at least one item required'); return; }
+    const payload = {
+      ...form,
+      items: form.items.filter((i: any) => i.product_id).map(buildSalesDocItemPayload),
+    };
     setLoading(true);
     try {
       if (editingId) {
-        await api.put(`/sales-orders/${editingId}`, form);
+        await api.put(`/sales-orders/${editingId}`, payload);
         toast.success('Order updated');
         setCreating(false);
       } else {
-        const res = await api.post('/sales-orders', form);
+        const res = await api.post('/sales-orders', payload);
         toast.success(`Order ${res.data.so_number} created${res.data.sq_number ? ` (from ${res.data.sq_number})` : ''}`);
         await openEdit(res.data.id);
       }
@@ -270,6 +350,11 @@ export default function SalesOrders() {
   // ========== FULL-PAGE CREATE/EDIT VIEW ==========
   if (creating) {
     const totalQty = form.items.reduce((s: number, i: any) => s + parseFloat(i.quantity || '0'), 0);
+    const totalBaseQty = form.items.reduce((s: number, i: any) => s + (i.product_id ? lineBaseQty(i) : 0), 0);
+    const hasMultiUom = form.items.some((i: any) => {
+      const uom = pickSalesLineUom(i.uoms || [], i, products.find((p: any) => p.id == i.product_id));
+      return (parseFloat(String(uom?.conversion_to_base ?? i.conversion_to_base ?? 1)) || 1) > 1;
+    });
     const totalDisc = form.items.reduce((s: number, i: any) => s + parseFloat(i.discount || 0), 0);
     const primary = '#1E40AF';
     const docStatus = editingMeta.status || 'Draft';
@@ -306,10 +391,17 @@ export default function SalesOrders() {
             <div className="grid grid-cols-2 gap-3">
               <div className="bg-white border border-gray-200 rounded-lg p-3 space-y-2">
                 <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">1 · Customer Information</div>
-                <select value={form.customer_id} onChange={e => selectCustomer(e.target.value)} className="w-full px-2.5 py-1.5 border border-gray-300 rounded text-xs">
-                  <option value="">Select Customer</option>
-                  {customers.map((c: any) => <option key={c.id} value={c.id}>{c.customer_name}</option>)}
-                </select>
+                <CustomerAutocomplete
+                  customers={customers}
+                  value={String(form.customer_id || '')}
+                  selectedName={formatCustomerLabel(selectedCustomer) || formatCustomerLabel(form) || form.customer_name || ''}
+                  onSelect={(c) => {
+                    if (!c?.id) selectCustomer('');
+                    else selectCustomer(String(c.id), c);
+                  }}
+                  searchFn={searchCustomers}
+                  placeholder="Search customer name or code…"
+                />
                 {selectedCustomer && (
                   <div className="grid grid-cols-2 gap-1.5 text-[10px] text-gray-500">
                     <div className="bg-gray-50 rounded p-1.5"><span className="text-gray-400 block">Code</span><span className="font-mono text-gray-700">{selectedCustomer.customer_code || '—'}</span></div>
@@ -353,7 +445,7 @@ export default function SalesOrders() {
               <div className="flex items-center justify-between px-3 py-2 border-b bg-gray-50">
                 <span className="text-[10px] font-semibold text-gray-500 uppercase">3 · Line Items ({form.items.length})</span>
                 <div className="flex items-center gap-2">
-                  <span className="text-[10px] text-gray-400">Qty: {totalQty}</span>
+                  <span className="text-[10px] text-gray-400">Qty: {totalQty}{hasMultiUom ? ` · ${totalBaseQty} base` : ''}</span>
                   <button onClick={addItem}
                     className="flex items-center gap-1 px-2.5 py-1 text-[10px] font-medium rounded border border-blue-200 text-blue-600 bg-blue-50 hover:bg-blue-100"><Plus size={12} /> Add Item</button>
                 </div>
@@ -366,8 +458,9 @@ export default function SalesOrders() {
                       <th className="px-2 py-1.5 text-left w-20">SKU</th>
                       <th className="px-2 py-1.5 text-left" style={{ minWidth: 160 }}>Item Name</th>
                       <th className="px-2 py-1.5 text-left" style={{ minWidth: 140 }}>Description</th>
-                      <th className="px-2 py-1.5 text-center w-12">UOM</th>
-                      <th className="px-2 py-1.5 text-center w-16">Qty</th>
+                      <th className="line-uom-col px-2 py-1.5 text-center">UOM</th>
+                      <th className="px-2 py-1.5 text-center w-16">Qty (UOM)</th>
+                      <th className="px-2 py-1.5 text-center w-16">Stock (pc)</th>
                       <th className="px-2 py-1.5 text-right w-20">Price</th>
                       <th className="px-2 py-1.5 text-center w-14">Disc</th>
                       <th className="px-2 py-1.5 text-center w-20">Tax</th>
@@ -377,10 +470,12 @@ export default function SalesOrders() {
                   </thead>
                   <tbody className="divide-y divide-gray-100">
                     {form.items.length === 0 && (
-                      <tr><td colSpan={11} className="px-4 py-16 text-center text-gray-300 text-xs">Select a customer, then click Add Item</td></tr>
+                      <tr><td colSpan={12} className="px-4 py-16 text-center text-gray-300 text-xs">Select a customer, then click Add Item</td></tr>
                     )}
                     {form.items.map((item: any, idx: number) => {
                       const prod = products.find((p: any) => p.id == item.product_id);
+                      const uom = pickSalesLineUom(item.uoms || [], item, prod);
+                      const baseQty = item.product_id ? lineBaseQty(item) : 0;
                       const lineTotal = parseFloat(item.quantity) * parseFloat(item.unit_price) - parseFloat(item.discount || 0);
                       return (
                         <tr key={idx} className="hover:bg-blue-50/20">
@@ -395,22 +490,22 @@ export default function SalesOrders() {
                               getPrice={(p: any) => getPrice(p)}
                               searchFn={searchProducts}
                               autoFocus={autoFocusItem && idx === 0}
-                              onSelect={(p: any) => {
+                              onSelect={async (p: any) => {
                                 if (!products.find((x: any) => x.id === p.id)) setProducts((prev: any) => [...prev, p]);
                                 const price = getPrice(p);
+                                const uoms = await loadProductUoms(p.id);
                                 setForm((prev: any) => {
                                   const items = [...prev.items];
-                                  items[idx] = recalcItem({
+                                  items[idx] = recalcItem(applySalesUomToLine({
                                     ...items[idx],
                                     product_id: p.id,
                                     product_name: p.name || '',
                                     description: items[idx].description || '',
                                     unit_price: price,
                                     tax_type: p.tax_type || 'VAT',
-                                    uom: p.unit_of_measure || '',
-                                  });
+                                  }, uoms, null, p, priceTier, price));
                                   if (idx === prev.items.length - 1) {
-                                    setTimeout(() => setForm((p2: any) => ({ ...p2, items: [...p2.items, { product_id: '', description: '', quantity: 1, unit_price: 0, discount: 0, tax_type: 'VAT', vat_amount: 0 }] })), 100);
+                                    setTimeout(() => setForm((p2: any) => ({ ...p2, items: [...p2.items, blankSoItem()] })), 100);
                                   }
                                   return { ...prev, items };
                                 });
@@ -422,10 +517,24 @@ export default function SalesOrders() {
                             <input type="text" value={item.description || ''} onChange={e => updateItem(idx, 'description', e.target.value)}
                               className="w-full px-1.5 py-1 text-xs border border-gray-200 rounded" placeholder="Line description..." />
                           </td>
-                          <td className="px-2 py-1.5 text-center text-[10px] text-gray-500">{item.uom || prod?.unit_of_measure || '—'}</td>
+                          <td className="line-uom-col px-1 py-1 text-center">
+                            {(item.uoms?.length || 0) > 1 ? (
+                              <select value={item.uom_id || ''} onChange={(e) => updateItem(idx, 'uom_id', parseInt(e.target.value, 10))}
+                                className="line-uom-select px-1 py-1 border border-gray-200 rounded text-[10px] uppercase">
+                                {(item.uoms || []).map((u: any) => (
+                                  <option key={u.uom_id} value={u.uom_id}>{(u.uom_code || '').toUpperCase()}</option>
+                                ))}
+                              </select>
+                            ) : (
+                              <span className="text-[10px] uppercase text-gray-500">{(uom?.uom_code || item.uom || prod?.unit_of_measure || '—').toUpperCase()}</span>
+                            )}
+                          </td>
                           <td className="px-1 py-1">
                             <input type="number" step="0.01" min="0.01" value={item.quantity} onChange={e => updateItem(idx, 'quantity', e.target.value)}
                               className="w-full px-1.5 py-1 text-xs text-center border border-gray-200 rounded" />
+                          </td>
+                          <td className="px-2 py-1.5 text-center text-[10px] text-gray-400 tabular-nums">
+                            {item.product_id ? `${baseQty} pc` : '—'}
                           </td>
                           <td className="px-1 py-1">
                             <input type="number" step="0.01" value={item.unit_price} onChange={e => updateItem(idx, 'unit_price', e.target.value)}

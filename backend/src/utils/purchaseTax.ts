@@ -133,13 +133,18 @@ export function purchaseInventoryDebitAmount(total: number, vat: number): number
   return round2(Math.max(0, (parseFloat(String(total)) || 0) - (parseFloat(String(vat)) || 0)));
 }
 
+import { convertToBaseQty } from './uom';
+
 export function buildPurchaseOrderItemsFromRequest(rawItems: any[], costBasis: PurchaseCostBasis) {
   let subtotal = 0;
   let totalLineDiscount = 0;
   const taxInputs: PurchaseLineInput[] = [];
 
   const orderItems = (rawItems || []).map((item: any) => {
-    const qty = parseFloat(item.quantity) || 0;
+    const enteredQty = parseFloat(item.entered_qty ?? item.quantity) || 0;
+    const qty = enteredQty;
+    const conversionToBase = parseFloat(item.conversion_to_base) || 1;
+    const baseQty = convertToBaseQty(enteredQty, conversionToBase);
     const unitCost = parseFloat(item.unit_cost) || 0;
     const gross = qty * unitCost;
     const discType = item.discount_type || '%';
@@ -172,6 +177,10 @@ export function buildPurchaseOrderItemsFromRequest(rawItems: any[], costBasis: P
       net_unit_cost: round2(netUnitCost),
       net_total: round2(netLineTotal),
       tax_type: taxType,
+      uom_id: item.uom_id || null,
+      entered_qty: enteredQty,
+      conversion_to_base: conversionToBase,
+      base_qty: baseQty,
     };
   });
 

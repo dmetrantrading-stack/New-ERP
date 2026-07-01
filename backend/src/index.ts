@@ -6,6 +6,8 @@ import helmet from 'helmet';
 import morgan from 'morgan';
 import { config } from './config';
 import { query } from './config/database';
+import { ensurePosReturnSchema } from './database/posReturnSchema';
+import { ensureSupplierEntityTypeSchema } from './database/supplierEntityTypeSchema';
 import { errorHandler, notFound } from './middleware/errorHandler';
 import { loginRateLimiter } from './middleware/rateLimit';
 
@@ -13,6 +15,7 @@ import { loginRateLimiter } from './middleware/rateLimit';
 import authRoutes from './modules/auth/auth.routes';
 import userRoutes from './modules/users/users.routes';
 import productRoutes from './modules/products/products.routes';
+import uomRoutes from './modules/uoms/uoms.routes';
 import categoryRoutes from './modules/categories/categories.routes';
 import brandRoutes from './modules/brands/brands.routes';
 import customerRoutes from './modules/customers/customers.routes';
@@ -78,6 +81,7 @@ app.use('/api/auth/login', loginRateLimiter);
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/products', productRoutes);
+app.use('/api/uoms', uomRoutes);
 app.use('/api/categories', categoryRoutes);
 app.use('/api/brands', brandRoutes);
 app.use('/api/customers', customerRoutes);
@@ -131,6 +135,7 @@ app.get('/api/health', async (req, res) => {
     if (!migrationsOk) {
       payload.migration_hint = 'Run: cd backend && npm run migrate';
     }
+    payload.gl_integrity_routes = true;
   } catch {
     payload.migrations_ok = false;
     payload.db = 'unreachable';
@@ -158,16 +163,26 @@ if (config.serveFrontend && fs.existsSync(config.frontendDist)) {
 app.use(notFound);
 app.use(errorHandler);
 
-app.listen(config.port, () => {
-  console.log(`D METRAN ERP Server running on port ${config.port}`);
-  console.log(`Environment: ${config.nodeEnv}`);
-  if (config.serveFrontend && fs.existsSync(config.frontendDist)) {
-    console.log(`Serving web UI from: ${config.frontendDist}`);
+void (async () => {
+  try {
+    await ensurePosReturnSchema();
+    await ensureSupplierEntityTypeSchema();
+  } catch (err: any) {
+    console.error('[WARN] Database schema patch failed:', err?.message || err);
+    console.error('[WARN] Run: cd backend && npm run migrate');
   }
-  if (config.isProduction && config.jwtSecret === 'default-secret') {
-    console.warn('[WARN] JWT_SECRET is still default-secret — set a strong secret in .env before go-live');
-  }
-});
+
+  app.listen(config.port, () => {
+    console.log(`D METRAN ERP Server running on port ${config.port}`);
+    console.log(`Environment: ${config.nodeEnv}`);
+    if (config.serveFrontend && fs.existsSync(config.frontendDist)) {
+      console.log(`Serving web UI from: ${config.frontendDist}`);
+    }
+    if (config.isProduction && config.jwtSecret === 'default-secret') {
+      console.warn('[WARN] JWT_SECRET is still default-secret — set a strong secret in .env before go-live');
+    }
+  });
+})();
 
 export default app;
 

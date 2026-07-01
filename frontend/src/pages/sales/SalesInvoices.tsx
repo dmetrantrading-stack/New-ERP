@@ -6,6 +6,7 @@ import { formatCurrency, formatDate, PAYMENT_METHODS } from '../../lib/utils';
 import { Plus, Eye, XCircle, Printer, Search, ArrowLeft, X, Edit2, FileText, Paperclip, Banknote } from 'lucide-react';
 import toast from 'react-hot-toast';
 import ProductAutocomplete from '../../components/ProductAutocomplete';
+import CustomerAutocomplete, { formatCustomerLabel } from '../../components/CustomerAutocomplete';
 import AttachmentPanel from '../../components/AttachmentPanel';
 import DocumentNotesTermsPanel from '../../components/DocumentNotesTermsPanel';
 import { ATTACHMENT_REF } from '../../lib/documentAttachments';
@@ -16,6 +17,7 @@ const TAX_TYPES = ['VATable', 'VAT Exempt', 'Zero Rated', 'LGU 5% Final VAT'];
 
 import Pagination from '../../components/Pagination';
 import { computeInvoiceLine, computeEwtForAppliedAmount, resolveInvoiceEwtRate } from '../../lib/invoiceTax';
+import { effectiveInvoiceTaxType, NO_VAT_TAX_TYPE } from '../../lib/retailTaxPolicy';
 import {
   fetchSoCopyToInvoice,
   fetchDrCopyToInvoice,
@@ -30,6 +32,8 @@ import CopyToMenu from '../../components/CopyToMenu';
 import { printDocument } from '../../lib/printDocument';
 import { resolveCustomerPriceMode } from '../../lib/customerPricing';
 import { beginCopyNavigation, endCopyNavigation } from '../../lib/copyNavigationGuard';
+import { convertToBaseQty, getUomPrice, resolveSalesUom } from '../../lib/uomUtils';
+import { hydrateSalesDocLineFromApi } from '../../lib/salesDocUom';
 
 const PRIMARY = '#1E40AF';
 
@@ -62,6 +66,7 @@ export default function SalesInvoices() {
   const [previewAttachFile, setPreviewAttachFile] = useState<any>(null);
   const [statusFilter, setStatusFilter] = useState('');
   const [customerPriceMap, setCustomerPriceMap] = useState<Record<string, number>>({});
+  const [invoiceTaxType, setInvoiceTaxType] = useState('VATable');
   const getPrice = (customer: any, product: any) => {
     if (product?.id && customerPriceMap[product.id] != null) {
       return parseFloat(String(customerPriceMap[product.id]));
@@ -71,7 +76,54 @@ export default function SalesInvoices() {
     if (mode === 'Distributor') return parseFloat(product.distributor_price || 0);
     return parseFloat(product.retail_price || 0);
   };
-  const [invoiceTaxType, setInvoiceTaxType] = useState('VATable');
+  const blankInvoiceLineItem = (locationId = 1) => ({
+    product_id: '', location_id: locationId, quantity: 1, available_qty: 0,
+    unit_cost: 0, unit_price: 0, unit_of_measure: '', discount: 0, tax_type: invoiceTaxType,
+    uoms: [] as any[], uom_id: null as number | null,
+  });
+  const loadLineUoms = async (productId: string | number) => {
+    try {
+      const res = await api.get(`/products/${productId}/uoms`);
+      return res.data || [];
+    } catch {
+      return [];
+    }
+  };
+  const uomPriceForCustomer = (uom: any) => getUomPrice(uom, resolveCustomerPriceMode(selectedCustomer));
+  const applySalesUomToLine = (line: any, uoms: any[], uomId?: number | null, product?: any) => {
+    const uom = resolveSalesUom(uoms, uomId, null);
+    if (!uom) return line;
+    let unitPrice = uomPriceForCustomer(uom);
+    if (!unitPrice && product) unitPrice = getPrice(selectedCustomer, product);
+    return {
+      ...line,
+      uoms,
+      uom_id: uom.uom_id,
+      unit_of_measure: uom.uom_code || line.unit_of_measure || 'pc',
+      unit_price: unitPrice,
+    };
+  };
+  const lineBaseQty = (item: any) => {
+    const uom = resolveSalesUom(item.uoms || [], item.uom_id, null);
+    return convertToBaseQty(parseFloat(String(item.quantity || 0)), uom?.conversion_to_base || 1);
+  };
+  const buildInvoiceItemPayload = (i: any) => {
+    const uom = resolveSalesUom(i.uoms || [], i.uom_id, null);
+    const enteredQty = parseFloat(String(i.quantity));
+    const conversion = uom?.conversion_to_base || 1;
+    return {
+      product_id: i.product_id,
+      quantity: enteredQty,
+      entered_qty: enteredQty,
+      uom_id: i.uom_id || uom?.uom_id || null,
+      conversion_to_base: conversion,
+      base_qty: convertToBaseQty(enteredQty, conversion),
+      unit_price: parseFloat(String(i.unit_price)),
+      discount: parseFloat(String(i.discount)),
+      location_id: i.location_id,
+      tax_type: i.tax_type || invoiceTaxType,
+    };
+  };
   const [ewtRate, setEwtRate] = useState('0');
   const [customerType, setCustomerType] = useState('Customer');
   const [form, setForm] = useState<any>({ customer_id: '', employee_id: '', items: [], payment_method: 'Cash', amount_tendered: 0, due_date: '', notes: '', terms_conditions: '', payment_terms: '', so_id: '', so_number: '', sq_number: '', dn_id: '', dr_number: '', skip_inventory: false });
@@ -99,7 +151,6 @@ export default function SalesInvoices() {
 
   useEffect(() => {
     loadInvoices();
-    loadCustomers();
     api.get('/hr/employees').then((res) => setEmployees(res.data)).catch(() => {});
     api.get('/products?limit=500').then((res) => setProducts(res.data.data)).catch(() => {});
   }, [page, statusFilter]);
@@ -129,14 +180,41 @@ export default function SalesInvoices() {
     } catch {
       mergeProductsFromCopyItems(nextForm.items, setProducts);
     }
-    const enrichedItems = await enrichInvoiceItemsWithProducts(nextForm.items, productList);
+    const priceTier = payload.customer_type || 'Retail';
+    const enrichedItems = [];
+    for (const item of nextForm.items) {
+      const hydrated = await hydrateSalesDocLineFromApi(
+        { ...item, product_name: item.description },
+        priceTier,
+      );
+      const product = productList.find((p: any) => String(p.id) === String(item.product_id));
+      let available_qty = item.available_qty || 0;
+      if (item.product_id) {
+        try {
+          const res = await api.get(`/inventory/product/${item.product_id}`);
+          const locInv = res.data.find((inv: any) => inv.location_id === (item.location_id || 1));
+          available_qty = locInv ? parseFloat(locInv.quantity) : 0;
+        } catch {
+          // non-blocking
+        }
+      }
+      enrichedItems.push({
+        ...hydrated,
+        location_id: item.location_id || 1,
+        available_qty,
+        unit_cost: product?.cost ?? item.unit_cost ?? 0,
+        tax_type: item.tax_type,
+      });
+    }
     setForm({ ...nextForm, items: enrichedItems });
     if (custType === 'Employee' && payload.employee_id) {
       const emp = employees.find((e: any) => String(e.id) === String(payload.employee_id));
       setSelectedEmployee(emp || { id: payload.employee_id });
       setSelectedCustomer(null);
     } else {
-      setSelectedCustomer(buildSelectedCustomerFromInvoiceCopy(payload, customers));
+      const cust = buildSelectedCustomerFromInvoiceCopy(payload, customers);
+      if (cust?.id) selectCustomer(String(cust.id), cust);
+      else setSelectedCustomer(cust);
       setSelectedEmployee(null);
     }
     setCustomerType(custType);
@@ -182,31 +260,26 @@ export default function SalesInvoices() {
   }, [searchParams]);
 
   useEffect(() => {
-    if (!creating || !form.customer_id || customers.length === 0) return;
-    const c = customers.find((x: any) => String(x.id) === String(form.customer_id));
-    if (c) setSelectedCustomer(c);
-  }, [customers, creating, form.customer_id]);
-
-  const loadCustomers = () => {
-    api.get('/customers?limit=500')
-      .then((r) => {
-        const list = r.data.data || r.data || [];
-        setCustomers(Array.isArray(list) ? list : []);
-      })
-      .catch((err) => toast.error(err.response?.data?.error || 'Failed to load customers'));
-  };
+    const cid = form.customer_id;
+    if (!creating || !cid || customerType === 'Employee') return;
+    if (String(selectedCustomer?.id) === String(cid)) return;
+    selectCustomer(String(cid));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form.customer_id, creating, customerType]);
 
   useEffect(() => { setPage(1); }, [statusFilter]);
 
-  const selectCustomer = (customerId: string) => {
-    if (!customerId) {
-      setSelectedCustomer(null);
-      setCustomerPriceMap({});
-      setForm({ ...form, customer_id: '', customer_name: '', payment_terms: '', payment_method: 'Cash', due_date: '' });
-      return;
+  const searchCustomers = async (q: string) => {
+    try {
+      const res = await api.get(`/customers?search=${encodeURIComponent(q)}&limit=20`);
+      return res.data.data || res.data || [];
+    } catch {
+      return [];
     }
-    const c = customers.find(x => String(x.id) === customerId);
-    if (!c) return;
+  };
+
+  const applyCustomer = (c: any) => {
+    setCustomers((prev) => (prev.some((x) => String(x.id) === String(c.id)) ? prev : [...prev, c]));
     setSelectedCustomer(c);
     api.get(`/customers/${c.id}/prices`)
       .then((r) => {
@@ -218,13 +291,38 @@ export default function SalesInvoices() {
     const terms = c.payment_terms || '';
     const isCharge = !!terms;
     setForm((prev: any) => {
-      const next = { ...prev, customer_id: c.id, customer_name: c.customer_name, payment_terms: terms, payment_method: isCharge ? 'Charge' : prev.payment_method, due_date: terms ? computeDueDate(invoiceDate, terms) : '' };
+      const next = {
+        ...prev,
+        customer_id: c.id,
+        customer_name: c.customer_name,
+        customer_code: c.customer_code || '',
+        payment_terms: prev.payment_terms || terms,
+        payment_method: prev.payment_method || (isCharge ? 'Charge' : 'Cash'),
+        due_date: prev.due_date || (terms ? computeDueDate(invoiceDate, terms) : ''),
+      };
       if (prev.items.length === 0) {
-        next.items = [{ product_id: '', location_id: 1, quantity: 1, available_qty: 0, unit_cost: 0, unit_price: 0, unit_of_measure: '', discount: 0, tax_type: invoiceTaxType }];
+        next.items = [blankInvoiceLineItem()];
         setAutoFocusItem(true);
       }
       return next;
     });
+  };
+
+  const selectCustomer = (customerId: string, customer?: any) => {
+    if (!customerId) {
+      setSelectedCustomer(null);
+      setCustomerPriceMap({});
+      setForm((prev) => ({ ...prev, customer_id: '', customer_name: '', customer_code: '', payment_terms: '', payment_method: 'Cash', due_date: '' }));
+      return;
+    }
+    const c = customer || customers.find((x) => String(x.id) === customerId);
+    if (c) {
+      applyCustomer(c);
+      return;
+    }
+    api.get(`/customers/${customerId}`)
+      .then((res) => applyCustomer(res.data))
+      .catch(() => toast.error('Failed to load customer'));
   };
 
   // === Product search ===
@@ -239,9 +337,13 @@ export default function SalesInvoices() {
     }, 150);
   };
 
-  const selectProduct = (product: any) => {
-    const price = getPrice(selectedCustomer, product);
-    const newItem = { product_id: product.id, product_name: product.name, sku: product.sku, location_id: 1, quantity: 1, available_qty: 0, unit_cost: product.cost || 0, unit_price: price || 0, unit_of_measure: product.unit_of_measure || '', discount: 0, tax_type: mapTaxTypeForInvoice(product.tax_type) };
+  const selectProduct = async (product: any) => {
+    const uoms = await loadLineUoms(product.id);
+    const newItem = applySalesUomToLine({
+      product_id: product.id, product_name: product.name, sku: product.sku,
+      location_id: 1, quantity: 1, available_qty: 0, unit_cost: product.cost || 0,
+      discount: 0, tax_type: mapTaxTypeForInvoice(product.tax_type),
+    }, uoms, null, product);
     const items = [...form.items, newItem];
     setForm({ ...form, items });
     setProductSearch(''); setSearchResults([]); setShowSearchResults(false);
@@ -256,13 +358,16 @@ export default function SalesInvoices() {
     if (field === 'product_id' && value) {
       const product = products.find((p) => p.id === value);
       if (product) {
-        const price = getPrice(selectedCustomer, product);
-        items[index].unit_price = price || 0;
         items[index].unit_cost = product.cost || 0;
-        items[index].unit_of_measure = product.unit_of_measure || '';
         items[index].tax_type = mapTaxTypeForInvoice(product.tax_type);
+        const uoms = await loadLineUoms(value);
+        Object.assign(items[index], applySalesUomToLine(items[index], uoms, null, product));
       }
       await fetchAvailableQty(items, index);
+    }
+    if (field === 'uom_id' && value) {
+      const product = products.find((p) => p.id === items[index].product_id);
+      Object.assign(items[index], applySalesUomToLine(items[index], items[index].uoms || [], parseInt(String(value), 10), product));
     }
     if (field === 'location_id') await fetchAvailableQty(items, index);
     setForm({ ...form, items });
@@ -275,7 +380,7 @@ export default function SalesInvoices() {
 
   const removeItem = (index: number) => setForm({ ...form, items: form.items.filter((_: any, i: number) => i !== index) });
 
-  const computeLine = (item: any) => computeInvoiceLine(item, invoiceTaxType, ewtRate);
+  const computeLine = (item: any) => computeInvoiceLine(item, activeInvoiceTaxType, isEmployee ? '0' : ewtRate);
 
   const totals = form.items.reduce((acc, item) => {
     const c = computeLine(item);
@@ -303,8 +408,8 @@ export default function SalesInvoices() {
         customer_id: customerType === 'Employee' ? undefined : form.customer_id,
         employee_id: customerType === 'Employee' ? form.employee_id : undefined,
         customer_name: selectedCustomer ? selectedCustomer.customer_name : selectedEmployee ? `${selectedEmployee.last_name}, ${selectedEmployee.first_name}` : form.customer_name,
-        price_mode: resolveCustomerPriceMode(selectedCustomer), invoice_tax_type: invoiceTaxType,
-        items: form.items.map((i: any) => ({ product_id: i.product_id, quantity: parseFloat(String(i.quantity)), unit_price: parseFloat(String(i.unit_price)), discount: parseFloat(String(i.discount)), location_id: i.location_id, tax_type: i.tax_type || invoiceTaxType })),
+        price_mode: resolveCustomerPriceMode(selectedCustomer), invoice_tax_type: activeInvoiceTaxType,
+        items: form.items.map((i: any) => buildInvoiceItemPayload(i)),
         payment_method: form.payment_method, payment_terms: form.payment_terms || undefined, amount_tendered: parseFloat(String(form.amount_tendered)) || 0,
         due_date: form.due_date || undefined, notes: form.notes, terms_conditions: form.terms_conditions,
         ewt_rate: ewtRate,
@@ -331,7 +436,16 @@ export default function SalesInvoices() {
     const e = employees.find(x => String(x.id) === empId);
     if (!e) return;
     setSelectedEmployee(e);
-    setForm({ ...form, employee_id: e.id, customer_name: `${e.last_name}, ${e.first_name}`, payment_method: 'Salary Deduction', payment_terms: 'Salary Deduction', amount_tendered: 0 });
+    setInvoiceTaxType(NO_VAT_TAX_TYPE);
+    setForm({
+      ...form,
+      employee_id: e.id,
+      customer_name: `${e.last_name}, ${e.first_name}`,
+      payment_method: 'Salary Deduction',
+      payment_terms: 'Salary Deduction',
+      amount_tendered: 0,
+      items: form.items.map((i: any) => ({ ...i, tax_type: NO_VAT_TAX_TYPE })),
+    });
   };
 
   const resetForm = () => {
@@ -351,11 +465,15 @@ export default function SalesInvoices() {
       if (inv.customer_type === 'Employee') {
         setSelectedEmployee({ id: inv.employee_id, first_name: inv.emp_first_name, last_name: inv.emp_last_name });
       } else if (inv.customer_id) {
-        // Fetch full customer to get customer_type
-        const custRes = await api.get(`/customers?limit=1&search=${encodeURIComponent(inv.customer_name)}`).catch(() => ({ data: { data: [] } }));
-        const custData = custRes.data?.data || custRes.data || [];
-        const cust = custData.find((c: any) => c.id == inv.customer_id) || { customer_name: inv.customer_name, customer_code: '' };
-        setSelectedCustomer({ id: inv.customer_id, customer_name: inv.customer_name, customer_code: cust.customer_code || '', customer_type: cust.customer_type || 'Retail' });
+        selectCustomer(String(inv.customer_id), {
+          id: inv.customer_id,
+          customer_name: inv.customer_name,
+          customer_code: inv.customer_code,
+          address: inv.customer_address,
+          tin: inv.customer_tin,
+          customer_type: inv.customer_type,
+          payment_terms: inv.payment_terms,
+        });
       }
       setInvoiceTaxType(inv.tax_type || 'VATable');
       const editItems = (inv.items || []).map((i: any) => ({
@@ -369,11 +487,25 @@ export default function SalesInvoices() {
       setForm({
         customer_id: inv.customer_id || '', employee_id: inv.employee_id || '',
         customer_name: inv.customer_name || '',
-        items: (inv.items || []).map((i: any) => ({
-          product_id: i.product_id,
-          description: i.description || '', quantity: i.quantity, unit_price: i.unit_price,
-          discount: i.discount || 0, total: i.total, location_id: i.location_id,
-          tax_type: i.tax_type || inv.tax_type || 'VATable',
+        customer_code: inv.customer_code || '',
+        items: await Promise.all((inv.items || []).map(async (i: any) => {
+          const uoms = i.product_id ? await loadLineUoms(i.product_id) : [];
+          const uom = resolveSalesUom(uoms, i.uom_id, null);
+          return {
+            product_id: i.product_id,
+            description: i.description || '',
+            quantity: i.entered_qty ?? i.quantity,
+            unit_price: i.unit_price,
+            discount: i.discount || 0,
+            total: i.total,
+            location_id: i.location_id,
+            tax_type: i.tax_type || inv.tax_type || 'VATable',
+            uom_id: i.uom_id || uom?.uom_id || null,
+            uoms,
+            unit_of_measure: i.uom_code || i.unit_of_measure || uom?.uom_code || 'pc',
+            unit_cost: i.cost || 0,
+            available_qty: 0,
+          };
         })),
         payment_method: inv.payment_method || 'Cash', amount_tendered: 0,
         due_date: inv.due_date || '', notes: inv.notes || '', terms_conditions: inv.terms_conditions || '', payment_terms: inv.payment_terms || '',
@@ -413,6 +545,7 @@ export default function SalesInvoices() {
 
   const isCharge = form.payment_method === 'Charge' || form.payment_method === 'Salary Deduction';
   const isEmployee = customerType === 'Employee';
+  const activeInvoiceTaxType = effectiveInvoiceTaxType(invoiceTaxType, customerType, form.payment_method);
 
   // ========== FULL-PAGE VIEW (DOT-MATRIX PRINT LAYOUT) ==========
   if (viewing && viewInv) {
@@ -495,7 +628,28 @@ export default function SalesInvoices() {
             <div className="grid grid-cols-2 gap-3">
               <div className="bg-white border border-gray-200 rounded-lg p-3 space-y-2">
                 <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">1 · Customer Information</div>
-                <select value={customerType} onChange={(e) => { setCustomerType(e.target.value); setSelectedCustomer(null); setSelectedEmployee(null); setForm({ ...form, customer_id: '', employee_id: '', customer_name: '', payment_method: e.target.value === 'Employee' ? 'Salary Deduction' : 'Cash', payment_terms: e.target.value === 'Employee' ? 'Salary Deduction' : '', amount_tendered: 0, due_date: '' }); }}
+                <select value={customerType} onChange={(e) => {
+                  const nextType = e.target.value;
+                  setCustomerType(nextType);
+                  setSelectedCustomer(null);
+                  setSelectedEmployee(null);
+                  const employeeSale = nextType === 'Employee';
+                  if (employeeSale) setInvoiceTaxType(NO_VAT_TAX_TYPE);
+                  else if (invoiceTaxType === NO_VAT_TAX_TYPE) setInvoiceTaxType('VATable');
+                  setForm((prev) => ({
+                    ...prev,
+                    customer_id: '',
+                    employee_id: '',
+                    customer_name: '',
+                    payment_method: employeeSale ? 'Salary Deduction' : 'Cash',
+                    payment_terms: employeeSale ? 'Salary Deduction' : '',
+                    amount_tendered: 0,
+                    due_date: '',
+                    items: employeeSale
+                      ? prev.items.map((i: any) => ({ ...i, tax_type: NO_VAT_TAX_TYPE }))
+                      : prev.items,
+                  }));
+                }}
                   className="w-full px-2.5 py-1.5 border border-gray-300 rounded text-xs bg-gray-50 font-medium">
                   <option value="Customer">Regular Customer</option><option value="LGU">LGU / Company</option><option value="Employee">Employee</option>
                 </select>
@@ -504,9 +658,17 @@ export default function SalesInvoices() {
                     <option value="">Select Employee</option>{employees.map((e: any) => <option key={e.id} value={e.id}>{e.last_name}, {e.first_name}</option>)}
                   </select>
                 ) : (
-                  <select value={form.customer_id} onChange={(e) => selectCustomer(e.target.value)} className="w-full px-2.5 py-1.5 border border-gray-300 rounded text-xs">
-                    <option value="">Search Customer...</option>{customers.map((c: any) => <option key={c.id} value={c.id}>{c.customer_name}{c.customer_code ? ` (${c.customer_code})` : ''}</option>)}
-                  </select>
+                  <CustomerAutocomplete
+                    customers={customers}
+                    value={String(form.customer_id || '')}
+                    selectedName={formatCustomerLabel(selectedCustomer) || formatCustomerLabel(form) || form.customer_name || ''}
+                    onSelect={(c) => {
+                      if (!c?.id) selectCustomer('');
+                      else selectCustomer(String(c.id), c);
+                    }}
+                    searchFn={searchCustomers}
+                    placeholder="Search customer name or code…"
+                  />
                 )}
                 {selectedCustomer && !isEmployee && (
                   <div className="grid grid-cols-2 gap-1.5 text-[10px] text-gray-500">
@@ -569,7 +731,7 @@ export default function SalesInvoices() {
                 <span className="text-[10px] font-semibold text-gray-500 uppercase">3 · Line Items ({form.items.length})</span>
                 <div className="flex items-center gap-2">
                   <span className="text-[10px] text-gray-400">Qty: {totalQty}</span>
-                  <button onClick={() => { const newItem = { product_id: '', location_id: 1, quantity: 1, available_qty: 0, unit_cost: 0, unit_price: 0, unit_of_measure: '', discount: 0, tax_type: invoiceTaxType }; setForm({ ...form, items: [...form.items, newItem] }); }}
+                  <button onClick={() => setForm({ ...form, items: [...form.items, blankInvoiceLineItem()] })}
                     className="flex items-center gap-1 px-2.5 py-1 text-[10px] font-medium rounded border border-blue-200 text-blue-600 bg-blue-50 hover:bg-blue-100"><Plus size={12} /> Add Item</button>
                 </div>
               </div>
@@ -582,7 +744,7 @@ export default function SalesInvoices() {
                       <th className="px-2 py-1.5 text-left w-14">Loc</th>
                       <th className="px-2 py-1.5 text-center w-10">Avail</th>
                       <th className="px-2 py-1.5 text-center w-14">Qty</th>
-                      <th className="px-2 py-1.5 text-center w-10">UOM</th>
+                      <th className="line-uom-col px-2 py-1.5 text-center">UOM</th>
                       <th className="px-2 py-1.5 text-right w-14">Cost</th>
                       <th className="px-2 py-1.5 text-right w-16">Price</th>
                       <th className="px-2 py-1.5 text-center w-12">Disc%</th>
@@ -598,6 +760,9 @@ export default function SalesInvoices() {
                     {form.items.map((item: any, i: number) => {
                       const c = computeLine(item);
                       const product = products.find((p) => p.id === item.product_id);
+                      const uom = resolveSalesUom(item.uoms || [], item.uom_id, null);
+                      const neededBase = lineBaseQty(item);
+                      const stockShort = item.product_id && neededBase > (item.available_qty || 0);
                       return (
                         <tr key={i} className="hover:bg-blue-50/20">
                           <td className="px-2 py-1.5 text-gray-400 text-[10px]">{i + 1}</td>
@@ -606,22 +771,22 @@ export default function SalesInvoices() {
                               selectedName={product?.name || item.description || ''} placeholder="Search product..."
                               getPrice={(p) => getPrice(selectedCustomer, p)} searchFn={searchProducts}
                               autoFocus={autoFocusItem && i === 0}
-                              onSelect={(p) => {
+                              onSelect={async (p) => {
                                 if (!products.find(x => x.id === p.id)) setProducts(prev => [...prev, p]);
+                                const uoms = await loadLineUoms(p.id);
                                 const items = [...form.items];
-                                const price = getPrice(selectedCustomer, p);
-                                items[i].product_id = p.id;
-                                items[i].unit_price = price || 0;
-                                items[i].unit_cost = p.cost || 0;
-                                items[i].unit_of_measure = p.unit_of_measure || '';
-                                items[i].tax_type = mapTaxTypeForInvoice(p.tax_type);
+                                items[i] = applySalesUomToLine({
+                                  ...items[i],
+                                  product_id: p.id,
+                                  unit_cost: p.cost || 0,
+                                  tax_type: mapTaxTypeForInvoice(p.tax_type),
+                                }, uoms, null, p);
                                 setForm({ ...form, items });
                                 setAutoFocusItem(false);
                                 if (p.id) { api.get(`/inventory/product/${p.id}`).then(res => { const locInv = res.data.find((inv: any) => inv.location_id === (item.location_id || 1)); items[i].available_qty = locInv ? parseFloat(locInv.quantity) : 0; setForm(prev => ({ ...prev, items: [...items] })); }).catch(() => {}); }
                                 if (i === form.items.length - 1) {
                                   setTimeout(() => {
-                                    const nextItem = { product_id: '', location_id: item.location_id || 1, quantity: 1, available_qty: 0, unit_cost: 0, unit_price: 0, unit_of_measure: '', discount: 0, tax_type: invoiceTaxType };
-                                    setForm(prev => ({ ...prev, items: [...prev.items, nextItem] }));
+                                    setForm(prev => ({ ...prev, items: [...prev.items, blankInvoiceLineItem(item.location_id || 1)] }));
                                   }, 100);
                                 }
                               }} />
@@ -630,13 +795,29 @@ export default function SalesInvoices() {
                             <select value={item.location_id} onChange={(e) => updateItem(i, 'location_id', parseInt(e.target.value))}
                               className="w-full px-1 py-1 text-[10px] border border-gray-200 rounded">{LOCATIONS.map((l) => <option key={l.id} value={l.id}>{l.name.substring(0, 4)}</option>)}</select>
                           </td>
-                          <td className={`px-1 py-1 text-center text-[10px] ${item.available_qty <= 0 ? 'text-red-500 font-medium' : 'text-gray-400'}`}>{item.available_qty || '—'}</td>
+                          <td className={`px-1 py-1 text-center text-[10px] ${stockShort ? 'text-red-500 font-medium' : 'text-gray-400'}`}>
+                            {item.available_qty || '—'}
+                            {uom && (uom.conversion_to_base || 1) > 1 && item.product_id && (
+                              <div className="text-[8px]">({neededBase} pc)</div>
+                            )}
+                          </td>
                           <td className="px-1 py-1">
                             <input type="number" step="any" value={item.quantity}
                               onChange={(e) => updateItem(i, 'quantity', e.target.value)}
                               className="w-full px-1.5 py-1 text-xs text-center border border-gray-200 rounded" min="0.001" />
                           </td>
-                          <td className="px-1 py-1 text-center text-[10px] text-gray-400">{item.unit_of_measure || '—'}</td>
+                          <td className="line-uom-col px-1 py-1 text-center">
+                            {(item.uoms?.length || 0) > 1 ? (
+                              <select value={item.uom_id || ''} onChange={(e) => updateItem(i, 'uom_id', parseInt(e.target.value, 10))}
+                                className="line-uom-select px-1 py-1 border border-gray-200 rounded text-[10px] uppercase">
+                                {(item.uoms || []).map((u: any) => (
+                                  <option key={u.uom_id} value={u.uom_id}>{(u.uom_code || '').toUpperCase()}</option>
+                                ))}
+                              </select>
+                            ) : (
+                              <span className="text-[10px] uppercase text-gray-400">{(uom?.uom_code || item.unit_of_measure || 'pc').toUpperCase()}</span>
+                            )}
+                          </td>
                           <td className="px-1 py-1 text-right text-[10px] text-gray-400">{formatCurrency(item.unit_cost || 0)}</td>
                           <td className="px-1 py-1">
                             <input type="number" step="0.01" value={item.unit_price}
@@ -649,8 +830,9 @@ export default function SalesInvoices() {
                               className="w-full px-1.5 py-1 text-xs text-center border border-gray-200 rounded" min="0" max="100" />
                           </td>
                           <td className="px-1 py-1">
-                            <select value={item.tax_type || invoiceTaxType} onChange={(e) => updateItem(i, 'tax_type', e.target.value)}
-                              className="w-full px-1 py-1 text-[10px] border border-gray-200 rounded">{TAX_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}</select>
+                            <select value={item.tax_type || activeInvoiceTaxType} onChange={(e) => updateItem(i, 'tax_type', e.target.value)}
+                              disabled={isEmployee}
+                              className="w-full px-1 py-1 text-[10px] border border-gray-200 rounded disabled:bg-gray-50">{TAX_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}</select>
                           </td>
                           <td className="px-2 py-1.5 text-right text-xs font-semibold">{formatCurrency(c.total)}</td>
                           <td className="px-1 py-1 text-center">

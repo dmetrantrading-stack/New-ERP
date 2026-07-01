@@ -13,7 +13,7 @@ export default function CustomerList() {
   const [search, setSearch] = useState('');
   const [showModal, setShowModal] = useState(false);
   const [editCustomer, setEditCustomer] = useState<any>(null);
-  const [form, setForm] = useState<any>({ customer_name: '', contact_person: '', address: '', phone: '', email: '', customer_type: 'Retail', default_price_mode: '', credit_limit: '', payment_terms: '', tax_type: 'VAT', tin: '' });
+  const [form, setForm] = useState<any>({ customer_name: '', contact_person: '', address: '', phone: '', email: '', customer_type: 'Retail', default_price_mode: '', credit_limit: '', payment_terms: '', tax_type: 'VAT', tin: '', loyalty_points: '' });
   const [page, setPage] = useState(1);
   const [total, setTotal] = useState(0);
   const limit = 20;
@@ -31,8 +31,8 @@ export default function CustomerList() {
   useEffect(() => { setPage(1); }, [search]);
   useEffect(() => { api.get(`/customers?search=${search}&page=${page}&limit=${limit}`).then((r) => { setCustomers(r.data.data); setTotal(r.data.total); }).catch((err) => toast.error(err.response?.data?.error || 'Failed to load data')).finally(() => setLoading(false)); }, [search, page]);
 
-  const openCreate = () => { setEditCustomer(null); setForm({ customer_name: '', contact_person: '', address: '', phone: '', email: '', customer_type: 'Retail', default_price_mode: '', credit_limit: '', payment_terms: '', tax_type: 'VAT', tin: '' }); setShowModal(true); };
-  const openEdit = (c: any) => { setEditCustomer(c); setForm(c); setShowModal(true); };
+  const openCreate = () => { setEditCustomer(null); setForm({ customer_name: '', contact_person: '', address: '', phone: '', email: '', customer_type: 'Retail', default_price_mode: '', credit_limit: '', payment_terms: '', tax_type: 'VAT', tin: '', loyalty_points: '' }); setShowModal(true); };
+  const openEdit = (c: any) => { setEditCustomer(c); setForm({ ...c, loyalty_points: c.loyalty_points ?? 0 }); setShowModal(true); };
 
   const handleDelete = async (id: string) => {
     if (!confirm('Are you sure you want to delete this customer?')) return;
@@ -43,7 +43,14 @@ export default function CustomerList() {
   const handleSave = async () => {
     if (!form.customer_name) { toast.error('Customer name is required'); return; }
     try {
-      if (editCustomer) { await api.put(`/customers/${editCustomer.id}`, { ...form, credit_limit: parseNumericField(form.credit_limit), default_price_mode: form.default_price_mode || null }); toast.success('Updated'); }
+      if (editCustomer) {
+        const payload: any = { ...form, credit_limit: parseNumericField(form.credit_limit), default_price_mode: form.default_price_mode || null };
+        if (form.loyalty_points !== '' && form.loyalty_points != null) {
+          payload.loyalty_points = Math.max(0, parseInt(String(form.loyalty_points), 10) || 0);
+        }
+        await api.put(`/customers/${editCustomer.id}`, payload);
+        toast.success('Updated');
+      }
       else { await api.post('/customers', { ...form, credit_limit: parseNumericField(form.credit_limit), default_price_mode: form.default_price_mode || null }); toast.success('Created'); }
       setShowModal(false);
       const res = await api.get(`/customers?search=${search}&page=${page}&limit=${limit}`); setCustomers(res.data.data); setTotal(res.data.total);
@@ -158,7 +165,7 @@ export default function CustomerList() {
       </div>
       <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
         <table className="data-table">
-          <thead><tr><th>Code</th><th>Name</th><th>Type</th><th>Phone</th><th>Terms</th><th>Credit Limit</th><th>Balance</th><th>Status</th><th>Actions</th></tr></thead>
+          <thead><tr><th>Code</th><th>Name</th><th>Type</th><th>Phone</th><th>Terms</th><th>Credit Limit</th><th>Balance</th><th>Loyalty Pts</th><th>Status</th><th>Actions</th></tr></thead>
           <tbody>
             {customers.map((c) => (
               <tr key={c.id}>
@@ -169,6 +176,7 @@ export default function CustomerList() {
                 <td className="text-xs">{c.payment_terms ? `${c.payment_terms} Days` : '—'}</td>
                 <td>{formatCurrency(c.credit_limit)}</td>
                 <td className={c.balance > 0 ? 'text-red-600 font-medium' : ''}>{formatCurrency(c.balance)}</td>
+                <td className="font-mono text-xs">{parseInt(String(c.loyalty_points ?? 0), 10) || 0}</td>
                 <td><span className={`px-2 py-1 text-xs rounded-full ${c.is_active ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{c.is_active ? 'Active' : 'Inactive'}</span></td>
                   <td>
                     <div className="flex gap-1">
@@ -371,6 +379,14 @@ export default function CustomerList() {
                 <div><label className="block text-sm font-medium mb-1">TIN</label>
                   <input type="text" value={form.tin} onChange={(e) => setForm({ ...form, tin: e.target.value })}
                     className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" /></div>
+                {editCustomer && (
+                  <div><label className="block text-sm font-medium mb-1">Loyalty Points</label>
+                    <input type="number" min={0} step={1} value={form.loyalty_points ?? 0}
+                      onChange={(e) => setForm({ ...form, loyalty_points: e.target.value })}
+                      className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
+                    <p className="text-[10px] text-gray-400 mt-0.5">Manual adjustment writes to loyalty ledger.</p>
+                  </div>
+                )}
               </div>
               <div className="flex justify-end gap-3 mt-6">
                 <button onClick={() => setShowModal(false)} className="px-4 py-2 border rounded-lg text-sm">Cancel</button>

@@ -69,6 +69,16 @@ export default function UserList() {
     setShowModal(true);
   };
 
+  const handleActivate = async (u: any) => {
+    try {
+      await api.put(`/users/${u.id}`, { ...u, is_active: true });
+      toast.success(`${u.username} activated`);
+      loadUsers();
+    } catch (err: any) {
+      toast.error(err.response?.data?.error || 'Failed to activate user');
+    }
+  };
+
   const handleDelete = async (id: string) => {
     if (!confirm('Deactivate this user?')) return;
     try {
@@ -112,7 +122,7 @@ export default function UserList() {
         <div className="flex items-center gap-2">
           {canViewPerms && (
             <Link
-              to="/settings?tab=permissions"
+              to="/settings?tab=users&section=permissions"
               className="flex items-center gap-1 px-3 py-1.5 bg-white/10 text-white rounded text-xs font-bold hover:bg-white/20"
             >
               <Shield size={14} /> Permissions
@@ -174,8 +184,8 @@ export default function UserList() {
                       </td>
                       <td className="px-3 py-2 text-gray-600">{u.email || '—'}</td>
                       <td className="px-3 py-2 text-center">
-                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${u.is_active !== false ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
-                          {u.is_active !== false ? 'Active' : 'Inactive'}
+                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${u.is_active !== false ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-800'}`}>
+                          {u.is_active !== false ? 'Active' : 'Pending'}
                         </span>
                       </td>
                       <td className="px-3 py-2">
@@ -192,6 +202,16 @@ export default function UserList() {
                           )}
                           {canEditUsers && (
                             <>
+                              {u.is_active === false && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleActivate(u)}
+                                  className="px-2 py-0.5 hover:bg-green-50 rounded text-green-700 text-[10px] font-semibold"
+                                  title="Activate account"
+                                >
+                                  Activate
+                                </button>
+                              )}
                               <button
                                 type="button"
                                 onClick={() => openEdit(u)}
@@ -258,7 +278,7 @@ export default function UserList() {
 
           <div className="bg-blue-50 border border-blue-100 rounded-lg p-3 text-[10px] text-blue-800 leading-relaxed space-y-2">
             <p>Manage login accounts, roles, and locations.</p>
-            <Link to="/settings?tab=permissions" className="block text-blue-700 hover:underline">User permissions →</Link>
+            <Link to="/settings?tab=users&section=permissions" className="block text-blue-700 hover:underline">User permissions →</Link>
             <Link to="/settings" className="block text-blue-700 hover:underline">System settings →</Link>
             <Link to="/audit" className="block text-blue-700 hover:underline">Audit trail →</Link>
           </div>
@@ -302,6 +322,17 @@ export default function UserList() {
                     </select>
                   </div>
                 </div>
+                {editUser && (
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={form.is_active !== false}
+                      onChange={(e) => setForm({ ...form, is_active: e.target.checked })}
+                      className="rounded"
+                    />
+                    Account active (can sign in)
+                  </label>
+                )}
               </div>
               <div className="flex justify-end gap-3 mt-6">
                 <button type="button" onClick={() => setShowModal(false)} className="px-4 py-2 border rounded-lg text-sm">Cancel</button>

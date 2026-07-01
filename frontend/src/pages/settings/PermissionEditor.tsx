@@ -202,7 +202,7 @@ export default function PermissionEditor() {
         <div className="flex items-center gap-3 min-w-0">
           <button
             type="button"
-            onClick={() => navigate('/settings?tab=permissions')}
+            onClick={() => navigate('/settings?tab=users&section=permissions')}
             className="p-1.5 rounded-md text-white/90 hover:bg-white/10 flex-shrink-0"
             title="Back to permissions list"
           >

@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Edit2, Plus, Search } from 'lucide-react';
 import { formatCurrency } from '../../lib/utils';
 import {
@@ -27,6 +27,8 @@ type Account = {
 type Props = {
   accounts: Account[];
   businessName?: string;
+  highlightAccountCode?: string | null;
+  onHighlightCleared?: () => void;
   onAccountClick?: (account: Account) => void;
   onEdit?: (account: Account) => void;
   onCreate?: () => void;
@@ -36,6 +38,8 @@ type Props = {
 export default function ChartOfAccountsReport({
   accounts,
   businessName,
+  highlightAccountCode,
+  onHighlightCleared,
   onAccountClick,
   onEdit,
   onCreate,
@@ -43,6 +47,12 @@ export default function ChartOfAccountsReport({
 }: Props) {
   const [search, setSearch] = useState('');
   const [typeFilter, setTypeFilter] = useState('');
+
+  useEffect(() => {
+    if (!highlightAccountCode) return;
+    setTypeFilter('');
+    setSearch(highlightAccountCode);
+  }, [highlightAccountCode]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -61,8 +71,25 @@ export default function ChartOfAccountsReport({
       list.push(a);
       map.set(a.account_type, list);
     }
-    return TYPE_ORDER.map((type) => ({ type, items: map.get(type) || [] })).filter((g) => g.items.length > 0);
+    const sortByCode = (items: Account[]) =>
+      [...items].sort((x, y) => x.account_code.localeCompare(y.account_code, undefined, { numeric: true }));
+    const known = TYPE_ORDER
+      .map((type) => ({ type, items: sortByCode(map.get(type) || []) }))
+      .filter((g) => g.items.length > 0);
+    const extraTypes = [...map.keys()]
+      .filter((type) => !TYPE_ORDER.includes(type) && (map.get(type)?.length ?? 0) > 0)
+      .sort()
+      .map((type) => ({ type, items: sortByCode(map.get(type) || []) }));
+    return [...known, ...extraTypes];
   }, [filtered]);
+
+  useEffect(() => {
+    if (!highlightAccountCode) return;
+    const row = document.getElementById(`coa-row-${highlightAccountCode}`);
+    if (!row) return;
+    row.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    onHighlightCleared?.();
+  }, [highlightAccountCode, grouped, onHighlightCleared]);
 
   const totalBalance = filtered.reduce((s, a) => s + parseFloat(String(a.balance || 0)), 0);
   const activeCount = filtered.filter((a) => a.is_active !== false).length;
@@ -136,11 +163,13 @@ export default function ChartOfAccountsReport({
                   <TableSectionHeader label={type} tone={type === 'Asset' ? 'emerald' : type === 'Liability' ? 'blue' : type === 'Equity' ? 'violet' : 'slate'} />
                   {items.map((a) => {
                     const bal = parseFloat(String(a.balance || 0));
+                    const isHighlighted = highlightAccountCode === a.account_code;
                     return (
                       <tr
                         key={a.id}
+                        id={`coa-row-${a.account_code}`}
                         onClick={() => onAccountClick?.(a)}
-                        className={`border-b border-slate-50 ${onAccountClick ? 'cursor-pointer hover:bg-blue-50/60' : ''} ${a.is_active === false ? 'opacity-60' : ''}`}
+                        className={`border-b border-slate-50 ${onAccountClick ? 'cursor-pointer hover:bg-blue-50/60' : ''} ${a.is_active === false ? 'opacity-60' : ''} ${isHighlighted ? 'bg-amber-50/80 ring-1 ring-inset ring-amber-200' : ''}`}
                       >
                         <AccountNameCell code={a.account_code} name={a.account_name} indent />
                         <td className="py-2 px-4"><AccountTypeBadge type={a.account_type} /></td>

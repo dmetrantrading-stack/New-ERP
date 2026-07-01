@@ -1,11 +1,20 @@
 import { Router, Response } from 'express';
 import multer from 'multer';
 import XLSX from 'xlsx';
-import { query } from '../../config/database';
+import { query, getClient } from '../../config/database';
 import { authenticate, AuthRequest, hasUserPerm, hasUserAnyPerm } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
 import { AppError } from '../../middleware/errorHandler';
 import { auditAfter, auditBefore, auditSnapshot, AUDIT_FIELDS } from '../../utils/auditHelpers';
+import { getEquivalentUomDisplay } from '../../utils/uom';
+import {
+  ensureProductBaseUomOnCreate,
+  loadProductUoms,
+  loadProductUomsBulk,
+  lookupBarcodeUom,
+  syncProductUomConversions,
+} from '../../utils/productUomDb';
+import { createUomCatalogEntry, loadUomCatalogRows } from '../../utils/uomCatalog';
 import { v4 as uuidv4 } from 'uuid';
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 }, fileFilter: (_req, file, cb) => { const ok = file.mimetype === 'text/csv' || file.originalname.endsWith('.csv') || file.mimetype === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' || file.originalname.endsWith('.xlsx'); cb(null, ok); } });
@@ -13,8 +22,28 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 
 const router = Router();
 
 const productView = hasUserPerm('inventory.inventory.view');
-const productSearch = hasUserAnyPerm(['inventory.inventory.view', 'pos.view', 'pos.write']);
+const productLookup = hasUserAnyPerm([
+  'inventory.inventory.view', 'inventory.inventory.edit', 'inventory.inventory.create',
+  'purchases.purchase-order.view', 'purchases.purchase-order.create', 'purchases.purchase-order.edit',
+  'purchases.receiving-report.view', 'purchases.receiving-report.create', 'purchases.receiving-report.edit',
+  'sales.sales-invoice.view', 'sales.sales-invoice.create', 'sales.sales-invoice.edit',
+  'sales.sales-order.view', 'sales.sales-order.create', 'sales.sales-order.edit',
+  'sales.sales-quotation.view', 'sales.sales-quotation.create',
+  'sales.delivery-receipt.view', 'sales.delivery-receipt.create',
+  'pos.view', 'pos.write',
+]);
 const productExport = hasUserPerm('inventory.inventory.export');
+const STOCK_SQL = 'COALESCE(i.quantity, 0)';
+
+async function safeUomMap(productIds: string[]) {
+  if (!productIds.length) return {} as Awaited<ReturnType<typeof loadProductUomsBulk>>;
+  try {
+    return await loadProductUomsBulk({ query }, productIds);
+  } catch (err: any) {
+    console.error('[products] UOM load failed:', err?.message || err);
+    return {};
+  }
+}
 
 // Generate next SKU
 const generateSKU = async (): Promise<string> => {
@@ -73,7 +102,7 @@ async function assertProductPayload(body: any, excludeId?: string, existingRow?:
 }
 
 // Get all products with search, pagination
-router.get('/', authenticate, productView, async (req: AuthRequest, res: Response) => {
+router.get('/', authenticate, productLookup, async (req: AuthRequest, res: Response) => {
   try {
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 50;
@@ -189,7 +218,7 @@ const parseFile = (buffer: Buffer, originalName: string): { headers: string[]; r
 };
 
 // Search products (for POS/autocomplete)
-router.get('/search/quick', authenticate, productSearch, async (req: AuthRequest, res: Response) => {
+router.get('/search/quick', authenticate, productLookup, async (req: AuthRequest, res: Response) => {
   try {
     const search = req.query.q as string || '';
     const location_id = parseInt(String(req.query.location_id ?? '1'), 10) || 1;
@@ -197,7 +226,8 @@ router.get('/search/quick', authenticate, productSearch, async (req: AuthRequest
     const result = await query(
       `SELECT p.id, p.sku, p.name, p.barcode, p.retail_price, p.wholesale_price,
         p.distributor_price, p.cost, p.tax_type, p.price_type, p.has_variants, p.has_chilled_variant,
-        p.chilled_price, COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure, COALESCE(i.available_quantity, 0) as stock,
+        p.chilled_price, p.default_sales_uom_id, p.allow_multiple_uom,
+        COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure, ${STOCK_SQL} as stock,
         COALESCE(
           (SELECT json_agg(json_build_object(
             'id', pv.id, 'name', pv.name, 'retail_price', pv.retail_price, 'additional_cost', pv.additional_cost
@@ -217,9 +247,18 @@ router.get('/search/quick', authenticate, productSearch, async (req: AuthRequest
        LIMIT 20`,
       [`%${search}%`, search, location_id]
     );
+    const productIds = result.rows.map((row: { id: string }) => row.id);
+    const uomMap = await safeUomMap(productIds);
+
     res.json(result.rows.map((row: any) => ({
       ...row,
       variants: Array.isArray(row.variants) ? row.variants : [],
+      uoms: uomMap[row.id] || [],
+      stock_display: getEquivalentUomDisplay(
+        parseFloat(row.stock) || 0,
+        (uomMap[row.id] || []).map((u) => ({ uom_code: u.uom_code, conversion_to_base: u.conversion_to_base })),
+        row.unit_of_measure || 'pc',
+      ),
     })));
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -227,15 +266,52 @@ router.get('/search/quick', authenticate, productSearch, async (req: AuthRequest
 });
 
 // Exact barcode / SKU lookup (no wildcard) — used by POS scanner Enter
-router.get('/search/exact', authenticate, productSearch, async (req: AuthRequest, res: Response) => {
+router.get('/search/exact', authenticate, productLookup, async (req: AuthRequest, res: Response) => {
   try {
     const q = req.query.q as string || '';
     const location_id = parseInt(String(req.query.location_id ?? '1'), 10) || 1;
 
+    const bcHit = await lookupBarcodeUom({ query }, q);
+    if (bcHit) {
+      const result = await query(
+        `SELECT p.id, p.sku, p.name, p.barcode, p.retail_price, p.wholesale_price,
+          p.distributor_price, p.cost, p.tax_type, p.price_type, p.has_variants, p.has_chilled_variant,
+          p.chilled_price, p.default_sales_uom_id, p.allow_multiple_uom,
+          COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure, ${STOCK_SQL} as stock,
+          COALESCE(
+            (SELECT json_agg(json_build_object(
+              'id', pv.id, 'name', pv.name, 'retail_price', pv.retail_price, 'additional_cost', pv.additional_cost
+            ) ORDER BY pv.name)
+             FROM product_variants pv
+             WHERE pv.product_id = p.id AND pv.is_active = true),
+            '[]'::json
+          ) AS variants
+         FROM products p
+         LEFT JOIN inventory i ON i.product_id = p.id AND i.location_id = $2
+         WHERE p.id = $1 AND p.is_active = true`,
+        [bcHit.product_id, location_id],
+      );
+      const row = result.rows[0];
+      if (!row) return res.json(null);
+      const uoms = await loadProductUoms({ query }, bcHit.product_id);
+      return res.json({
+        ...row,
+        variants: Array.isArray(row.variants) ? row.variants : [],
+        uoms,
+        selected_uom: bcHit.uom,
+        stock_display: getEquivalentUomDisplay(
+          parseFloat(row.stock) || 0,
+          uoms.map((u) => ({ uom_code: u.uom_code, conversion_to_base: u.conversion_to_base })),
+          row.unit_of_measure || 'pc',
+        ),
+      });
+    }
+
     const result = await query(
       `SELECT p.id, p.sku, p.name, p.barcode, p.retail_price, p.wholesale_price,
         p.distributor_price, p.cost, p.tax_type, p.price_type, p.has_variants, p.has_chilled_variant,
-        p.chilled_price, COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure, COALESCE(i.available_quantity, 0) as stock,
+        p.chilled_price, p.default_sales_uom_id, p.allow_multiple_uom,
+        COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure, ${STOCK_SQL} as stock,
         COALESCE(
           (SELECT json_agg(json_build_object(
             'id', pv.id, 'name', pv.name, 'retail_price', pv.retail_price, 'additional_cost', pv.additional_cost
@@ -253,7 +329,17 @@ router.get('/search/exact', authenticate, productSearch, async (req: AuthRequest
     );
     const row = result.rows[0];
     if (!row) return res.json(null);
-    res.json({ ...row, variants: Array.isArray(row.variants) ? row.variants : [] });
+    const uoms = await loadProductUoms({ query }, row.id);
+    res.json({
+      ...row,
+      variants: Array.isArray(row.variants) ? row.variants : [],
+      uoms,
+      stock_display: getEquivalentUomDisplay(
+        parseFloat(row.stock) || 0,
+        uoms.map((u) => ({ uom_code: u.uom_code, conversion_to_base: u.conversion_to_base })),
+        row.unit_of_measure || 'pc',
+      ),
+    });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -498,7 +584,7 @@ router.post('/import/execute', authenticate, hasUserPerm('inventory.inventory.ed
         const barcode = importCell(row, headerMap, 'Barcode');
         const catName = importCell(row, headerMap, 'Category').toLowerCase();
         const brandName = importCell(row, headerMap, 'Brand').toLowerCase();
-        const unit_of_measure = importCell(row, headerMap, 'Unit of Measure', 'pc') || 'pc';
+        const unit_of_measure = 'pc';
         const cost = parseImportNumber(importCell(row, headerMap, 'Cost', '0')) || 0;
         const retail_price = parseImportNumber(importCell(row, headerMap, 'Retail Price', '0')) || 0;
         const wholesale_price = parseImportNumber(importCell(row, headerMap, 'Wholesale Price', '0')) || 0;
@@ -577,21 +663,55 @@ router.post('/import/execute', authenticate, hasUserPerm('inventory.inventory.ed
   }
 });
 
+// ==================== UOM CATALOG & PRODUCT UOMs ====================
+router.get('/uoms/catalog', authenticate, productLookup, async (_req: AuthRequest, res: Response) => {
+  try {
+    const rows = await loadUomCatalogRows();
+    res.json(rows);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/uoms/catalog', authenticate, hasUserPerm('inventory.inventory.edit'), auditLog('Products', 'Add UOM'), async (req: AuthRequest, res: Response) => {
+  try {
+    const row = await createUomCatalogEntry(req.body?.code, req.body?.name);
+    res.status(201).json(row);
+  } catch (error: any) {
+    if (error instanceof AppError) {
+      return res.status(error.statusCode).json({ error: error.message });
+    }
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/:id/uoms', authenticate, productLookup, async (req: AuthRequest, res: Response) => {
+  try {
+    const uoms = await loadProductUoms({ query }, req.params.id);
+    res.json(uoms);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Get single product
-router.get('/:id', authenticate, productSearch, async (req: AuthRequest, res: Response) => {
+router.get('/:id', authenticate, productLookup, async (req: AuthRequest, res: Response) => {
   try {
     const result = await query(
-      `SELECT p.*, c.name as category_name, b.name as brand_name
+      `SELECT p.*, c.name as category_name, b.name as brand_name,
+        bu.code AS base_uom_code, bu.name AS base_uom_name
        FROM products p
        LEFT JOIN categories c ON p.category_id = c.id
        LEFT JOIN brands b ON p.brand_id = b.id
+       LEFT JOIN uoms bu ON bu.id = p.base_uom_id
        WHERE p.id = $1`,
       [req.params.id]
     );
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Product not found' });
     }
-    res.json(result.rows[0]);
+    const uoms = await loadProductUoms({ query }, req.params.id);
+    res.json({ ...result.rows[0], uoms });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -612,13 +732,47 @@ router.post('/', authenticate, hasUserPerm('inventory.inventory.create'), auditL
 
     await query(
       `INSERT INTO products (id, sku, name, barcode, category_id, brand_id, unit_of_measure, cost,
-        retail_price, wholesale_price, distributor_price, reorder_level, tax_type, price_type, description, image_url, has_variants, has_chilled_variant, chilled_price)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`,
+        retail_price, wholesale_price, distributor_price, reorder_level, tax_type, price_type, description, image_url, has_variants, has_chilled_variant, chilled_price,
+        allow_multiple_uom, track_batch, track_expiry)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)`,
       [id, sku, normalized.name, normalized.barcode, category_id, brand_id, unit_of_measure || 'pc', cost || 0,
         retail_price || 0, wholesale_price || 0, distributor_price || 0, reorder_level || 0,
         tax_type || 'VAT', price_type || 'VAT Inclusive', description, image_url, has_variants || false,
-        has_chilled_variant || false, chilled_price || 0]
+        has_chilled_variant || false, chilled_price || 0,
+        Boolean(req.body.allow_multiple_uom), Boolean(req.body.track_batch), Boolean(req.body.track_expiry)]
     );
+
+    const uomMeta = await ensureProductBaseUomOnCreate({ query }, id, unit_of_measure || 'pc', {
+      cost: parseFloat(cost) || 0,
+      retail: parseFloat(retail_price) || 0,
+      wholesale: parseFloat(wholesale_price) || 0,
+      distributor: parseFloat(distributor_price) || 0,
+      barcode: normalized.barcode || undefined,
+    });
+
+    if (req.body.base_uom_id || req.body.allow_multiple_uom || (req.body.uom_conversions && req.body.uom_conversions.length)) {
+      await query(
+        `UPDATE products SET
+          base_uom_id = COALESCE($1, base_uom_id),
+          default_purchase_uom_id = COALESCE($2, default_purchase_uom_id),
+          default_sales_uom_id = COALESCE($3, default_sales_uom_id),
+          allow_multiple_uom = COALESCE($4, allow_multiple_uom)
+         WHERE id = $5`,
+        [req.body.base_uom_id || uomMeta.base_uom_id,
+          req.body.default_purchase_uom_id || uomMeta.default_purchase_uom_id,
+          req.body.default_sales_uom_id || uomMeta.default_sales_uom_id,
+          req.body.allow_multiple_uom, id],
+      );
+      await syncProductUomConversions({ query }, id, req.body.uom_conversions || [], {
+        cost: parseFloat(cost) || 0,
+        retail_price: parseFloat(retail_price) || 0,
+        wholesale_price: parseFloat(wholesale_price) || 0,
+        distributor_price: parseFloat(distributor_price) || 0,
+        barcode: normalized.barcode || undefined,
+        base_uom_id: req.body.base_uom_id || uomMeta.base_uom_id,
+        allow_multiple_uom: Boolean(req.body.allow_multiple_uom),
+      });
+    }
 
     // Create inventory records for all locations
     const locations = await query('SELECT id FROM locations WHERE is_active = true');
@@ -658,13 +812,45 @@ router.put('/:id', authenticate, hasUserPerm('inventory.inventory.edit'), auditL
         unit_of_measure = $5, cost = $6, retail_price = $7, wholesale_price = $8,
         distributor_price = $9, reorder_level = $10, tax_type = $11, price_type = $12, description = $13,
         image_url = $14, is_active = COALESCE($15, is_active), has_chilled_variant = $16,
-        chilled_price = $17, updated_at = CURRENT_TIMESTAMP
-       WHERE id = $18`,
+        chilled_price = $17,
+        allow_multiple_uom = COALESCE($18, allow_multiple_uom),
+        track_batch = COALESCE($19, track_batch),
+        track_expiry = COALESCE($20, track_expiry),
+        base_uom_id = COALESCE($21, base_uom_id),
+        default_purchase_uom_id = COALESCE($22, default_purchase_uom_id),
+        default_sales_uom_id = COALESCE($23, default_sales_uom_id),
+        updated_at = CURRENT_TIMESTAMP
+       WHERE id = $24`,
       [normalized.name, normalized.barcode, category_id || null, brand_id || null, unit_of_measure, cost,
         retail_price, wholesale_price, distributor_price, reorder_level,
         tax_type, price_type, description, image_url, is_active, has_chilled_variant || false,
-        chilled_price || 0, req.params.id]
+        chilled_price || 0,
+        req.body.allow_multiple_uom, req.body.track_batch, req.body.track_expiry,
+        req.body.base_uom_id, req.body.default_purchase_uom_id, req.body.default_sales_uom_id,
+        req.params.id]
     );
+
+    if (req.body.uom_conversions || req.body.allow_multiple_uom !== undefined) {
+      await syncProductUomConversions({ query }, req.params.id, req.body.uom_conversions || [{
+        uom_id: req.body.base_uom_id || existing.rows[0].base_uom_id,
+        conversion_to_base: 1,
+        barcode: normalized.barcode || undefined,
+        purchase_price: cost,
+        retail_price,
+        wholesale_price,
+        distributor_price,
+        is_default_purchase: true,
+        is_default_sales: true,
+      }], {
+        cost: parseFloat(cost) || 0,
+        retail_price: parseFloat(retail_price) || 0,
+        wholesale_price: parseFloat(wholesale_price) || 0,
+        distributor_price: parseFloat(distributor_price) || 0,
+        barcode: normalized.barcode || undefined,
+        base_uom_id: req.body.base_uom_id || existing.rows[0].base_uom_id,
+        allow_multiple_uom: req.body.allow_multiple_uom ?? existing.rows[0].allow_multiple_uom,
+      });
+    }
 
     // Update unit cost in inventory
     if (cost !== undefined) {

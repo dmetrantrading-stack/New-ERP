@@ -45,6 +45,8 @@ interface CatalogItem {
   order_qty_multiplier: number;
   fixed_order_qty: number | null;
   unit_cost: number;
+  unit_cost_uom?: string;
+  has_supplier_price?: boolean;
   tax_type: string;
 }
 
@@ -77,6 +79,9 @@ export default function SupplierCatalogPage() {
   const [editingReorderId, setEditingReorderId] = useState<string | null>(null);
   const [editingReorderValue, setEditingReorderValue] = useState('');
   const [savingReorder, setSavingReorder] = useState(false);
+  const [editingOrderQtyId, setEditingOrderQtyId] = useState<string | null>(null);
+  const [editingOrderQtyValue, setEditingOrderQtyValue] = useState('');
+  const [savingOrderQty, setSavingOrderQty] = useState(false);
 
   const existingProductIds = useMemo(() => new Set(items.map((i) => i.product_id)), [items]);
 
@@ -279,6 +284,63 @@ export default function SupplierCatalogPage() {
     }
   };
 
+  const startEditOrderQty = (item: CatalogItem) => {
+    if (!canEdit) return;
+    setEditingOrderQtyId(item.catalog_item_id);
+    setEditingOrderQtyValue(
+      item.fixed_order_qty != null
+        ? String(item.fixed_order_qty)
+        : item.standard_order_qty != null
+          ? String(item.standard_order_qty)
+          : '',
+    );
+  };
+
+  const cancelEditOrderQty = () => {
+    setEditingOrderQtyId(null);
+    setEditingOrderQtyValue('');
+  };
+
+  const saveOrderQty = async (item: CatalogItem) => {
+    if (!canEdit || savingOrderQty) return;
+    const parsed = parseFloat(editingOrderQtyValue);
+    if (Number.isNaN(parsed) || parsed <= 0) {
+      toast.error('Enter a valid PO quantity greater than zero');
+      return;
+    }
+    setSavingOrderQty(true);
+    try {
+      await api.put(`/suppliers/${supplierId}/catalog/${item.catalog_item_id}`, {
+        fixed_order_qty: parsed,
+      });
+      toast.success('PO quantity updated');
+      cancelEditOrderQty();
+      load();
+    } catch (err: any) {
+      toast.error(err.response?.data?.error || 'Failed to update PO quantity');
+    } finally {
+      setSavingOrderQty(false);
+    }
+  };
+
+  const resetOrderQty = async (item: CatalogItem) => {
+    if (!canEdit || savingOrderQty) return;
+    if (!window.confirm('Reset PO qty to auto (reorder level × multiplier)?')) return;
+    setSavingOrderQty(true);
+    try {
+      await api.put(`/suppliers/${supplierId}/catalog/${item.catalog_item_id}`, {
+        fixed_order_qty: null,
+      });
+      toast.success('PO quantity reset to auto');
+      cancelEditOrderQty();
+      load();
+    } catch (err: any) {
+      toast.error(err.response?.data?.error || 'Failed to reset PO quantity');
+    } finally {
+      setSavingOrderQty(false);
+    }
+  };
+
   const copyToPo = () => {
     if (!canCreatePo) {
       toast.error('You do not have permission to create purchase orders');
@@ -305,7 +367,7 @@ export default function SupplierCatalogPage() {
             </Link>
             <h1 className="text-xl font-bold">{supplier?.supplier_name || 'Supplier Catalog'}</h1>
             <p className="text-blue-100 text-sm mt-1">
-              Low stock catalog · Order qty = reorder level × 2 (or fixed qty per item)
+              Low stock catalog · PO qty defaults to reorder × 1 — click PO Qty to override per item
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
@@ -383,7 +445,7 @@ export default function SupplierCatalogPage() {
                 <th className="text-right">On Hand</th>
                 <th className="text-right">Reorder</th>
                 <th>Status</th>
-                <th className="text-right">PO Qty</th>
+                <th className="text-right">PO Qty (pc)</th>
                 <th className="text-right">Unit Cost</th>
                 {canEdit && <th className="w-12" />}
               </tr>
@@ -453,9 +515,63 @@ export default function SupplierCatalogPage() {
                     )}
                   </td>
                   <td className="text-right font-semibold tabular-nums text-blue-700">
-                    {item.standard_order_qty ?? '—'}
+                    {editingOrderQtyId === item.catalog_item_id ? (
+                      <div className="inline-flex flex-col items-end gap-1">
+                        <div className="inline-flex items-center gap-1">
+                          <input
+                            type="number"
+                            step="0.01"
+                            min="0.01"
+                            autoFocus
+                            value={editingOrderQtyValue}
+                            onChange={(e) => setEditingOrderQtyValue(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') saveOrderQty(item);
+                              if (e.key === 'Escape') cancelEditOrderQty();
+                            }}
+                            className="w-20 px-2 py-1 border rounded text-sm text-right focus:ring-2 focus:ring-blue-500 outline-none"
+                          />
+                          <button
+                            onClick={() => saveOrderQty(item)}
+                            disabled={savingOrderQty}
+                            className="px-2 py-0.5 text-[10px] bg-blue-600 text-white rounded disabled:opacity-50"
+                          >
+                            Save
+                          </button>
+                        </div>
+                        {item.fixed_order_qty != null && (
+                          <button
+                            type="button"
+                            onClick={() => resetOrderQty(item)}
+                            disabled={savingOrderQty}
+                            className="text-[10px] text-gray-500 hover:text-blue-600 hover:underline"
+                          >
+                            Reset to auto
+                          </button>
+                        )}
+                      </div>
+                    ) : canEdit ? (
+                      <button
+                        type="button"
+                        onClick={() => startEditOrderQty(item)}
+                        className="hover:text-blue-900 hover:underline text-right"
+                        title="Click to edit PO quantity (pieces)"
+                      >
+                        {item.standard_order_qty ?? '—'}
+                        {item.fixed_order_qty != null && (
+                          <span className="block text-[9px] font-normal text-blue-500">custom</span>
+                        )}
+                      </button>
+                    ) : (
+                      item.standard_order_qty ?? '—'
+                    )}
                   </td>
-                  <td className="text-right tabular-nums">{formatCurrency(item.unit_cost)}</td>
+                  <td className="text-right tabular-nums">
+                    {formatCurrency(item.unit_cost)}
+                    {item.unit_cost_uom && (
+                      <span className="block text-[9px] text-gray-400 uppercase">/{item.unit_cost_uom}</span>
+                    )}
+                  </td>
                   {canEdit && (
                     <td>
                       <button onClick={() => handleRemove(item)} className="p-1.5 hover:bg-red-50 rounded text-red-600" title="Remove from catalog">
@@ -607,7 +723,7 @@ export default function SupplierCatalogPage() {
                 <div className="space-y-4">
                   <p className="text-sm text-gray-500">
                     Upload CSV or Excel with columns: <strong>SKU</strong>, <strong>Product Name</strong> (at least one required),
-                    optional <strong>Order Qty Multiplier</strong> (default 2), <strong>Fixed Order Qty</strong>.
+                    optional <strong>Order Qty Multiplier</strong> (default 1), <strong>Fixed Order Qty</strong>.
                   </p>
                   <div
                     className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center hover:border-blue-400 transition-colors"

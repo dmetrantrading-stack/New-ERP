@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import api from '../../lib/api';
 import { Plus, RefreshCw } from 'lucide-react';
 import ProductAutocomplete from '../../components/ProductAutocomplete';
+import UomCatalogPanel from './UomCatalogPanel';
 import toast from 'react-hot-toast';
 import { useAuth } from '../../store/auth';
 
@@ -89,9 +90,11 @@ export default function UnitConversions({ embedded = false }: { embedded?: boole
       {!embedded && (
         <div className="mb-4">
           <h1 className="text-xl font-bold">Unit Conversions</h1>
-          <p className="text-sm text-gray-500">Define conversion factors and convert inventory units</p>
+          <p className="text-sm text-gray-500">Manage global UOM types and product conversion factors</p>
         </div>
       )}
+
+      <UomCatalogPanel />
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <div className="bg-white rounded-lg border p-4">

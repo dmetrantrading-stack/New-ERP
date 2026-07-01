@@ -6,6 +6,9 @@ import { v4 as uuidv4 } from 'uuid';
 import { getInvoiceCopyMode } from '../utils/salesSettings';
 import { calculateSalesDocItems } from '../utils/invoiceTax';
 import { auditAfter, auditBefore, auditSnapshot, AUDIT_FIELDS } from '../utils/auditHelpers';
+import { loadProductUoms } from '../utils/productUomDb';
+import { lineItemBaseQty, resolveSalesDocLineUomFields, formatInsufficientStockMessage } from '../utils/uom';
+import { enrichSalesPrintLineUoms } from '../utils/salesPrintUom';
 import { tableRow, fmtCurrency, fmtDate } from '../utils/printLayout';
 import {
   buildSalesEnterpriseDocument,
@@ -69,9 +72,12 @@ router.get('/:id/copy-to-invoice', authenticate, hasUserPerm('sales.sales-invoic
     }
 
     const items = await query(
-      `SELECT soi.*, p.name as product_name, p.sku, p.unit_of_measure
+      `SELECT soi.*, p.name as product_name, p.sku,
+              COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as uom_code,
+              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
        FROM sales_order_items soi
        LEFT JOIN products p ON soi.product_id = p.id
+       LEFT JOIN uoms u ON soi.uom_id = u.id
        WHERE soi.order_id = $1 ORDER BY soi.id`,
       [req.params.id]
     );
@@ -90,9 +96,13 @@ router.get('/:id/copy-to-invoice', authenticate, hasUserPerm('sales.sales-invoic
           variant_id: i.variant_id,
           product_name: i.product_name || '',
           sku: i.sku || '',
-          unit_of_measure: i.unit_of_measure || '',
+          unit_of_measure: i.uom_code || i.unit_of_measure || '',
           description: i.description || i.product_name,
           quantity: qty,
+          uom_id: i.uom_id,
+          entered_qty: qty,
+          conversion_to_base: parseFloat(i.conversion_to_base || 1),
+          base_qty: lineItemBaseQty({ ...i, quantity: qty, entered_qty: qty }),
           unit_price: unitPrice,
           discount: Math.round(discountPercent * 100) / 100,
           tax_type: i.tax_type || 'VAT',
@@ -143,8 +153,10 @@ router.get('/:id', authenticate, soView, async (req: AuthRequest, res: Response)
     if (so.rows.length === 0) return res.status(404).json({ error: 'Sales Order not found' });
     const items = await query(
       `SELECT soi.*, p.name as product_name, p.sku,
+              COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as uom_code,
               COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
        FROM sales_order_items soi LEFT JOIN products p ON soi.product_id = p.id
+       LEFT JOIN uoms u ON soi.uom_id = u.id
        WHERE soi.order_id = $1 ORDER BY soi.id`,
       [req.params.id]
     );
@@ -188,10 +200,11 @@ router.post('/', authenticate, hasUserPerm('sales.sales-order.create'), auditLog
       for (let i = 0; i < items.length; i++) {
         const item = items[i];
         const calc = lines[i];
+        const uomFields = await resolveSalesDocLineUomFields(client, item.product_id, item, calc.quantity, loadProductUoms);
         await client.query(
-          `INSERT INTO sales_order_items (id, order_id, product_id, variant_id, description, ordered_qty, unit_price, discount, tax_type, vat_amount, total)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-          [uuidv4(), id, item.product_id, item.variant_id || null, item.description, calc.quantity, calc.unit_price, calc.discount, calc.tax_type, calc.vat, calc.total]
+          `INSERT INTO sales_order_items (id, order_id, product_id, variant_id, description, ordered_qty, unit_price, discount, tax_type, vat_amount, total, uom_id, entered_qty, conversion_to_base, base_qty)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+          [uuidv4(), id, item.product_id, item.variant_id || null, item.description, calc.quantity, calc.unit_price, calc.discount, calc.tax_type, calc.vat, calc.total, uomFields.uom_id, uomFields.enteredQty, uomFields.conversion_to_base, uomFields.base_qty]
         );
       }
 
@@ -243,10 +256,11 @@ router.put('/:id', authenticate, hasUserPerm('sales.sales-order.edit'), auditLog
         for (let i = 0; i < items.length; i++) {
           const item = items[i];
           const calc = lines[i];
+          const uomFields = await resolveSalesDocLineUomFields(client, item.product_id, item, calc.quantity, loadProductUoms);
           await client.query(
-            `INSERT INTO sales_order_items (id, order_id, product_id, variant_id, description, ordered_qty, unit_price, discount, tax_type, vat_amount, total)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-            [uuidv4(), req.params.id, item.product_id, item.variant_id || null, item.description, calc.quantity, calc.unit_price, calc.discount, calc.tax_type, calc.vat, calc.total]
+            `INSERT INTO sales_order_items (id, order_id, product_id, variant_id, description, ordered_qty, unit_price, discount, tax_type, vat_amount, total, uom_id, entered_qty, conversion_to_base, base_qty)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+            [uuidv4(), req.params.id, item.product_id, item.variant_id || null, item.description, calc.quantity, calc.unit_price, calc.discount, calc.tax_type, calc.vat, calc.total, uomFields.uom_id, uomFields.enteredQty, uomFields.conversion_to_base, uomFields.base_qty]
           );
         }
       }
@@ -286,10 +300,28 @@ router.patch('/:id/confirm', authenticate, hasUserPerm('sales.sales-order.approv
     const items = await client.query('SELECT * FROM sales_order_items WHERE order_id = $1', [req.params.id]);
     let totalReserved = 0;
     for (const item of items.rows) {
-      const qty = parseFloat(item.ordered_qty);
-      totalReserved += qty;
-      await client.query('UPDATE sales_order_items SET reserved_qty = $1 WHERE id = $2', [qty, item.id]);
-      await client.query('UPDATE inventory SET reserved_quantity = reserved_quantity + $1 WHERE product_id = $2 AND location_id = 1', [qty, item.product_id]);
+      const enteredQty = parseFloat(item.ordered_qty);
+      const baseQty = lineItemBaseQty({ ...item, quantity: enteredQty, entered_qty: item.entered_qty ?? enteredQty });
+
+      const inv = await client.query(
+        'SELECT quantity, reserved_quantity FROM inventory WHERE product_id = $1 AND location_id = 1',
+        [item.product_id],
+      );
+      if (inv.rows.length > 0) {
+        const onHand = parseFloat(inv.rows[0].quantity) || 0;
+        const reserved = parseFloat(inv.rows[0].reserved_quantity) || 0;
+        const available = onHand - reserved;
+        if (baseQty > available + 0.0001) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({
+            error: formatInsufficientStockMessage(available, baseQty, 'pc'),
+          });
+        }
+      }
+
+      totalReserved += enteredQty;
+      await client.query('UPDATE sales_order_items SET reserved_qty = $1 WHERE id = $2', [enteredQty, item.id]);
+      await client.query('UPDATE inventory SET reserved_quantity = reserved_quantity + $1 WHERE product_id = $2 AND location_id = 1', [baseQty, item.product_id]);
     }
 
     const remaining = parseFloat(so.rows[0].total_ordered_qty);
@@ -320,9 +352,10 @@ router.patch('/:id/cancel', authenticate, hasUserPerm('sales.sales-order.edit'),
 
     const items = await client.query('SELECT * FROM sales_order_items WHERE order_id = $1', [req.params.id]);
     for (const item of items.rows) {
-      const reserved = parseFloat(item.reserved_qty || 0);
-      if (reserved > 0) {
-        await client.query('UPDATE inventory SET reserved_quantity = GREATEST(0, reserved_quantity - $1) WHERE product_id = $2 AND location_id = 1', [reserved, item.product_id]);
+      const enteredReserved = parseFloat(item.reserved_qty || 0);
+      if (enteredReserved > 0) {
+        const baseRelease = lineItemBaseQty({ ...item, quantity: enteredReserved, entered_qty: enteredReserved });
+        await client.query('UPDATE inventory SET reserved_quantity = GREATEST(0, reserved_quantity - $1) WHERE product_id = $2 AND location_id = 1', [baseRelease, item.product_id]);
       }
       await client.query('UPDATE sales_order_items SET reserved_qty = 0 WHERE id = $1', [item.id]);
     }
@@ -373,23 +406,26 @@ router.get('/:id/print', authenticate, hasUserPerm('sales.sales-order.print'), a
     const items = await query(
       `SELECT soi.*, p.name as product_name, p.sku,
               COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
-       FROM sales_order_items soi LEFT JOIN products p ON soi.product_id = p.id WHERE soi.order_id = $1 ORDER BY soi.id`,
+       FROM sales_order_items soi LEFT JOIN products p ON soi.product_id = p.id
+       WHERE soi.order_id = $1 ORDER BY soi.id`,
       [req.params.id]
     );
 
-    const totalQty = items.rows.reduce((s: number, r: any) => s + parseFloat(r.ordered_qty), 0);
+    const printItems = await enrichSalesPrintLineUoms({ query }, items.rows);
+
+    const totalQty = printItems.reduce((s: number, r: any) => s + parseFloat(r.ordered_qty), 0);
     const subtotal = parseFloat(so.subtotal) || 0;
     const discount = parseFloat(so.discount) || 0;
     const tax = parseFloat(so.tax_amount || so.tax || 0);
     const total = parseFloat(so.total_amount || so.total) || 0;
 
-    const itemRows = items.rows.map((row: any, idx: number) =>
+    const itemRows = printItems.map((row: any, idx: number) =>
       tableRow([
         { html: String(idx + 1), align: 'c' },
         { html: row.sku || '—' },
         { html: row.product_name || row.description || '—' },
         { html: String(parseFloat(row.ordered_qty)), align: 'c' },
-        { html: row.unit_of_measure || '—', align: 'c' },
+        { html: row.display_uom || '—', align: 'c' },
         { html: fmtCurrency(row.unit_price), align: 'r' },
         { html: fmtCurrency(row.total), align: 'r' },
       ])
@@ -418,7 +454,7 @@ router.get('/:id/print', authenticate, hasUserPerm('sales.sales-order.print'), a
       itemHeaders: SALES_LINE_ITEM_HEADERS,
       itemRows,
       summaryRows: buildVatInclusiveSummaryRows({
-        lineCount: items.rows.length,
+        lineCount: printItems.length,
         qtyTotal: totalQty,
         subtotal,
         discount,

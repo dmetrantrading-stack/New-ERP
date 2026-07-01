@@ -87,6 +87,7 @@ export interface Supplier {
   id: number;
   supplier_code: string;
   supplier_name: string;
+  entity_type?: 'Corporation' | 'Sole Proprietorship';
   contact_person?: string;
   address?: string;
   phone?: string;

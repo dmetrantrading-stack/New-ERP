@@ -5,8 +5,8 @@ import { formatCurrency } from '../../lib/utils';
 import { useAuth } from '../../store/auth';
 import {
   PRIMARY, FINANCE_FONT, financeTabClass,
-  StockOpsTabKey,
-  filterStockOpsTabs, parseStockOpsTab,
+  parseStockOpsTab, sectionForTab, tabsForSection, sectionsForUser, tabDef, filterStockOpsTabs,
+  type StockOpsSectionKey, type StockOpsTabKey,
 } from '../../lib/stockOpsUtils';
 import InventoryPage from '../inventory/InventoryPage';
 import UnitConversions from '../inventory/UnitConversions';
@@ -17,6 +17,12 @@ import StockTransferPage from '../stockTransfer/StockTransferPage';
 import {
   Warehouse, Package, ArrowLeftRight, Factory, ClipboardList, Truck, RefreshCw, Layers,
 } from 'lucide-react';
+
+const SECTION_ICONS: Record<StockOpsSectionKey, React.ElementType> = {
+  inventory: Package,
+  movement: Truck,
+  production: Factory,
+};
 
 const TAB_ICONS: Record<StockOpsTabKey, React.ElementType> = {
   inventory: Package,
@@ -40,28 +46,48 @@ export default function StockOpsPage() {
   const { hasPerm } = useAuth();
   const [searchParams, setSearchParams] = useSearchParams();
 
-  const tabs = useMemo(() => filterStockOpsTabs(hasPerm), [hasPerm]);
-  const initialTab = parseStockOpsTab(searchParams.get('tab')) || tabs[0]?.key || 'inventory';
+  const accessibleTabs = useMemo(() => filterStockOpsTabs(hasPerm), [hasPerm]);
+  const sections = useMemo(() => sectionsForUser(hasPerm), [hasPerm]);
+
+  const initialTab = parseStockOpsTab(searchParams.get('tab')) || accessibleTabs[0]?.id || 'inventory';
   const [activeTab, setActiveTab] = useState<StockOpsTabKey>(initialTab);
+  const [activeSection, setActiveSection] = useState<StockOpsSectionKey>(() => sectionForTab(initialTab));
   const [invSummary, setInvSummary] = useState({ total_skus: 0, low_stock: 0, inventory_value: 0 });
 
-  const setTab = useCallback((key: StockOpsTabKey) => {
-    setActiveTab(key);
-    setSearchParams({ tab: key }, { replace: true });
+  const sectionTabs = useMemo(() => tabsForSection(activeSection, hasPerm), [activeSection, hasPerm]);
+  const activeDef = tabDef(activeTab);
+
+  const setTab = useCallback((tab: StockOpsTabKey) => {
+    setActiveTab(tab);
+    setActiveSection(sectionForTab(tab));
+    setSearchParams({ tab }, { replace: true });
   }, [setSearchParams]);
 
+  const setSection = useCallback((section: StockOpsSectionKey) => {
+    setActiveSection(section);
+    const first = tabsForSection(section, hasPerm)[0];
+    if (first) setTab(first.id);
+  }, [hasPerm, setTab]);
+
   useEffect(() => {
-    if (tabs.length > 0 && !tabs.some((t) => t.key === activeTab)) {
-      setTab(tabs[0].key);
+    if (accessibleTabs.length > 0 && !accessibleTabs.some((t) => t.id === activeTab)) {
+      setTab(accessibleTabs[0].id);
     }
-  }, [tabs, activeTab, setTab]);
+  }, [accessibleTabs, activeTab, setTab]);
+
+  useEffect(() => {
+    if (sections.length > 0 && !sections.some((s) => s.key === activeSection)) {
+      setSection(sections[0].key);
+    }
+  }, [sections, activeSection, setSection]);
 
   useEffect(() => {
     const fromUrl = parseStockOpsTab(searchParams.get('tab'));
-    if (fromUrl && fromUrl !== activeTab && tabs.some((t) => t.key === fromUrl)) {
+    if (fromUrl && fromUrl !== activeTab && accessibleTabs.some((t) => t.id === fromUrl)) {
       setActiveTab(fromUrl);
+      setActiveSection(sectionForTab(fromUrl));
     }
-  }, [searchParams, tabs, activeTab]);
+  }, [searchParams, accessibleTabs, activeTab]);
 
   const loadInvSummary = useCallback(() => {
     if (!hasPerm('inventory.inventory.view')) return;
@@ -95,7 +121,7 @@ export default function StockOpsPage() {
     }
   };
 
-  if (tabs.length === 0) {
+  if (accessibleTabs.length === 0) {
     return (
       <div className="h-[calc(100vh-4rem)] -m-6 flex items-center justify-center bg-gray-50" style={{ fontFamily: FINANCE_FONT }}>
         <div className="text-center text-gray-500">
@@ -112,19 +138,20 @@ export default function StockOpsPage() {
       <div className="flex-shrink-0 px-4 h-12 flex items-center justify-between gap-3" style={{ backgroundColor: PRIMARY }}>
         <div className="flex items-center gap-3 min-w-0 flex-1">
           <Warehouse size={18} className="text-white/90 flex-shrink-0" />
-          <div className="flex items-center gap-1 bg-white/10 rounded-lg p-0.5 overflow-x-auto max-w-full">
-            {tabs.map((t) => {
-              const Icon = TAB_ICONS[t.key];
+          <h1 className="text-white font-semibold text-sm tracking-wide flex-shrink-0 hidden sm:block">Stock & Ops</h1>
+          <div className="flex items-center gap-1 bg-white/10 rounded-lg p-0.5 overflow-x-auto min-w-0 flex-1">
+            {sections.map((s) => {
+              const Icon = SECTION_ICONS[s.key];
               return (
                 <button
-                  key={t.key}
+                  key={s.key}
                   type="button"
-                  onClick={() => setTab(t.key)}
-                  className={financeTabClass(activeTab === t.key)}
+                  onClick={() => setSection(s.key)}
+                  className={financeTabClass(activeSection === s.key)}
                 >
                   <span className="inline-flex items-center gap-1">
                     <Icon size={13} />
-                    {t.label}
+                    {s.label}
                   </span>
                 </button>
               );
@@ -143,6 +170,35 @@ export default function StockOpsPage() {
             <RefreshCw size={14} />
             Refresh
           </button>
+        )}
+      </div>
+
+      <div className="flex-shrink-0 bg-white border-b border-gray-200 px-4 py-2.5">
+        <div className="flex flex-wrap gap-1.5">
+          {sectionTabs.map((t) => {
+            const Icon = TAB_ICONS[t.id];
+            return (
+              <button
+                key={t.id}
+                type="button"
+                onClick={() => setTab(t.id)}
+                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
+                  activeTab === t.id
+                    ? 'bg-blue-700 text-white'
+                    : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                }`}
+              >
+                <Icon size={13} />
+                {t.label}
+              </button>
+            );
+          })}
+        </div>
+        {activeDef && (
+          <p className="text-[11px] text-gray-400 mt-2">
+            {activeDef.label} · {sections.find((s) => s.key === activeSection)?.label}
+            {activeDef.description ? ` — ${activeDef.description}` : ''}
+          </p>
         )}
       </div>
 

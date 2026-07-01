@@ -3,8 +3,17 @@ import ModalOverlay from '../../components/ModalOverlay';
 import api from '../../lib/api';
 import { formatCurrency, generateBarcode } from '../../lib/utils';
 import { validateProductForm, isOnlyReorderLevelChanged } from '../../lib/productsUtils';
+import {
+  findBaseUomFromCatalog,
+  findProductBaseRowIndex,
+  getProductBaseUomId,
+  isProductBaseRow,
+  normalizeProductUomRows,
+  normalizeUomCode,
+} from '../../lib/uomUtils';
+import ProductUomPanel, { pricesFromBasePc } from './ProductUomPanel';
 import { useAuth } from '../../store/auth';
-import { Plus, Search, Edit2, Eye, Download, Upload, ToggleLeft, Barcode, Trash2, FileText, X, Loader2, Package, TrendingUp, Printer } from 'lucide-react';
+import { Plus, Search, Edit2, Eye, Download, Upload, ToggleLeft, Barcode, Trash2, FileText, X, Loader2, Package, TrendingUp, Printer, ArrowLeft } from 'lucide-react';
 import Pagination from '../../components/Pagination';
 import toast from 'react-hot-toast';
 
@@ -48,8 +57,22 @@ const EMPTY_FORM = {
   cost: 0, retail_price: 0, wholesale_price: 0, distributor_price: 0, reorder_level: 0, tax_type: 'VAT', price_type: 'VAT Inclusive',
   retail_markup: 0, wholesale_markup: 0, distributor_markup: 0,
   has_chilled_variant: false, chilled_price: 0,
+  allow_multiple_uom: true, track_batch: true, track_expiry: true,
   _manualRetail: false, _manualWholesale: false, _manualDistributor: false,
 };
+
+const DEFAULT_UOM_ROW = (prices: { cost: number; retail: number; wholesale: number; distributor: number; barcode?: string }) => ([{
+  uom_id: 0,
+  uom_code: 'pc',
+  conversion_to_base: 1,
+  barcode: prices.barcode || '',
+  purchase_price: prices.cost,
+  retail_price: prices.retail,
+  wholesale_price: prices.wholesale,
+  distributor_price: prices.distributor,
+  is_default_purchase: true,
+  is_default_sales: true,
+}]);
 
 export default function ProductList({ embedded = false, onChanged }: { embedded?: boolean; onChanged?: () => void }) {
   const { hasPerm, hasAnyPerm } = useAuth();
@@ -61,7 +84,7 @@ export default function ProductList({ embedded = false, onChanged }: { embedded?
   const [products, setProducts] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
-  const [showModal, setShowModal] = useState(false);
+  const [showForm, setShowForm] = useState(false);
   const [editProduct, setEditProduct] = useState<any>(null);
   const [categories, setCategories] = useState<any[]>([]);
   const [brands, setBrands] = useState<any[]>([]);
@@ -86,6 +109,7 @@ export default function ProductList({ embedded = false, onChanged }: { embedded?
   const [phDateTo, setPhDateTo] = useState('');
   const [saving, setSaving] = useState(false);
   const [form, setForm] = useState<any>({ ...EMPTY_FORM });
+  const [uomConversions, setUomConversions] = useState<any[]>(DEFAULT_UOM_ROW({ cost: 0, retail: 0, wholesale: 0, distributor: 0 }));
 
   // Auto-calculate prices when cost or markup changes
   useEffect(() => {
@@ -103,6 +127,35 @@ export default function ProductList({ embedded = false, onChanged }: { embedded?
       setForm((f: any) => ({ ...f, distributor_price: Math.round(cost * (1 + dm / 100) * 100) / 100 }));
     }
   }, [form.cost, form.retail_markup, form.wholesale_markup, form.distributor_markup]);
+
+  // Auto-sync alternate UOM prices from base unit when "Auto" is enabled
+  useEffect(() => {
+    setUomConversions((rows) => rows.map((row) => {
+      const isBase = isProductBaseRow(row, rows, form.base_uom_id ?? editProduct?.base_uom_id);
+      if (isBase) {
+        return {
+          ...row,
+          purchase_price: parseFloat(form.cost) || 0,
+          retail_price: parseFloat(form.retail_price) || 0,
+          wholesale_price: parseFloat(form.wholesale_price) || 0,
+          distributor_price: parseFloat(form.distributor_price) || 0,
+        };
+      }
+      if (!row.auto_from_pc) return row;
+      return {
+        ...row,
+        ...pricesFromBasePc({
+          cost: form.cost,
+          retail_markup: form.retail_markup,
+          wholesale_markup: form.wholesale_markup,
+          distributor_markup: form.distributor_markup,
+          retail_price: form.retail_price,
+          wholesale_price: form.wholesale_price,
+          distributor_price: form.distributor_price,
+        }, row.conversion_to_base),
+      };
+    }));
+  }, [form.cost, form.retail_price, form.wholesale_price, form.distributor_price, form.base_uom_id, editProduct?.base_uom_id]);
 
   const loadProducts = () => {
     setLoading(true);
@@ -122,22 +175,67 @@ export default function ProductList({ embedded = false, onChanged }: { embedded?
     if (!canCreate) { toast.error('You do not have permission to add products'); return; }
     setEditProduct(null);
     setForm({ ...EMPTY_FORM });
-    setShowModal(true);
+    setUomConversions(DEFAULT_UOM_ROW({ cost: 0, retail: 0, wholesale: 0, distributor: 0 }));
+    api.get('/uoms/catalog').then((r) => {
+      const catalog = Array.isArray(r.data) ? r.data : [];
+      const pc = findBaseUomFromCatalog(catalog);
+      if (pc) {
+        setForm((f: any) => ({
+          ...f,
+          base_uom_id: Number(pc.id),
+          unit_of_measure: normalizeUomCode(pc.code) || 'pc',
+        }));
+        setUomConversions([{
+          uom_id: Number(pc.id),
+          uom_code: normalizeUomCode(pc.code) || 'pc',
+          conversion_to_base: 1,
+          barcode: '',
+          purchase_price: 0,
+          retail_price: 0,
+          wholesale_price: 0,
+          distributor_price: 0,
+          is_default_purchase: true,
+          is_default_sales: true,
+        }]);
+      }
+    }).catch(() => {});
+    setShowForm(true);
   };
-  const openEdit = (p: any) => {
+  const openEdit = async (p: any) => {
     if (!canEdit) { toast.error('You do not have permission to edit products'); return; }
     const cost = parseFloat(p.cost) || 0;
-    setEditProduct(p);
-    setForm({
-      ...p,
-      retail_markup: cost > 0 ? Math.round(((parseFloat(p.retail_price) || 0) / cost - 1) * 100 * 100) / 100 : 0,
-      wholesale_markup: cost > 0 ? Math.round(((parseFloat(p.wholesale_price) || 0) / cost - 1) * 100 * 100) / 100 : 0,
-      distributor_markup: cost > 0 ? Math.round(((parseFloat(p.distributor_price) || 0) / cost - 1) * 100 * 100) / 100 : 0,
-      _manualRetail: false,
-      _manualWholesale: false,
-      _manualDistributor: false,
-    });
-    setShowModal(true);
+    try {
+      const full = await api.get(`/products/${p.id}`);
+      const prod = full.data;
+      setEditProduct(prod);
+      setForm({
+        ...prod,
+        retail_markup: cost > 0 ? Math.round(((parseFloat(prod.retail_price) || 0) / cost - 1) * 100 * 100) / 100 : 0,
+        wholesale_markup: cost > 0 ? Math.round(((parseFloat(prod.wholesale_price) || 0) / cost - 1) * 100 * 100) / 100 : 0,
+        distributor_markup: cost > 0 ? Math.round(((parseFloat(prod.distributor_price) || 0) / cost - 1) * 100 * 100) / 100 : 0,
+        _manualRetail: false,
+        _manualWholesale: false,
+        _manualDistributor: false,
+        allow_multiple_uom: Boolean(prod.allow_multiple_uom),
+        track_batch: Boolean(prod.track_batch),
+        track_expiry: Boolean(prod.track_expiry),
+      });
+      setUomConversions(prod.uoms?.length
+        ? normalizeProductUomRows(prod.uoms.map((row: any) => ({
+          ...row,
+          auto_from_pc: Boolean(row.auto_from_pc),
+        })), prod.base_uom_id)
+        : DEFAULT_UOM_ROW({
+          cost: parseFloat(prod.cost) || 0,
+          retail: parseFloat(prod.retail_price) || 0,
+          wholesale: parseFloat(prod.wholesale_price) || 0,
+          distributor: parseFloat(prod.distributor_price) || 0,
+          barcode: prod.barcode,
+        }));
+      setShowForm(true);
+    } catch {
+      toast.error('Failed to load product');
+    }
   };
 
   const handleSave = async () => {
@@ -164,6 +262,55 @@ export default function ProductList({ embedded = false, onChanged }: { embedded?
       payload.reorder_level = parseFloat(payload.reorder_level) || 0;
       payload.chilled_price = parseFloat(payload.chilled_price) || 0;
       payload.has_chilled_variant = Boolean(payload.has_chilled_variant);
+      payload.allow_multiple_uom = Boolean(form.allow_multiple_uom)
+        || uomConversions.some((r) => parseFloat(String(r.conversion_to_base)) > 1);
+      payload.track_batch = Boolean(form.track_batch);
+      payload.track_expiry = Boolean(form.track_expiry);
+
+      const normalizedRows = normalizeProductUomRows(uomConversions, form.base_uom_id ?? editProduct?.base_uom_id);
+      const baseUomId = getProductBaseUomId(normalizedRows, form.base_uom_id ?? editProduct?.base_uom_id);
+      const baseRow = normalizedRows[findProductBaseRowIndex(normalizedRows, baseUomId)] || normalizedRows[0];
+      payload.unit_of_measure = normalizeUomCode(baseRow?.uom_code) || payload.unit_of_measure || 'pc';
+      payload.base_uom_id = baseUomId;
+
+      let catalogForSave: any[] = [];
+      if (payload.allow_multiple_uom || normalizedRows.some((r) => !Number(r.uom_id))) {
+        try {
+          const catRes = await api.get('/uoms/catalog');
+          catalogForSave = Array.isArray(catRes.data) ? catRes.data : [];
+        } catch {
+          toast.error('Failed to load UOM catalog');
+          setSaving(false);
+          return;
+        }
+      }
+      const baseCatalogUom = findBaseUomFromCatalog(catalogForSave);
+      let syncedUoms = normalizedRows.map((row) => {
+        const isBase = baseUomId ? Number(row.uom_id) === Number(baseUomId) : parseFloat(String(row.conversion_to_base)) === 1;
+        const uomId = Number(row.uom_id) || (isBase && baseCatalogUom ? Number(baseCatalogUom.id) : 0);
+        const { auto_from_pc: _auto, ...rowRest } = row;
+        return {
+          ...rowRest,
+          uom_id: uomId,
+          purchase_price: isBase ? payload.cost : row.purchase_price,
+          retail_price: isBase ? payload.retail_price : row.retail_price,
+          wholesale_price: isBase ? payload.wholesale_price : row.wholesale_price,
+          distributor_price: isBase ? payload.distributor_price : row.distributor_price,
+          barcode: isBase ? payload.barcode : row.barcode,
+        };
+      }).filter((row) => Number(row.uom_id) > 0);
+
+      if (payload.allow_multiple_uom && !syncedUoms.some((r) => Number(r.uom_id) === Number(baseUomId))) {
+        toast.error('Base UOM is required');
+        setSaving(false);
+        return;
+      }
+
+      payload.uom_conversions = syncedUoms;
+      payload.default_sales_uom_id = syncedUoms.find((r) => r.is_default_sales)?.uom_id || syncedUoms[0]?.uom_id;
+      payload.default_purchase_uom_id = syncedUoms.find((r) => r.is_default_purchase)?.uom_id || syncedUoms[0]?.uom_id;
+      payload.base_uom_id = baseUomId || syncedUoms.find((r) => parseFloat(String(r.conversion_to_base)) === 1)?.uom_id || syncedUoms[0]?.uom_id;
+
       if (editProduct) {
         if (isOnlyReorderLevelChanged(editProduct, payload)) {
           await api.patch(`/products/${editProduct.id}/reorder-level`, { reorder_level: payload.reorder_level });
@@ -176,7 +323,7 @@ export default function ProductList({ embedded = false, onChanged }: { embedded?
         await api.post('/products', payload);
         toast.success('Product created');
       }
-      setShowModal(false);
+      setShowForm(false);
       loadProducts();
     } catch (err: any) { toast.error(err.response?.data?.error || 'Error saving product'); }
     finally { setSaving(false); }
@@ -295,23 +442,182 @@ export default function ProductList({ embedded = false, onChanged }: { embedded?
     toast.success('Barcode generated');
   };
 
+  const closeForm = () => {
+    if (saving) return;
+    setShowForm(false);
+    setEditProduct(null);
+  };
+
+  const renderProductFormFields = () => (
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div className="md:col-span-2">
+        <label className="block text-sm font-medium mb-1">Product Name *</label>
+        <input type="text" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })}
+          disabled={saving || (editProduct ? !canEdit : !canCreate)}
+          className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none disabled:bg-gray-50" />
+      </div>
+      <div className="md:col-span-2">
+        <label className="block text-sm font-medium mb-1">Description</label>
+        <textarea value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })}
+          className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" rows={2} />
+      </div>
+      <div>
+        <label className="block text-sm font-medium mb-1">Barcode</label>
+        <div className="flex gap-2">
+          <input type="text" value={form.barcode} onChange={(e) => setForm({ ...form, barcode: e.target.value })}
+            className="flex-1 px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
+          <button type="button" onClick={handleGenerateBarcode} title="Generate barcode" className="px-3 py-2 border rounded-lg text-sm hover:bg-gray-50 text-blue-600"><Barcode size={16} /></button>
+        </div>
+      </div>
+      <div>
+        <label className="block text-sm font-medium mb-1">Category</label>
+        <select value={form.category_id} onChange={(e) => setForm({ ...form, category_id: e.target.value })}
+          className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
+          <option value="">Select Category</option>
+          {categories.map((c: any) => <option key={c.id} value={c.id}>{c.name}</option>)}
+        </select>
+      </div>
+      <div>
+        <label className="block text-sm font-medium mb-1">Brand</label>
+        <select value={form.brand_id} onChange={(e) => setForm({ ...form, brand_id: e.target.value })}
+          className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
+          <option value="">Select Brand</option>
+          {brands.map((b: any) => <option key={b.id} value={b.id}>{b.name}</option>)}
+        </select>
+      </div>
+      <ProductUomPanel
+        allowMultiple={Boolean(form.allow_multiple_uom)}
+        trackBatch={Boolean(form.track_batch)}
+        trackExpiry={Boolean(form.track_expiry)}
+        conversions={uomConversions}
+        pricing={{
+          cost: form.cost,
+          retail_markup: form.retail_markup,
+          wholesale_markup: form.wholesale_markup,
+          distributor_markup: form.distributor_markup,
+          retail_price: form.retail_price,
+          wholesale_price: form.wholesale_price,
+          distributor_price: form.distributor_price,
+          _manualRetail: form._manualRetail,
+          _manualWholesale: form._manualWholesale,
+          _manualDistributor: form._manualDistributor,
+        }}
+        onAllowMultipleChange={(v) => {
+          setForm({ ...form, allow_multiple_uom: v });
+          if (!v) {
+            setUomConversions((rows) => {
+              const idx = findProductBaseRowIndex(rows, form.base_uom_id ?? editProduct?.base_uom_id);
+              return idx >= 0 ? [rows[idx]] : rows.slice(0, 1);
+            });
+          }
+        }}
+        onTrackBatchChange={(v) => setForm({ ...form, track_batch: v })}
+        onTrackExpiryChange={(v) => setForm({ ...form, track_expiry: v })}
+        onConversionsChange={setUomConversions}
+        onPricingChange={(updates) => setForm((f: any) => ({ ...f, ...updates }))}
+        productBarcode={form.barcode}
+        baseUomId={form.base_uom_id ?? editProduct?.base_uom_id}
+        onBaseUomIdChange={(uomId, uomCode) => {
+          setForm((f: any) => ({ ...f, base_uom_id: uomId, unit_of_measure: normalizeUomCode(uomCode) || 'pc' }));
+        }}
+      />
+      <div>
+        <label className="block text-sm font-medium mb-1">Reorder Level</label>
+        <input type="number" step="0.01" value={form.reorder_level} onChange={(e) => setForm({ ...form, reorder_level: e.target.value })}
+          className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
+      </div>
+      <div>
+        <label className="block text-sm font-medium mb-1">Tax Type</label>
+        <select value={form.tax_type} onChange={(e) => setForm({ ...form, tax_type: e.target.value })}
+          className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
+          <option value="VAT">VAT 12%</option><option value="VAT Exempt">VAT Exempt</option>
+          <option value="Zero Rated">Zero Rated</option><option value="LGU 5% Final VAT">LGU 5% Final VAT</option>
+        </select>
+      </div>
+      {showPriceType && (
+        <div>
+          <label className="block text-sm font-medium mb-1">Price Type</label>
+          <select value={form.price_type} onChange={(e) => setForm({ ...form, price_type: e.target.value })}
+            className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
+            <option value="VAT Inclusive">VAT Inclusive</option>
+            <option value="VAT Exclusive">VAT Exclusive</option>
+          </select>
+          <p className="text-xs text-gray-500 mt-1">Whether retail price includes 12% VAT — used by POS only.</p>
+        </div>
+      )}
+      <div className="col-span-2 border rounded-lg p-3 bg-blue-50/50">
+        <label className="flex items-center gap-2 cursor-pointer mb-2">
+          <input type="checkbox" checked={form.has_chilled_variant} onChange={(e) => setForm({ ...form, has_chilled_variant: e.target.checked })}
+            className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500" />
+          <span className="text-sm font-medium text-gray-700">Enable Chilled Variant</span>
+        </label>
+        {form.has_chilled_variant && (
+          <div className="mt-2">
+            <label className="block text-xs text-gray-500 mb-1">Chilled Selling Price (Retail only) *</label>
+            <input type="number" step="0.01" min="0" value={form.chilled_price} onChange={(e) => setForm({ ...form, chilled_price: e.target.value })}
+              disabled={saving}
+              className="w-full max-w-xs px-3 py-2 border rounded-lg text-sm font-medium text-cyan-700 focus:ring-2 focus:ring-blue-500 outline-none disabled:bg-gray-50" />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
+  if (showForm) {
+    return (
+      <div className={`flex flex-col bg-gray-50 ${embedded ? 'h-full min-h-0' : 'min-h-[calc(100vh-4rem)] -m-6'}`}>
+        <div className="flex-shrink-0 sticky top-0 z-10 bg-white border-b border-gray-200 px-4 sm:px-6 py-3 flex flex-wrap items-center justify-between gap-3 shadow-sm">
+          <div className="flex items-center gap-3 min-w-0">
+            <button type="button" onClick={closeForm} disabled={saving}
+              className="inline-flex items-center gap-2 px-3 py-2 text-sm font-medium text-gray-700 border border-gray-200 rounded-lg hover:bg-gray-50 disabled:opacity-50">
+              <ArrowLeft size={16} /> Back
+            </button>
+            <div className="min-w-0">
+              <h1 className="text-lg font-semibold text-gray-900 truncate">
+                {editProduct ? 'Edit Product' : 'Add Product'}
+              </h1>
+              {editProduct?.sku && <p className="text-xs text-gray-500 truncate">{editProduct.sku}</p>}
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button type="button" onClick={closeForm} disabled={saving}
+              className="px-4 py-2 border rounded-lg text-sm hover:bg-gray-50 disabled:opacity-50">Cancel</button>
+            <button type="button" onClick={handleSave} disabled={saving || (editProduct ? !canEdit : !canCreate)}
+              className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700 disabled:opacity-50">
+              {saving && <Loader2 size={16} className="animate-spin" />}
+              {saving ? 'Saving...' : 'Save Product'}
+            </button>
+          </div>
+        </div>
+        <div className="flex-1 overflow-y-auto px-4 sm:px-6 py-6">
+          <div className="max-w-6xl mx-auto bg-white rounded-xl border border-gray-200 p-6 shadow-sm">
+            {renderProductFormFields()}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="space-y-4">
+    <div className={`flex flex-col min-h-0 ${embedded ? 'h-full gap-0' : 'space-y-4'}`}>
       {readOnly && (
-        <div className="px-4 py-2 bg-amber-50 border border-amber-200 rounded-lg text-amber-900 text-xs">
+        <div className="flex-shrink-0 mb-3 px-4 py-2 bg-amber-50 border border-amber-200 rounded-lg text-amber-900 text-xs">
           Read-only mode — you can view products but cannot add or edit. Contact an administrator for catalog access.
         </div>
       )}
 
-      <div className={`flex items-center ${embedded ? 'justify-end' : 'justify-between'}`}>
-        {!embedded && <h1 className="text-2xl font-bold text-gray-900">Products</h1>}
-        <div className="flex gap-2">
+      {/* Dynamic page toolbar */}
+      <div className="flex-shrink-0 flex items-center justify-between gap-3 pb-3">
+        <p className="text-xs text-gray-500">
+          <span className="font-semibold text-gray-700">{total}</span> product{total !== 1 ? 's' : ''}
+        </p>
+        <div className="flex gap-2 flex-wrap justify-end">
           {canEdit && (
-            <button onClick={() => setShowImportModal(true)} className="flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50"><Upload size={16} /> Import</button>
+            <button onClick={() => setShowImportModal(true)} className="flex items-center gap-2 px-3 py-1.5 border border-gray-300 rounded-lg text-xs font-semibold hover:bg-gray-50 bg-white"><Upload size={14} /> Import</button>
           )}
           {canExport && (
             <div className="relative">
-              <button onClick={() => setShowExportDropdown(!showExportDropdown)} className="flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50"><Download size={16} /> Export</button>
+              <button onClick={() => setShowExportDropdown(!showExportDropdown)} className="flex items-center gap-2 px-3 py-1.5 border border-gray-300 rounded-lg text-xs font-semibold hover:bg-gray-50 bg-white"><Download size={14} /> Export</button>
               {showExportDropdown && (
                 <div className="absolute right-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-lg z-10 w-40">
                   <button onClick={() => exportProducts('csv')} className="w-full text-left px-4 py-2.5 text-sm hover:bg-gray-50 border-b border-gray-100">Export as CSV</button>
@@ -321,38 +627,38 @@ export default function ProductList({ embedded = false, onChanged }: { embedded?
             </div>
           )}
           {canCreate && (
-            <button onClick={openCreate} className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700"><Plus size={16} /> Add Product</button>
+            <button onClick={openCreate} className="flex items-center gap-2 px-3 py-1.5 bg-blue-700 text-white rounded-lg text-xs font-semibold hover:bg-blue-800"><Plus size={14} /> Create</button>
           )}
         </div>
       </div>
 
-      {/* Search & Filters */}
-      <div className="flex gap-3 items-center">
-        <div className="relative flex-1 max-w-md">
-          <Search size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
-          <input type="text" placeholder="Search by name, SKU, or barcode..." value={search} onChange={(e) => setSearch(e.target.value)}
-            className="w-full pl-10 pr-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm" />
+      {/* Filter bar */}
+      <div className="flex-shrink-0 flex flex-wrap gap-3 items-center bg-white border border-gray-200 rounded-t-lg px-4 py-3">
+        <div className="relative flex-1 min-w-[200px] max-w-md">
+          <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+          <input type="text" placeholder="Search name, SKU, or barcode…" value={search} onChange={(e) => setSearch(e.target.value)}
+            className="w-full pl-9 pr-3 py-2 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm" />
         </div>
         <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}
-          className="px-3 py-2.5 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
-          <option value="all">All Status</option>
+          className="px-3 py-2 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none bg-white">
+          <option value="all">All status</option>
           <option value="true">Active</option>
           <option value="false">Inactive</option>
         </select>
       </div>
 
       {/* Table */}
-      <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
-        <div className="overflow-x-auto">
+      <div className={`bg-white border border-t-0 border-gray-200 overflow-hidden flex flex-col min-h-0 ${embedded ? 'flex-1 rounded-b-lg' : 'rounded-b-lg'}`}>
+        <div className="flex-1 overflow-auto min-h-0">
           <table className="data-table">
-            <thead>
+            <thead className="sticky top-0 z-10 bg-gray-50">
               <tr>
                 <th>SKU</th><th>Name</th><th>Category</th><th>Cost</th><th>Retail</th><th>Wholesale</th><th>Stock</th><th>Status</th><th className="w-32">Actions</th>
               </tr>
             </thead>
             <tbody>
               {loading ? (
-                <tr><td colSpan={9} className="text-center py-8 text-gray-400">Loading...</td></tr>
+                <tr><td colSpan={9} className="text-center py-8 text-gray-400">Loading…</td></tr>
               ) : products.length === 0 ? (
                 <tr><td colSpan={9} className="text-center py-8 text-gray-400">No products found</td></tr>
               ) : products.map((p) => (
@@ -387,164 +693,10 @@ export default function ProductList({ embedded = false, onChanged }: { embedded?
             </tbody>
           </table>
         </div>
-        <Pagination page={page} totalPages={Math.ceil(total / limit)} total={total} onPageChange={setPage} limit={limit} onLimitChange={(l) => setPage(1)} showSizeChanger />
+        <div className="flex-shrink-0 border-t border-gray-100">
+          <Pagination page={page} totalPages={Math.ceil(total / limit)} total={total} onPageChange={setPage} limit={limit} onLimitChange={(l) => setPage(1)} showSizeChanger />
+        </div>
       </div>
-
-      {/* Modal */}
-      {showModal && (
-        <ModalOverlay onClose={() => !saving && setShowModal(false)}>
-          <div className="modal-content">
-            <div className="p-6">
-              <h2 className="text-lg font-semibold mb-4">{editProduct ? 'Edit Product' : 'Add Product'}</h2>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="md:col-span-2">
-                  <label className="block text-sm font-medium mb-1">Product Name *</label>
-                  <input type="text" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })}
-                    disabled={saving || (editProduct ? !canEdit : !canCreate)}
-                    className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none disabled:bg-gray-50" />
-                </div>
-                <div className="md:col-span-2">
-                  <label className="block text-sm font-medium mb-1">Description</label>
-                  <textarea value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })}
-                    className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" rows={2} />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium mb-1">Barcode</label>
-                  <div className="flex gap-2">
-                    <input type="text" value={form.barcode} onChange={(e) => setForm({ ...form, barcode: e.target.value })}
-                      className="flex-1 px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
-                    <button type="button" onClick={handleGenerateBarcode} title="Generate barcode" className="px-3 py-2 border rounded-lg text-sm hover:bg-gray-50 text-blue-600"><Barcode size={16} /></button>
-                  </div>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium mb-1">Category</label>
-                  <select value={form.category_id} onChange={(e) => setForm({ ...form, category_id: e.target.value })}
-                    className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
-                    <option value="">Select Category</option>
-                    {categories.map((c: any) => <option key={c.id} value={c.id}>{c.name}</option>)}
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium mb-1">Brand</label>
-                  <select value={form.brand_id} onChange={(e) => setForm({ ...form, brand_id: e.target.value })}
-                    className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
-                    <option value="">Select Brand</option>
-                    {brands.map((b: any) => <option key={b.id} value={b.id}>{b.name}</option>)}
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium mb-1">Unit of Measure</label>
-                  <select value={form.unit_of_measure} onChange={(e) => setForm({ ...form, unit_of_measure: e.target.value })}
-                    className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
-                    <option value="pc">Piece (pc)</option><option value="case">Case</option><option value="box">Box</option>
-                    <option value="sack">Sack</option><option value="kg">Kilogram</option><option value="liter">Liter</option>
-                    <option value="pack">Pack</option><option value="bottle">Bottle</option><option value="can">Can</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium mb-1">Cost</label>
-                  <input type="number" step="0.01" value={form.cost} onChange={(e) => setForm({ ...form, cost: e.target.value, _manualRetail: false, _manualWholesale: false, _manualDistributor: false })}
-                    className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
-                </div>
-                <div className="border rounded-lg p-3 bg-gray-50 col-span-2">
-                  <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Pricing &amp; Markup</p>
-                  <div className="grid grid-cols-3 gap-3">
-                    <div>
-                      <label className="block text-xs text-gray-500 mb-1">Retail Markup %</label>
-                      <input type="number" step="0.01" value={form.retail_markup} onChange={(e) => setForm({ ...form, retail_markup: e.target.value, _manualRetail: false })}
-                        className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
-                    </div>
-                    <div>
-                      <label className="block text-xs text-gray-500 mb-1">Retail Price</label>
-                      <input type="number" step="0.01" value={form.retail_price} onChange={(e) => setForm({ ...form, retail_price: e.target.value, _manualRetail: true })}
-                        className="w-full px-3 py-2 border rounded-lg text-sm font-medium text-blue-700 focus:ring-2 focus:ring-blue-500 outline-none" />
-                    </div>
-                    <div className="flex items-end text-xs text-gray-400 pb-2">
-                      {form.cost > 0 && form.retail_price > 0 ? `+${Math.round(((parseFloat(form.retail_price) / parseFloat(form.cost)) - 1) * 100 * 100) / 100}%` : ''}
-                    </div>
-                    <div>
-                      <label className="block text-xs text-gray-500 mb-1">Wholesale Markup %</label>
-                      <input type="number" step="0.01" value={form.wholesale_markup} onChange={(e) => setForm({ ...form, wholesale_markup: e.target.value, _manualWholesale: false })}
-                        className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
-                    </div>
-                    <div>
-                      <label className="block text-xs text-gray-500 mb-1">Wholesale Price</label>
-                      <input type="number" step="0.01" value={form.wholesale_price} onChange={(e) => setForm({ ...form, wholesale_price: e.target.value, _manualWholesale: true })}
-                        className="w-full px-3 py-2 border rounded-lg text-sm font-medium text-green-700 focus:ring-2 focus:ring-blue-500 outline-none" />
-                    </div>
-                    <div className="flex items-end text-xs text-gray-400 pb-2">
-                      {form.cost > 0 && form.wholesale_price > 0 ? `+${Math.round(((parseFloat(form.wholesale_price) / parseFloat(form.cost)) - 1) * 100 * 100) / 100}%` : ''}
-                    </div>
-                    <div>
-                      <label className="block text-xs text-gray-500 mb-1">Distributor Markup %</label>
-                      <input type="number" step="0.01" value={form.distributor_markup} onChange={(e) => setForm({ ...form, distributor_markup: e.target.value, _manualDistributor: false })}
-                        className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
-                    </div>
-                    <div>
-                      <label className="block text-xs text-gray-500 mb-1">Distributor Price</label>
-                      <input type="number" step="0.01" value={form.distributor_price} onChange={(e) => setForm({ ...form, distributor_price: e.target.value, _manualDistributor: true })}
-                        className="w-full px-3 py-2 border rounded-lg text-sm font-medium text-purple-700 focus:ring-2 focus:ring-blue-500 outline-none" />
-                    </div>
-                    <div className="flex items-end text-xs text-gray-400 pb-2">
-                      {form.cost > 0 && form.distributor_price > 0 ? `+${Math.round(((parseFloat(form.distributor_price) / parseFloat(form.cost)) - 1) * 100 * 100) / 100}%` : ''}
-                    </div>
-                  </div>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium mb-1">Reorder Level</label>
-                  <input type="number" step="0.01" value={form.reorder_level} onChange={(e) => setForm({ ...form, reorder_level: e.target.value })}
-                    className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium mb-1">Tax Type</label>
-                  <select value={form.tax_type} onChange={(e) => setForm({ ...form, tax_type: e.target.value })}
-                    className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
-                    <option value="VAT">VAT 12%</option><option value="VAT Exempt">VAT Exempt</option>
-                    <option value="Zero Rated">Zero Rated</option><option value="LGU 5% Final VAT">LGU 5% Final VAT</option>
-                  </select>
-                </div>
-                {showPriceType && (
-                  <div>
-                    <label className="block text-sm font-medium mb-1">Price Type</label>
-                    <select value={form.price_type} onChange={(e) => setForm({ ...form, price_type: e.target.value })}
-                      className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
-                      <option value="VAT Inclusive">VAT Inclusive</option>
-                      <option value="VAT Exclusive">VAT Exclusive</option>
-                    </select>
-                    <p className="text-xs text-gray-500 mt-1">Whether retail price includes 12% VAT — used by POS only.</p>
-                  </div>
-                )}
-                <div className="col-span-2 border rounded-lg p-3 bg-blue-50/50">
-                  <label className="flex items-center gap-2 cursor-pointer mb-2">
-                    <input type="checkbox" checked={form.has_chilled_variant} onChange={(e) => setForm({ ...form, has_chilled_variant: e.target.checked })}
-                      className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500" />
-                    <span className="text-sm font-medium text-gray-700">Enable Chilled Variant</span>
-                  </label>
-                  {form.has_chilled_variant && (
-                    <div className="mt-2">
-                      <label className="block text-xs text-gray-500 mb-1">Chilled Selling Price (Retail only) *</label>
-                      <input type="number" step="0.01" min="0" value={form.chilled_price} onChange={(e) => setForm({ ...form, chilled_price: e.target.value })}
-                        disabled={saving}
-                        className="w-full max-w-xs px-3 py-2 border rounded-lg text-sm font-medium text-cyan-700 focus:ring-2 focus:ring-blue-500 outline-none disabled:bg-gray-50" />
-                    </div>
-                  )}
-                </div>
-              </div>
-              <div className="flex justify-end gap-3 mt-6">
-                <button onClick={() => setShowModal(false)} disabled={saving} className="px-4 py-2 border rounded-lg text-sm hover:bg-gray-50 disabled:opacity-50">Cancel</button>
-                <button
-                  onClick={handleSave}
-                  disabled={saving || (editProduct ? !canEdit : !canCreate)}
-                  className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700 disabled:opacity-50"
-                >
-                  {saving && <Loader2 size={16} className="animate-spin" />}
-                  {saving ? 'Saving...' : 'Save'}
-                </button>
-              </div>
-            </div>
-          </div>
-        </ModalOverlay>
-      )}
 
       {/* Import modal */}
       {showImportModal && (

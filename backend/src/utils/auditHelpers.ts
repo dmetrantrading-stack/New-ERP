@@ -1,5 +1,11 @@
 import { AuthRequest } from '../middleware/auth';
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isValidUuid(value: string | null | undefined): boolean {
+  return !!value && UUID_RE.test(value);
+}
+
 const SENSITIVE_KEYS = new Set([
   'password', 'password_hash', 'current_password', 'new_password', 'token', 'secret',
 ]);
@@ -92,7 +98,7 @@ export const AUDIT_FIELDS = {
   goodsReceipt: ['id', 'gr_number', 'po_id', 'supplier_id', 'status', 'total'],
   product: ['id', 'sku', 'name', 'cost', 'price', 'tax_type', 'is_active', 'category_id', 'brand_id'],
   customer: ['id', 'customer_code', 'customer_name', 'customer_type', 'tin', 'credit_limit', 'payment_terms', 'is_active'],
-  supplier: ['id', 'supplier_code', 'supplier_name', 'tin', 'payment_terms', 'is_active'],
+  supplier: ['id', 'supplier_code', 'supplier_name', 'entity_type', 'tin', 'payment_terms', 'is_active'],
   user: ['id', 'username', 'full_name', 'email', 'role_id', 'is_active'],
   chartAccount: ['id', 'account_code', 'account_name', 'account_type', 'is_active'],
   bankAccount: ['id', 'account_name', 'account_number', 'bank_name', 'balance', 'is_active'],
@@ -123,14 +129,23 @@ export function auditReference(req: AuthRequest, referenceType: string, referenc
   if (referenceId) (req as any).auditReferenceId = referenceId;
 }
 
-/** Extract document id from URL params or JSON response body. */
+/** Extract document id from URL params or JSON response body (UUID only for reference_id column). */
 export function resolveAuditReferenceId(req: AuthRequest, body: unknown): string | null {
   const explicit = (req as any).auditReferenceId;
-  if (explicit) return String(explicit);
-  if (req.params?.id) return String(req.params.id);
+  if (explicit) {
+    const id = String(explicit);
+    return isValidUuid(id) ? id : null;
+  }
+  if (req.params?.id) {
+    const id = String(req.params.id);
+    return isValidUuid(id) ? id : null;
+  }
   if (body && typeof body === 'object') {
     const b = body as Record<string, unknown>;
-    if (b.id) return String(b.id);
+    if (b.id) {
+      const id = String(b.id);
+      if (isValidUuid(id)) return id;
+    }
     if (b.invoice_id) return String(b.invoice_id);
     if (b.receipt_id) return String(b.receipt_id);
   }

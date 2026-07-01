@@ -15,7 +15,7 @@ const reset = async () => {
       'stock_transfers', 'stock_transfer_items',
       'sales_quotations', 'sales_orders', 'delivery_notes',
       'sales_invoices', 'sales_invoice_items', 'sales_returns',
-      'pos_shifts', 'pos_transactions', 'pos_transaction_items', 'suspended_sales',
+      'pos_shifts', 'pos_return_items', 'pos_returns', 'pos_transactions', 'pos_transaction_items', 'suspended_sales',
       'journal_entries', 'journal_entry_lines',
       'collection_receipts', 'payment_vouchers',
       'cash_transactions', 'bank_transactions',

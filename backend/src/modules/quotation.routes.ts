@@ -12,6 +12,9 @@ import {
 } from '../utils/salesEnterprisePrint';
 import { calculateSalesDocItems } from '../utils/invoiceTax';
 import { auditAfter, auditBefore, auditSnapshot, AUDIT_FIELDS } from '../utils/auditHelpers';
+import { loadProductUoms } from '../utils/productUomDb';
+import { resolveSalesDocLineUomFields } from '../utils/uom';
+import { enrichSalesPrintLineUoms } from '../utils/salesPrintUom';
 
 const router = Router();
 
@@ -82,8 +85,10 @@ router.get('/:id', authenticate, sqView, async (req: AuthRequest, res: Response)
     if (sq.rows.length === 0) return res.status(404).json({ error: 'Not found' });
     const items = await query(
       `SELECT sqi.*, p.name as product_name, p.sku,
+              COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as uom_code,
               COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
        FROM sales_quotation_items sqi LEFT JOIN products p ON sqi.product_id = p.id
+       LEFT JOIN uoms u ON sqi.uom_id = u.id
        WHERE sqi.quotation_id = $1 ORDER BY sqi.id`,
       [req.params.id]
     );
@@ -118,10 +123,11 @@ router.post('/', authenticate, hasUserPerm('sales.sales-quotation.create'), audi
       for (let i = 0; i < items.length; i++) {
         const item = items[i];
         const calc = lines[i];
+        const uomFields = await resolveSalesDocLineUomFields(client, item.product_id, item, calc.quantity, loadProductUoms);
         await client.query(
-          `INSERT INTO sales_quotation_items (id, quotation_id, product_id, variant_id, description, quantity, unit_price, discount, tax_type, vat_amount, total)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-          [uuidv4(), id, item.product_id, item.variant_id || null, item.description, calc.quantity, calc.unit_price, calc.discount, calc.tax_type, calc.vat, calc.total]
+          `INSERT INTO sales_quotation_items (id, quotation_id, product_id, variant_id, description, quantity, unit_price, discount, tax_type, vat_amount, total, uom_id, entered_qty, conversion_to_base, base_qty)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+          [uuidv4(), id, item.product_id, item.variant_id || null, item.description, calc.quantity, calc.unit_price, calc.discount, calc.tax_type, calc.vat, calc.total, uomFields.uom_id, uomFields.enteredQty, uomFields.conversion_to_base, uomFields.base_qty]
         );
       }
 
@@ -161,10 +167,11 @@ router.put('/:id', authenticate, hasUserPerm('sales.sales-quotation.edit'), audi
         for (let i = 0; i < items.length; i++) {
           const item = items[i];
           const calc = lines[i];
+          const uomFields = await resolveSalesDocLineUomFields(client, item.product_id, item, calc.quantity, loadProductUoms);
           await client.query(
-            `INSERT INTO sales_quotation_items (id, quotation_id, product_id, variant_id, description, quantity, unit_price, discount, tax_type, vat_amount, total)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-            [uuidv4(), req.params.id, item.product_id, item.variant_id || null, item.description, calc.quantity, calc.unit_price, calc.discount, calc.tax_type, calc.vat, calc.total]
+            `INSERT INTO sales_quotation_items (id, quotation_id, product_id, variant_id, description, quantity, unit_price, discount, tax_type, vat_amount, total, uom_id, entered_qty, conversion_to_base, base_qty)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+            [uuidv4(), req.params.id, item.product_id, item.variant_id || null, item.description, calc.quantity, calc.unit_price, calc.discount, calc.tax_type, calc.vat, calc.total, uomFields.uom_id, uomFields.enteredQty, uomFields.conversion_to_base, uomFields.base_qty]
           );
         }
       }
@@ -216,8 +223,10 @@ router.get('/:id/copy-to-order', authenticate, hasUserPerm('sales.sales-order.cr
 
     const items = await query(
       `SELECT sqi.*, p.name as product_name, p.sku,
+              COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as uom_code,
               COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
        FROM sales_quotation_items sqi LEFT JOIN products p ON sqi.product_id = p.id
+       LEFT JOIN uoms u ON sqi.uom_id = u.id
        WHERE sqi.quotation_id = $1 ORDER BY sqi.id`,
       [req.params.id]
     );
@@ -250,7 +259,11 @@ router.get('/:id/copy-to-order', authenticate, hasUserPerm('sales.sales-order.cr
         discount: parseFloat(i.discount || 0),
         tax_type: i.tax_type || 'VAT',
         vat_amount: parseFloat(i.vat_amount || 0),
-        uom: i.unit_of_measure || '',
+        uom: i.uom_code || i.unit_of_measure || '',
+        uom_id: i.uom_id,
+        entered_qty: parseFloat(i.entered_qty ?? i.quantity),
+        conversion_to_base: parseFloat(i.conversion_to_base || 1),
+        base_qty: parseFloat(i.base_qty ?? i.quantity),
       })),
     });
   } catch (error: any) { res.status(500).json({ error: error.message }); }
@@ -271,24 +284,27 @@ router.get('/:id/print', authenticate, hasUserPerm('sales.sales-quotation.print'
       `SELECT sqi.*, p.name as product_name, p.sku,
               COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
        FROM sales_quotation_items sqi
-       LEFT JOIN products p ON sqi.product_id = p.id WHERE sqi.quotation_id = $1 ORDER BY sqi.id`,
+       LEFT JOIN products p ON sqi.product_id = p.id
+       WHERE sqi.quotation_id = $1 ORDER BY sqi.id`,
       [req.params.id]
     );
 
-    const biz = await query('SELECT * FROM business_details WHERE id = 1');
-    const b = biz.rows[0] || {};
+    const printItems = await enrichSalesPrintLineUoms({ query }, items.rows);
 
-    const itemRows = items.rows.map((row: any, idx: number) =>
+    const itemRows = printItems.map((row: any, idx: number) =>
       tableRow([
         { html: String(idx + 1), align: 'c' },
         { html: row.sku || '—' },
         { html: row.product_name || row.description || '—' },
         { html: String(parseFloat(row.quantity || 0)), align: 'c' },
-        { html: row.unit_of_measure || '—', align: 'c' },
+        { html: row.display_uom || '—', align: 'c' },
         { html: fmtCurrency(parseFloat(row.unit_price || 0)), align: 'r' },
         { html: fmtCurrency(parseFloat(row.total || 0)), align: 'r' },
       ])
     ).join('');
+
+    const biz = await query('SELECT * FROM business_details WHERE id = 1');
+    const b = biz.rows[0] || {};
 
     const subtotal = parseFloat(d.subtotal || 0);
     const discount = parseFloat(d.discount || 0);
@@ -319,7 +335,7 @@ router.get('/:id/print', authenticate, hasUserPerm('sales.sales-quotation.print'
       itemHeaders: SALES_LINE_ITEM_HEADERS,
       itemRows,
       summaryRows: buildVatInclusiveSummaryRows({
-        lineCount: items.rows.length,
+        lineCount: printItems.length,
         subtotal,
         discount,
         tax,

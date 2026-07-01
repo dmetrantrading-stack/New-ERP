@@ -19,6 +19,9 @@ import {
   sumLineGlCogs,
 } from '../utils/categoryGlPosting';
 import { deductInventoryFefo, restoreInventoryFromLedger } from '../utils/batchFefo';
+import { loadProductUoms } from '../utils/productUomDb';
+import { lineItemBaseQty, resolveSalesDocLineUomFields } from '../utils/uom';
+import { enrichSalesPrintLineUoms } from '../utils/salesPrintUom';
 
 const router = Router();
 
@@ -154,10 +157,13 @@ router.get('/:id/copy-to-invoice', authenticate, hasUserPerm('sales.sales-invoic
     }
 
     const items = await query(
-      `SELECT dni.*, p.name as product_name, p.sku, p.unit_of_measure,
+      `SELECT dni.*, p.name as product_name, p.sku,
+              COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as uom_code,
+              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure,
               soi.variant_id, soi.tax_type, soi.discount as so_line_discount, soi.ordered_qty, soi.unit_price as so_unit_price
        FROM delivery_note_items dni
        LEFT JOIN products p ON dni.product_id = p.id
+       LEFT JOIN uoms u ON dni.uom_id = u.id
        LEFT JOIN sales_order_items soi ON dni.order_item_id = soi.id
        WHERE dni.note_id = $1 ORDER BY dni.id`,
       [req.params.id]
@@ -178,9 +184,13 @@ router.get('/:id/copy-to-invoice', authenticate, hasUserPerm('sales.sales-invoic
         variant_id: i.variant_id,
         product_name: i.product_name || '',
         sku: i.sku || '',
-        unit_of_measure: i.unit_of_measure || '',
+        unit_of_measure: i.uom_code || i.unit_of_measure || '',
         description: i.description || i.product_name || '',
         quantity: qty,
+        uom_id: i.uom_id,
+        entered_qty: qty,
+        conversion_to_base: parseFloat(i.conversion_to_base || 1),
+        base_qty: lineItemBaseQty({ ...i, quantity: qty, entered_qty: qty }),
         unit_price: unitPrice,
         discount: Math.round(discountPercent * 100) / 100,
         tax_type: i.tax_type || 'VAT',
@@ -224,10 +234,12 @@ router.get('/:id', authenticate, drView, async (req: AuthRequest, res: Response)
     if (dr.rows.length === 0) return res.status(404).json({ error: 'Not found' });
     const items = await query(
       `SELECT dni.*, soi.ordered_qty, soi.delivered_qty as soi_delivered, p.name as product_name, p.sku,
+              COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as uom_code,
               COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
        FROM delivery_note_items dni
        LEFT JOIN sales_order_items soi ON dni.order_item_id = soi.id
        LEFT JOIN products p ON dni.product_id = p.id
+       LEFT JOIN uoms u ON dni.uom_id = u.id
        WHERE dni.note_id = $1 ORDER BY dni.id`,
       [req.params.id]
     );
@@ -254,10 +266,13 @@ router.get('/from-so/:soId', authenticate, drView, async (req: AuthRequest, res:
     }
 
     const items = await query(
-      `SELECT soi.*, p.name as product_name, p.sku, p.unit_of_measure,
+      `SELECT soi.*, p.name as product_name, p.sku,
+              COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as uom_code,
+              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure,
               (soi.ordered_qty - soi.delivered_qty) as remaining_qty
        FROM sales_order_items soi
        LEFT JOIN products p ON soi.product_id = p.id
+       LEFT JOIN uoms u ON soi.uom_id = u.id
        WHERE soi.order_id = $1 AND soi.ordered_qty > soi.delivered_qty
        ORDER BY soi.id`,
       [req.params.soId]
@@ -290,7 +305,9 @@ router.get('/from-so/:soId', authenticate, drView, async (req: AuthRequest, res:
         product_name: i.product_name || '',
         sku: i.sku || '',
         description: i.description || '',
-        unit_of_measure: i.unit_of_measure || '',
+        unit_of_measure: i.uom_code || i.unit_of_measure || '',
+        uom_id: i.uom_id,
+        conversion_to_base: parseFloat(i.conversion_to_base || 1),
         ordered_qty: parseFloat(i.ordered_qty),
         delivered_qty: parseFloat(i.delivered_qty),
         remaining_qty: parseFloat(i.remaining_qty),
@@ -342,10 +359,18 @@ router.post('/', authenticate, hasUserPerm('sales.delivery-receipt.create'), aud
       for (const item of items) {
         const soi = await client.query('SELECT * FROM sales_order_items WHERE id = $1', [item.order_item_id]);
         const soItem = soi.rows[0];
+        const qty = parseFloat(item.quantity || 0);
+        const uomFields = await resolveSalesDocLineUomFields(
+          client,
+          soItem.product_id,
+          { uom_id: item.uom_id ?? soItem.uom_id, conversion_to_base: item.conversion_to_base ?? soItem.conversion_to_base, quantity: qty },
+          qty,
+          loadProductUoms,
+        );
         await client.query(
-          `INSERT INTO delivery_note_items (id, note_id, order_item_id, product_id, description, quantity, unit_price, total)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-          [uuidv4(), id, item.order_item_id, soItem.product_id, item.description || soItem.description, item.quantity, soItem.unit_price, parseFloat(item.quantity || 0) * parseFloat(soItem.unit_price)]
+          `INSERT INTO delivery_note_items (id, note_id, order_item_id, product_id, description, quantity, unit_price, total, uom_id, entered_qty, conversion_to_base, base_qty)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+          [uuidv4(), id, item.order_item_id, soItem.product_id, item.description || soItem.description, qty, soItem.unit_price, qty * parseFloat(soItem.unit_price), uomFields.uom_id, uomFields.enteredQty, uomFields.conversion_to_base, uomFields.base_qty]
         );
       }
 
@@ -389,10 +414,17 @@ router.put('/:id', authenticate, hasUserPerm('sales.delivery-receipt.edit'), aud
           const remaining = parseFloat(soi.rows[0].ordered_qty) - parseFloat(soi.rows[0].delivered_qty);
           const qty = parseFloat(item.quantity || 0);
           if (qty > remaining) { await client.query('ROLLBACK'); return res.status(400).json({ error: `Cannot deliver ${qty} — only ${remaining} remaining` }); }
+          const uomFields = await resolveSalesDocLineUomFields(
+            client,
+            soi.rows[0].product_id,
+            { uom_id: item.uom_id ?? soi.rows[0].uom_id, conversion_to_base: item.conversion_to_base ?? soi.rows[0].conversion_to_base, quantity: qty },
+            qty,
+            loadProductUoms,
+          );
           await client.query(
-            `INSERT INTO delivery_note_items (id, note_id, order_item_id, product_id, description, quantity, unit_price, total)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-            [uuidv4(), req.params.id, item.order_item_id, soi.rows[0].product_id, item.description || soi.rows[0].description, item.quantity, soi.rows[0].unit_price, qty * parseFloat(soi.rows[0].unit_price)]
+            `INSERT INTO delivery_note_items (id, note_id, order_item_id, product_id, description, quantity, unit_price, total, uom_id, entered_qty, conversion_to_base, base_qty)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+            [uuidv4(), req.params.id, item.order_item_id, soi.rows[0].product_id, item.description || soi.rows[0].description, qty, soi.rows[0].unit_price, qty * parseFloat(soi.rows[0].unit_price), uomFields.uom_id, uomFields.enteredQty, uomFields.conversion_to_base, uomFields.base_qty]
           );
         }
       }
@@ -451,12 +483,13 @@ router.patch('/:id/post', authenticate, hasUserPerm('sales.delivery-receipt.appr
       }
     }
     for (const item of items.rows) {
-      const qty = parseFloat(item.quantity);
+      const enteredQty = parseFloat(item.quantity);
+      const baseQty = lineItemBaseQty(item);
 
       const fefo = await deductInventoryFefo(client, {
         product_id: item.product_id,
         location_id: 1,
-        quantity: qty,
+        quantity: baseQty,
         reference_type: 'Delivery Receipt',
         reference_id: req.params.id,
         created_by: req.user!.id,
@@ -472,11 +505,11 @@ router.patch('/:id/post', authenticate, hasUserPerm('sales.delivery-receipt.appr
 
       await client.query(
         `UPDATE sales_order_items SET delivered_qty = delivered_qty + $1, reserved_qty = GREATEST(0, reserved_qty - $1) WHERE id = $2`,
-        [qty, item.order_item_id]
+        [enteredQty, item.order_item_id]
       );
       await client.query(
         `UPDATE inventory SET reserved_quantity = GREATEST(0, reserved_quantity - $1) WHERE product_id = $2 AND location_id = 1`,
-        [qty, item.product_id]
+        [baseQty, item.product_id]
       );
     }
 
@@ -552,14 +585,15 @@ router.patch('/:id/cancel', authenticate, hasUserPerm('sales.delivery-receipt.ed
 
     // Reverse SO item updates and restore inventory (FEFO batches)
     for (const item of items.rows) {
-      const qty = parseFloat(item.quantity);
+      const enteredQty = parseFloat(item.quantity);
+      const baseQty = lineItemBaseQty(item);
       await client.query(
         `UPDATE sales_order_items SET delivered_qty = GREATEST(0, delivered_qty - $1), reserved_qty = reserved_qty + $1 WHERE id = $2`,
-        [qty, item.order_item_id]
+        [enteredQty, item.order_item_id]
       );
       await client.query(
         `UPDATE inventory SET reserved_quantity = reserved_quantity + $1 WHERE product_id = $2 AND location_id = 1`,
-        [qty, item.product_id]
+        [baseQty, item.product_id]
       );
     }
 
@@ -635,8 +669,10 @@ router.get('/:id/print', authenticate, hasUserPerm('sales.delivery-receipt.print
       [req.params.id]
     );
 
-    const totalQty = items.rows.reduce((s: number, row: any) => s + parseFloat(row.quantity || 0), 0);
-    const total = items.rows.reduce((s: number, row: any) => s + parseFloat(row.total || 0), 0)
+    const printItems = await enrichSalesPrintLineUoms({ query }, items.rows);
+
+    const totalQty = printItems.reduce((s: number, row: any) => s + parseFloat(row.quantity || 0), 0);
+    const total = printItems.reduce((s: number, row: any) => s + parseFloat(row.total || 0), 0)
       || parseFloat(d.total_amount || d.subtotal || 0);
 
     const drNumber = d.dr_number || d.dn_number;
@@ -650,12 +686,12 @@ Thank you for your continued support!`;
       ? savedNotes.replace(DR_STANDARD_NOTE, '').trim()
       : '';
 
-    const itemRows = items.rows.map((i: any, idx: number) => tableRow([
+    const itemRows = printItems.map((i: any, idx: number) => tableRow([
       { html: String(idx + 1), align: 'c' },
       { html: i.sku || '—' },
       { html: i.product_name || i.soi_description || i.description || '—' },
       { html: String(parseFloat(i.quantity || 0)), align: 'c' },
-      { html: i.unit_of_measure || '—', align: 'c' },
+      { html: i.display_uom || '—', align: 'c' },
       { html: fmtCurrency(i.unit_price), align: 'r' },
       { html: fmtCurrency(i.total), align: 'r' },
     ])).join('');
@@ -691,7 +727,7 @@ Thank you for your continued support!`;
       itemHeaders: SALES_LINE_ITEM_HEADERS,
       itemRows,
       summaryRows: [
-        { label: 'No. of Line Items', value: String(items.rows.length) },
+        { label: 'No. of Line Items', value: String(printItems.length) },
         { label: 'Total Quantity', value: String(totalQty) },
         { label: 'TOTAL', value: fmtCurrency(total), total: true },
       ],

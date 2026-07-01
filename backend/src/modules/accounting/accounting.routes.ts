@@ -1,5 +1,5 @@
 import { Router, Response } from 'express';
-import { query, getClient } from '../../config/database';
+import { query } from '../../config/database';
 import { runTransactionAudit } from '../../utils/transactionAudit';
 import { authenticate, AuthRequest, hasUserPerm } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
@@ -11,9 +11,11 @@ import {
   listChartOfAccountsWithBalance,
 } from '../../utils/chartOfAccountsBalance';
 import { normalizeComparativeColumns, runComparativeIncomeStatement } from '../../utils/comparativeIncomeStatement';
-import { findDuplicateCogsInvoices, repairDuplicateInvoiceCogs } from '../../utils/glIntegrity';
+import glIntegrityRoutes from './glIntegrity.routes';
 
 const router = Router();
+
+router.use('/gl-integrity', glIntegrityRoutes);
 
 // ==================== CHART OF ACCOUNTS ====================
 router.get('/chart-of-accounts', authenticate, hasUserPerm('finance.accounting.view'), async (req: AuthRequest, res: Response) => {
@@ -32,9 +34,13 @@ router.post('/chart-of-accounts', authenticate, hasUserPerm('finance.accounting.
     if (!account_code || !account_name || !account_type) {
       return res.status(400).json({ error: 'Account code, name, and type are required' });
     }
+    const parentId = parent_id != null && String(parent_id).trim() !== '' ? parseInt(String(parent_id), 10) : null;
+    if (parent_id != null && String(parent_id).trim() !== '' && Number.isNaN(parentId)) {
+      return res.status(400).json({ error: 'Invalid parent account' });
+    }
     const result = await query(
       'INSERT INTO chart_of_accounts (account_code, account_name, account_type, parent_id) VALUES ($1, $2, $3, $4) RETURNING *',
-      [account_code, account_name, account_type, parent_id]
+      [account_code, account_name, account_type, parentId]
     );
     res.status(201).json(result.rows[0]);
   } catch (error: any) {
@@ -49,6 +55,10 @@ router.put('/chart-of-accounts/:id', authenticate, hasUserPerm('finance.accounti
     if (!account_code || !account_name || !account_type) {
       return res.status(400).json({ error: 'Account code, name, and type are required' });
     }
+    const parentId = parent_id != null && String(parent_id).trim() !== '' ? parseInt(String(parent_id), 10) : null;
+    if (parent_id != null && String(parent_id).trim() !== '' && Number.isNaN(parentId)) {
+      return res.status(400).json({ error: 'Invalid parent account' });
+    }
     // Check uniqueness (exclude self)
     const dup = await query('SELECT id FROM chart_of_accounts WHERE account_code = $1 AND id != $2', [account_code, req.params.id]);
     if (dup.rows.length > 0) return res.status(409).json({ error: 'Account code already exists' });
@@ -61,7 +71,7 @@ router.put('/chart-of-accounts/:id', authenticate, hasUserPerm('finance.accounti
       `UPDATE chart_of_accounts SET account_code = $1, account_name = $2, account_type = $3,
         parent_id = $4, is_active = COALESCE($5, is_active), updated_at = CURRENT_TIMESTAMP
        WHERE id = $6 RETURNING *`,
-      [account_code, account_name, account_type, parent_id || null, is_active !== undefined ? is_active : null, req.params.id]
+      [account_code, account_name, account_type, parentId, is_active !== undefined ? is_active : null, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Account not found' });
     auditAfter(req, auditSnapshot(result.rows[0], AUDIT_FIELDS.chartAccount));
@@ -244,11 +254,28 @@ router.get('/balance-sheet', authenticate, hasUserPerm('finance.accounting.view'
 });
 
 // ==================== INCOME STATEMENT ====================
+router.get('/report-context', authenticate, hasUserPerm('finance.accounting.view'), async (_req: AuthRequest, res: Response) => {
+  try {
+    const today = await query('SELECT CURRENT_DATE::text AS server_today');
+    const serverToday = today.rows[0]?.server_today as string;
+    const year = serverToday?.slice(0, 4) || String(new Date().getFullYear());
+    res.json({
+      server_today: serverToday,
+      fiscal_year_start: `${year}-01-01`,
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 router.get('/income-statement', authenticate, hasUserPerm('finance.accounting.view'), async (req: AuthRequest, res: Response) => {
   try {
-    const from = req.query.from as string || new Date(new Date().getFullYear(), 0, 1).toISOString().split('T')[0];
-    const to = req.query.to as string || new Date().toISOString().split('T')[0];
-    const includeZero = req.query.include_zero !== 'false';
+    const todayRes = await query('SELECT CURRENT_DATE::text AS server_today');
+    const serverToday = todayRes.rows[0]?.server_today as string;
+    const yearStart = `${(serverToday || new Date().toISOString().slice(0, 10)).slice(0, 4)}-01-01`;
+    const from = req.query.from as string || yearStart;
+    const to = req.query.to as string || serverToday;
+    const includeZero = req.query.include_zero === 'true';
 
     const result = await query(`
       SELECT coa.id, coa.account_type, coa.account_code, coa.account_name,
@@ -275,9 +302,26 @@ router.get('/income-statement', authenticate, hasUserPerm('finance.accounting.vi
     const grossProfit = totalIncome - totalCogs;
     const netIncome = grossProfit - totalExpenses;
 
+    const posInPeriod = await query(
+      `SELECT COUNT(*)::int AS n, COALESCE(SUM(total), 0) AS sales_total
+       FROM pos_transactions
+       WHERE status = 'Completed' AND created_at::date >= $1 AND created_at::date <= $2`,
+      [from, to],
+    );
+    const posCount = posInPeriod.rows[0]?.n ?? 0;
+    const posSalesTotal = parseFloat(posInPeriod.rows[0]?.sales_total) || 0;
+    const hints: string[] = [];
+    if (posCount > 0 && Math.abs(totalIncome) < 0.009) {
+      hints.push(`There are ${posCount} POS sale(s) (₱${posSalesTotal.toFixed(2)}) in this date range but no revenue on the income statement. Check journal entries or extend the date range.`);
+    }
+    if (posCount > 0 && totalIncome > 0.009) {
+      hints.push('POS sales may appear under generic Sales Revenue (4000) if the product category GL was set after the sale. Use GL Integrity → POS Category GL to reclassify.');
+    }
+
     res.json({
       from,
       to,
+      server_today: serverToday,
       income,
       cost_of_goods_sold: cogs,
       expenses,
@@ -289,6 +333,9 @@ router.get('/income-statement', authenticate, hasUserPerm('finance.accounting.vi
       gross_margin_pct: totalIncome > 0 ? (grossProfit / totalIncome) * 100 : 0,
       net_margin_pct: totalIncome > 0 ? (netIncome / totalIncome) * 100 : 0,
       include_zero: includeZero,
+      pos_sales_count: posCount,
+      pos_sales_total: posSalesTotal,
+      hints,
     });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -828,37 +875,6 @@ router.get('/transaction-audit', authenticate, hasUserPerm('finance.accounting.v
     res.json(report);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
-  }
-});
-
-// Duplicate COGS — DR + Sales Invoice both posted cost of sales for same flow
-router.get('/gl-integrity/duplicate-cogs', authenticate, hasUserPerm('finance.accounting.view'), async (_req: AuthRequest, res: Response) => {
-  try {
-    const rows = await findDuplicateCogsInvoices();
-    const totalDuplicate = rows.reduce((s, r) => s + r.duplicate_amount, 0);
-    res.json({
-      issue_count: rows.length,
-      total_duplicate_cogs: Math.round(totalDuplicate * 100) / 100,
-      rows,
-    });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-router.post('/gl-integrity/repair-duplicate-cogs/:invoiceId', authenticate, hasUserPerm('finance.accounting.edit'), auditLog('Accounting', 'Repair Duplicate COGS'), async (req: AuthRequest, res: Response) => {
-  const client = await getClient();
-  try {
-    await client.query('BEGIN');
-    const result = await repairDuplicateInvoiceCogs(client, req.params.invoiceId);
-    await client.query('COMMIT');
-    auditAfter(req, { invoice_id: req.params.invoiceId, ...result });
-    res.json({ message: 'Duplicate COGS repaired', ...result });
-  } catch (error: any) {
-    await client.query('ROLLBACK');
-    res.status(400).json({ error: error.message });
-  } finally {
-    client.release();
   }
 });
 

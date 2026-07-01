@@ -9,7 +9,8 @@
     "migrate": "ts-node src/database/migrate.ts",
     "migrate:prod": "node dist/database/migrate.js",
     "seed": "ts-node src/database/seed.ts",
-    "reset": "ts-node src/database/reset.ts"
+    "reset": "ts-node src/database/reset.ts",
+    "test": "vitest run"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -38,6 +39,7 @@
     "@types/uuid": "^9.0.7",
     "ts-node": "^10.9.2",
     "ts-node-dev": "^2.0.0",
-    "typescript": "^5.3.3"
+    "typescript": "^5.3.3",
+    "vitest": "^3.2.4"
   }
 }

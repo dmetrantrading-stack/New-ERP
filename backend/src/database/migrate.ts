@@ -1,5 +1,7 @@
 import { query, getClient } from '../config/database';
 import { ensureCategoryGlAccounts } from '../utils/chartOfAccountsBalance';
+import { migrateUomSchema } from './uomSchema';
+import { migratePosReturnSchema } from './posReturnSchema';
 
 const migrate = async () => {
   const client = await getClient();
@@ -768,6 +770,37 @@ const migrate = async () => {
       )
     `);
 
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS pos_returns (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        return_number VARCHAR(50) UNIQUE NOT NULL,
+        pos_transaction_id UUID REFERENCES pos_transactions(id),
+        shift_id UUID REFERENCES pos_shifts(id),
+        total DECIMAL(15,2) DEFAULT 0,
+        refund_method VARCHAR(50),
+        reason TEXT,
+        created_by UUID REFERENCES users(id),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS pos_return_items (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        return_id UUID REFERENCES pos_returns(id) ON DELETE CASCADE,
+        pos_transaction_item_id UUID REFERENCES pos_transaction_items(id),
+        product_id UUID REFERENCES products(id),
+        entered_qty DECIMAL(15,2) NOT NULL,
+        base_qty DECIMAL(15,2) NOT NULL,
+        unit_price DECIMAL(15,2) NOT NULL,
+        discount DECIMAL(15,2) DEFAULT 0,
+        total DECIMAL(15,2) NOT NULL,
+        cost DECIMAL(15,2) DEFAULT 0,
+        location_id INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
     // ==================== ACCOUNTING ====================
     await client.query(`
       CREATE TABLE IF NOT EXISTS chart_of_accounts (
@@ -1206,6 +1239,8 @@ const migrate = async () => {
     await client.query(`ALTER TABLE sales_invoice_items ADD COLUMN IF NOT EXISTS vat_amount DECIMAL(15,2) DEFAULT 0`);
     await client.query(`ALTER TABLE pos_transaction_items ADD COLUMN IF NOT EXISTS selected_variant VARCHAR(50)`);
     await client.query(`ALTER TABLE pos_transaction_items ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`);
+    await client.query(`ALTER TABLE pos_transaction_items ADD COLUMN IF NOT EXISTS returned_entered_qty DECIMAL(15,2) DEFAULT 0`);
+    await client.query(`ALTER TABLE pos_transaction_items ADD COLUMN IF NOT EXISTS returned_base_qty DECIMAL(15,2) DEFAULT 0`);
     await client.query(`ALTER TABLE collection_receipts ADD COLUMN IF NOT EXISTS bank_account_id INTEGER REFERENCES bank_accounts(id)`);
     await client.query(`ALTER TABLE collection_receipts ADD COLUMN IF NOT EXISTS check_date DATE`);
     await client.query(`ALTER TABLE collection_receipts ADD COLUMN IF NOT EXISTS check_bank VARCHAR(100)`);
@@ -1254,6 +1289,8 @@ const migrate = async () => {
     await client.query(`ALTER TABLE goods_receipt_items ADD COLUMN IF NOT EXISTS discount_amount DECIMAL(15,2) DEFAULT 0`);
     await client.query(`ALTER TABLE goods_receipt_items ADD COLUMN IF NOT EXISTS net_unit_cost DECIMAL(15,2) NOT NULL DEFAULT 0`);
     await client.query(`ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS default_discount_percent DECIMAL(5,2) DEFAULT 0`);
+    await client.query(`ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS entity_type VARCHAR(30) DEFAULT 'Corporation'`);
+    await client.query(`UPDATE suppliers SET entity_type = 'Corporation' WHERE entity_type IS NULL`);
 
     // HR / Payroll additions for existing databases
     await client.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS hire_date DATE`);
@@ -1424,6 +1461,53 @@ const migrate = async () => {
     await client.query(`CREATE INDEX IF NOT EXISTS idx_sph_supplier ON supplier_price_history(supplier_id)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_sph_product_supplier ON supplier_price_history(product_id, supplier_id)`);
 
+    // Backfill supplier price history from completed GR lines missing history rows
+    await client.query(`
+      INSERT INTO supplier_price_history (
+        id, product_id, supplier_id, product_name, supplier_name,
+        po_id, po_number, gr_id, gr_number, gr_item_id,
+        received_date, unit_cost, previous_cost, price_difference,
+        quantity_received, uom, location_id, location_name,
+        batch_number, expiry_date, remarks, created_by
+      )
+      SELECT
+        gen_random_uuid(),
+        gri.product_id,
+        gr.supplier_id,
+        p.name,
+        s.supplier_name,
+        gr.po_id,
+        po.po_number,
+        gr.id,
+        gr.gr_number,
+        gri.id,
+        gr.received_date,
+        gri.net_unit_cost,
+        0,
+        0,
+        gri.entered_qty,
+        COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc'),
+        gr.location_id,
+        COALESCE(l.name, ''),
+        COALESCE(gri.batch_number, ''),
+        gri.expiry_date,
+        'Backfilled from goods receipt',
+        gr.created_by
+      FROM goods_receipt_items gri
+      JOIN goods_receipts gr ON gri.gr_id = gr.id
+      JOIN products p ON gri.product_id = p.id
+      JOIN suppliers s ON gr.supplier_id = s.id
+      LEFT JOIN purchase_orders po ON gr.po_id = po.id
+      LEFT JOIN uoms u ON gri.uom_id = u.id
+      LEFT JOIN locations l ON gr.location_id = l.id
+      WHERE gr.status = 'Completed'
+        AND gr.supplier_id IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM supplier_price_history sph
+          WHERE sph.gr_id = gr.id AND sph.gr_item_id = gri.id
+        )
+    `);
+
     // Setting: auto-update product cost from receiving report
     await client.query(`
       INSERT INTO system_settings (setting_key, setting_value)
@@ -1489,7 +1573,7 @@ const migrate = async () => {
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         supplier_id INTEGER NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
         product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-        order_qty_multiplier DECIMAL(5,2) DEFAULT 2,
+        order_qty_multiplier DECIMAL(5,2) DEFAULT 1,
         fixed_order_qty DECIMAL(15,2),
         sort_order INTEGER DEFAULT 0,
         is_active BOOLEAN DEFAULT true,
@@ -1500,6 +1584,12 @@ const migrate = async () => {
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_supplier_catalog_supplier ON supplier_catalog_items(supplier_id)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_supplier_catalog_product ON supplier_catalog_items(product_id)`);
+    await client.query(`ALTER TABLE supplier_catalog_items ALTER COLUMN order_qty_multiplier SET DEFAULT 1`);
+    await client.query(`
+      UPDATE supplier_catalog_items
+      SET order_qty_multiplier = 1, updated_at = CURRENT_TIMESTAMP
+      WHERE order_qty_multiplier = 2 AND fixed_order_qty IS NULL
+    `);
 
     // ==================== SALES ORDER ITEMS ====================
     await client.query(`
@@ -1765,6 +1855,38 @@ const migrate = async () => {
 
     // ==================== PHASE 2 OPERATIONS: FEFO dispatch, customer price mode ====================
     await client.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS default_price_mode VARCHAR(50)`);
+    await client.query(`ALTER TABLE customers ADD COLUMN IF NOT EXISTS loyalty_points INTEGER NOT NULL DEFAULT 0`);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS customer_loyalty_ledger (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+        pos_transaction_id UUID REFERENCES pos_transactions(id) ON DELETE SET NULL,
+        points_change INTEGER NOT NULL,
+        balance_after INTEGER NOT NULL,
+        reason VARCHAR(100) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_by UUID REFERENCES users(id)
+      )
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_loyalty_ledger_customer ON customer_loyalty_ledger(customer_id, created_at DESC)`);
+
+    await client.query(`ALTER TABLE pos_transactions ADD COLUMN IF NOT EXISTS loyalty_points_redeemed INTEGER NOT NULL DEFAULT 0`);
+    await client.query(`ALTER TABLE pos_transactions ADD COLUMN IF NOT EXISTS loyalty_points_earned INTEGER NOT NULL DEFAULT 0`);
+    await client.query(`ALTER TABLE pos_transactions ADD COLUMN IF NOT EXISTS loyalty_discount DECIMAL(15,2) NOT NULL DEFAULT 0`);
+    await client.query(`ALTER TABLE suspended_sales ADD COLUMN IF NOT EXISTS loyalty_redeem_points INTEGER NOT NULL DEFAULT 0`);
+    await client.query(`
+      INSERT INTO chart_of_accounts (account_code, account_name, account_type)
+      VALUES ('4050', 'Sales Discounts - Loyalty', 'Income')
+      ON CONFLICT (account_code) DO NOTHING
+    `);
+    await client.query(`
+      INSERT INTO system_settings (setting_key, setting_value) VALUES
+        ('loyalty_enabled', 'true'),
+        ('loyalty_earn_peso_per_point', '1'),
+        ('loyalty_redeem_peso_per_point', '1')
+      ON CONFLICT (setting_key) DO NOTHING
+    `);
     await client.query(`ALTER TABLE delivery_notes ADD COLUMN IF NOT EXISTS driver_name VARCHAR(255)`);
     await client.query(`ALTER TABLE delivery_notes ADD COLUMN IF NOT EXISTS vehicle_plate VARCHAR(50)`);
     await client.query(`ALTER TABLE delivery_notes ADD COLUMN IF NOT EXISTS dispatch_notes TEXT`);
@@ -1851,10 +1973,22 @@ const migrate = async () => {
       )
     `);
 
+    // ==================== MULTI-UOM (Phase A) ====================
+    await migrateUomSchema(client);
+    await migratePosReturnSchema(client);
+
     // ==================== PHASE 3: Compliance & scale ====================
     await client.query(`
       INSERT INTO system_settings (setting_key, setting_value)
       VALUES ('enforce_approval_limits', 'true')
+      ON CONFLICT (setting_key) DO NOTHING
+    `);
+
+    await client.query(`
+      INSERT INTO system_settings (setting_key, setting_value) VALUES
+        ('allow_self_registration', 'true'),
+        ('registration_require_approval', 'true'),
+        ('registration_default_role', 'Cashier')
       ON CONFLICT (setting_key) DO NOTHING
     `);
 

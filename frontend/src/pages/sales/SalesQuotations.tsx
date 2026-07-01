@@ -5,6 +5,7 @@ import { formatCurrency, formatDate } from '../../lib/utils';
 import { Plus, Edit2, CheckCircle, XCircle, Send, Eye, Printer, Paperclip, Download, X, FileText } from 'lucide-react';
 import toast from 'react-hot-toast';
 import ProductAutocomplete from '../../components/ProductAutocomplete';
+import CustomerAutocomplete, { formatCustomerLabel } from '../../components/CustomerAutocomplete';
 import Pagination from '../../components/Pagination';
 import DocumentNotesTermsPanel from '../../components/DocumentNotesTermsPanel';
 import { ATTACHMENT_REF } from '../../lib/documentAttachments';
@@ -21,6 +22,15 @@ import { useAuth } from '../../store/auth';
 import { computeSalesDocLine, computeSalesDocTotals } from '../../lib/invoiceTax';
 import { getProductPriceForCustomer } from '../../lib/customerPricing';
 import { printDocument, printFromIframe } from '../../lib/printDocument';
+import {
+  applySalesUomToLine,
+  blankSalesDocLine,
+  buildSalesDocItemPayload,
+  hydrateSalesDocLinesFromApi,
+  lineBaseQty,
+  loadProductUoms,
+  pickSalesLineUom,
+} from '../../lib/salesDocUom';
 
 const STATUS_FILTERS = [
   { value: '', label: 'All' },
@@ -72,8 +82,28 @@ export default function SalesQuotations() {
   };
 
   useEffect(() => { loadQuotations(); }, [page, statusFilter, search]);
-  useEffect(() => { api.get('/customers?limit=200').then(r => setCustomers(r.data?.data || r.data || [])).catch(() => {}); }, []);
   useEffect(() => { api.get('/products?limit=200').then(r => setProducts(r.data?.data || r.data || [])).catch(() => {}); }, []);
+
+  useEffect(() => {
+    const cid = form.customer_id;
+    if (!cid || !creating) return;
+    if (String(selectedCustomer?.id) === String(cid)) return;
+    selectCustomer(String(cid));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form.customer_id, creating]);
+
+  const searchProducts = async (q: string) => {
+    try { const r = await api.get(`/products/search/quick?q=${encodeURIComponent(q)}`); return r.data || []; } catch { return []; }
+  };
+
+  const searchCustomers = async (q: string) => {
+    try {
+      const r = await api.get(`/customers?search=${encodeURIComponent(q)}&limit=20`);
+      return r.data?.data || r.data || [];
+    } catch {
+      return [];
+    }
+  };
 
   useEffect(() => {
     if (!selectedCustomer?.id) {
@@ -89,39 +119,45 @@ export default function SalesQuotations() {
       .catch(() => setCustomerPriceMap({}));
   }, [selectedCustomer?.id]);
 
-  useEffect(() => {
-    if (!creating || !form.customer_id || customers.length === 0) return;
-    const c = customers.find((x: any) => String(x.id) === String(form.customer_id));
-    if (c) setSelectedCustomer(c);
-  }, [customers, creating, form.customer_id]);
+  const getPrice = (p: any) => getProductPriceForCustomer(selectedCustomer, p, customerPriceMap);
+  const priceTier = selectedCustomer?.customer_type || 'Retail';
 
-  const searchProducts = async (q: string) => {
-    try { const r = await api.get(`/products/search/quick?q=${encodeURIComponent(q)}`); return r.data || []; } catch { return []; }
+  const blankSqItem = () => blankSalesDocLine();
+
+  const applyCustomer = (c: any) => {
+    setCustomers((prev) => (prev.some((x) => String(x.id) === String(c.id)) ? prev : [...prev, c]));
+    setSelectedCustomer(c);
+    setForm((prev: any) => {
+      const next = {
+        ...prev,
+        customer_id: c.id,
+        customer_name: c.customer_name,
+        customer_code: c.customer_code || '',
+        payment_terms: prev.payment_terms || c.payment_terms || '',
+      };
+      if (prev.items.length === 0) {
+        next.items = [blankSqItem()];
+        setAutoFocusItem(true);
+      }
+      return next;
+    });
   };
 
-  const getPrice = (p: any) => getProductPriceForCustomer(selectedCustomer, p, customerPriceMap);
-
-  const blankSqItem = () => ({ product_id: '', product_name: '', description: '', quantity: 1, unit_price: 0, discount: 0, tax_type: 'VAT', vat_amount: 0 });
-
-  const selectCustomer = (cid: string) => {
+  const selectCustomer = (cid: string, customer?: any) => {
     if (!cid) {
       setSelectedCustomer(null);
       setCustomerPriceMap({});
-      setForm((prev: any) => ({ ...prev, customer_id: '' }));
+      setForm((prev: any) => ({ ...prev, customer_id: '', customer_name: '', customer_code: '' }));
       return;
     }
-    const c = customers.find((x: any) => x.id == cid);
+    const c = customer || customers.find((x: any) => x.id == cid);
     if (c) {
-      setSelectedCustomer(c);
-      setForm((prev: any) => {
-        const next = { ...prev, customer_id: cid, payment_terms: c.payment_terms || '' };
-        if (prev.items.length === 0) {
-          next.items = [blankSqItem()];
-          setAutoFocusItem(true);
-        }
-        return next;
-      });
+      applyCustomer(c);
+      return;
     }
+    api.get(`/customers/${cid}`)
+      .then((r) => applyCustomer(r.data))
+      .catch(() => toast.error('Failed to load customer'));
   };
 
   const setValidityDays = (days: number) => {
@@ -137,8 +173,15 @@ export default function SalesQuotations() {
     return { ...item, vat_amount: calc.vat_amount };
   };
 
-  const updateItem = (idx: number, field: string, value: any) => {
+  const updateItem = async (idx: number, field: string, value: any) => {
     const items = [...form.items];
+    if (field === 'uom_id' && value) {
+      const product = products.find((p: any) => p.id == items[idx].product_id);
+      Object.assign(items[idx], applySalesUomToLine(items[idx], items[idx].uoms || [], parseInt(String(value), 10), product, priceTier, getPrice(product)));
+      items[idx] = recalcItem(items[idx]);
+      setForm({ ...form, items });
+      return;
+    }
     items[idx] = recalcItem({ ...items[idx], [field]: value });
     setForm({ ...form, items });
   };
@@ -163,35 +206,38 @@ export default function SalesQuotations() {
       const sq = r.data;
       setEditingId(id);
       setEditingMeta({ sq_number: sq.sq_number, status: sq.status });
-      const c = customers.find((x: any) => x.id == sq.customer_id);
-      if (c) setSelectedCustomer(c);
       const existingUntil = sq.valid_until || '';
       const existingDays = existingUntil ? Math.max(1, Math.round((new Date(existingUntil).getTime() - Date.now()) / 86400000)) : 7;
+      const hydrated = await hydrateSalesDocLinesFromApi(sq.items || [], sq.customer_type || 'Retail');
       setForm({
         customer_id: sq.customer_id,
-        payment_terms: sq.payment_terms || c?.payment_terms || '',
+        customer_name: sq.customer_name || '',
+        customer_code: sq.customer_code || '',
+        payment_terms: sq.payment_terms || '',
         validity_days: existingDays,
         valid_until: existingUntil,
         notes: sq.notes || '',
         terms_conditions: sq.terms_conditions || '',
-        items: (sq.items || []).map((i: any) => ({
-          product_id: i.product_id,
-          product_name: i.product_name || '',
-          description: i.description || '',
-          quantity: i.quantity,
-          unit_price: i.unit_price,
-          discount: i.discount || 0,
-          tax_type: i.tax_type || 'VAT',
-          vat_amount: i.vat_amount || 0,
-          uom: i.unit_of_measure || 'pc',
-        })),
+        items: hydrated,
       });
+      if (sq.customer_id) {
+        selectCustomer(String(sq.customer_id), {
+          id: sq.customer_id,
+          customer_name: sq.customer_name,
+          customer_code: sq.customer_code,
+          address: sq.customer_address,
+          phone: sq.customer_phone,
+          tin: sq.customer_tin,
+          customer_type: sq.customer_type,
+          payment_terms: sq.payment_terms,
+        });
+      }
       setCreating(true);
     } catch { toast.error('Failed to load'); }
   };
 
   const save = async () => {
-    const items = form.items.filter((i: any) => i.product_id);
+    const items = form.items.filter((i: any) => i.product_id).map(buildSalesDocItemPayload);
     if (!form.customer_id || items.length === 0) { toast.error('Customer and items required'); return; }
     setLoading(true);
     try {
@@ -282,6 +328,11 @@ export default function SalesQuotations() {
   // ========== FULL-PAGE CREATE/EDIT VIEW ==========
   if (creating) {
     const totalQty = form.items.reduce((s: number, i: any) => s + parseFloat(i.quantity || '0'), 0);
+    const totalBaseQty = form.items.reduce((s: number, i: any) => s + (i.product_id ? lineBaseQty(i) : 0), 0);
+    const hasMultiUom = form.items.some((i: any) => {
+      const uom = pickSalesLineUom(i.uoms || [], i);
+      return (parseFloat(String(uom?.conversion_to_base ?? i.conversion_to_base ?? 1)) || 1) > 1;
+    });
     const totalDisc = form.items.reduce((s: number, i: any) => s + parseFloat(i.discount || 0), 0);
     const docStatus = editingMeta.status || 'Draft';
     const previewSq = () => {
@@ -317,10 +368,18 @@ export default function SalesQuotations() {
           <div className="flex-1 overflow-y-auto p-4 space-y-4">
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
               <SalesSectionCard title="Customer" subtitle="Bill-to party and commercial terms">
-                <select value={form.customer_id} onChange={(e) => selectCustomer(e.target.value)} className="input-field text-sm w-full">
-                  <option value="">Select customer…</option>
-                  {customers.map((c: any) => <option key={c.id} value={c.id}>{c.customer_name}</option>)}
-                </select>
+                <CustomerAutocomplete
+                  customers={customers}
+                  value={String(form.customer_id || '')}
+                  selectedName={formatCustomerLabel(selectedCustomer) || formatCustomerLabel(form) || form.customer_name || ''}
+                  onSelect={(c) => {
+                    if (!c?.id) selectCustomer('');
+                    else selectCustomer(String(c.id), c);
+                  }}
+                  searchFn={searchCustomers}
+                  placeholder="Search customer name or code…"
+                  inputClassName="input-field text-sm w-full"
+                />
                 {selectedCustomer ? (
                   <div className="mt-3 grid grid-cols-2 gap-2">
                     {[
@@ -388,7 +447,7 @@ export default function SalesQuotations() {
 
             <SalesSectionCard
               title="Line items"
-              subtitle={`${form.items.length} row(s) · ${totalQty} total qty`}
+              subtitle={`${form.items.length} row(s) · ${totalQty} total qty${hasMultiUom ? ` · ${totalBaseQty} base` : ''}`}
               action={
                 <button type="button" onClick={addItem}
                   className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold rounded-lg border border-blue-200 text-blue-700 bg-blue-50 hover:bg-blue-100">
@@ -405,8 +464,9 @@ export default function SalesQuotations() {
                       <th className="w-24 px-2 py-2 text-left">SKU</th>
                       <th className="px-2 py-2 text-left min-w-[160px]">Product</th>
                       <th className="px-2 py-2 text-left min-w-[140px]">Description</th>
-                      <th className="w-12 px-2 py-2 text-center">UOM</th>
-                      <th className="min-w-[5.5rem] w-[5.5rem] px-2 py-2 text-center">Qty</th>
+                      <th className="line-uom-col px-2 py-2 text-center">UOM</th>
+                      <th className="min-w-[5.5rem] w-[5.5rem] px-2 py-2 text-center">Qty (UOM)</th>
+                      <th className="w-16 px-2 py-2 text-center">Stock (pc)</th>
                       <th className="min-w-[7.5rem] w-[7.5rem] px-2 py-2 text-right">Unit price</th>
                       <th className="min-w-[4.5rem] w-[4.5rem] px-2 py-2 text-center">Disc</th>
                       <th className="w-24 px-2 py-2 text-center">Tax</th>
@@ -416,10 +476,12 @@ export default function SalesQuotations() {
                   </thead>
                   <tbody>
                     {form.items.length === 0 && (
-                      <tr><td colSpan={11} className="px-4 py-16 text-center text-slate-400">Select a customer, then add your first line item.</td></tr>
+                      <tr><td colSpan={12} className="px-4 py-16 text-center text-slate-400">Select a customer, then add your first line item.</td></tr>
                     )}
                     {form.items.map((item: any, idx: number) => {
                       const prod = products.find((p: any) => p.id == item.product_id);
+                      const uom = pickSalesLineUom(item.uoms || [], item, prod);
+                      const baseQty = item.product_id ? lineBaseQty(item) : 0;
                       const lineTotal = parseFloat(item.quantity) * parseFloat(item.unit_price) - parseFloat(item.discount || 0);
                       return (
                         <tr key={idx} className="hover:bg-blue-50/30 even:bg-slate-50/40">
@@ -434,19 +496,19 @@ export default function SalesQuotations() {
                               getPrice={(p: any) => getPrice(p)}
                               searchFn={searchProducts}
                               autoFocus={autoFocusItem && idx === 0}
-                              onSelect={(p: any) => {
+                              onSelect={async (p: any) => {
                                 if (!products.find((x: any) => x.id === p.id)) setProducts((prev: any) => [...prev, p]);
                                 const price = getPrice(p);
+                                const uoms = await loadProductUoms(p.id);
                                 setForm((prev: any) => {
                                   const items = [...prev.items];
-                                  items[idx] = recalcItem({
+                                  items[idx] = recalcItem(applySalesUomToLine({
                                     ...items[idx],
                                     product_id: p.id,
                                     product_name: p.name || '',
                                     unit_price: price,
                                     tax_type: p.tax_type || 'VAT',
-                                    uom: p.unit_of_measure || 'pc',
-                                  });
+                                  }, uoms, null, p, priceTier, price));
                                   if (idx === prev.items.length - 1) {
                                     setTimeout(() => setForm((p2: any) => ({ ...p2, items: [...p2.items, blankSqItem()] })), 100);
                                   }
@@ -460,10 +522,24 @@ export default function SalesQuotations() {
                             <input type="text" value={item.description || ''} onChange={(e) => updateItem(idx, 'description', e.target.value)}
                               className="input-field text-xs py-1.5" placeholder="Optional line note" />
                           </td>
-                          <td className="px-2 py-2 text-center text-[11px] text-slate-500">{item.uom || prod?.unit_of_measure || 'pc'}</td>
+                          <td className="line-uom-col px-1 py-1.5 text-center">
+                            {(item.uoms?.length || 0) > 1 ? (
+                              <select value={item.uom_id || ''} onChange={(e) => updateItem(idx, 'uom_id', parseInt(e.target.value, 10))}
+                                className="line-uom-select px-1 py-1 border border-gray-200 rounded-lg text-[10px] uppercase focus:ring-2 focus:ring-blue-500 outline-none">
+                                {(item.uoms || []).map((u: any) => (
+                                  <option key={u.uom_id} value={u.uom_id}>{(u.uom_code || '').toUpperCase()}</option>
+                                ))}
+                              </select>
+                            ) : (
+                              <span className="text-[11px] uppercase text-slate-500">{(uom?.uom_code || item.uom || prod?.unit_of_measure || 'pc').toUpperCase()}</span>
+                            )}
+                          </td>
                           <td className="px-1.5 py-1.5 min-w-[5.5rem] w-[5.5rem]">
                             <input type="number" step="0.01" min="0.01" value={item.quantity} onChange={(e) => updateItem(idx, 'quantity', e.target.value)}
                               className="input-field text-xs py-1.5 text-center w-full min-w-[4.5rem]" />
+                          </td>
+                          <td className="px-2 py-2 text-center text-[10px] text-slate-400 tabular-nums">
+                            {item.product_id ? `${baseQty} pc` : '—'}
                           </td>
                           <td className="px-1.5 py-1.5 min-w-[7.5rem] w-[7.5rem]">
                             <input type="number" step="0.01" value={item.unit_price} onChange={(e) => updateItem(idx, 'unit_price', e.target.value)}

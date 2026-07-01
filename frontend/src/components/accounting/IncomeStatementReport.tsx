@@ -22,6 +22,9 @@ type IncomeStatementData = {
   net_income: number;
   gross_margin_pct?: number;
   net_margin_pct?: number;
+  server_today?: string;
+  hints?: string[];
+  pos_sales_count?: number;
 };
 
 type Props = {
@@ -147,6 +150,13 @@ export default function IncomeStatementReport({ data, businessName, onAccountCli
 
   return (
     <div className="space-y-4">
+      {(data.hints || []).length > 0 && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 space-y-1">
+          {(data.hints || []).map((hint, i) => (
+            <p key={i} className="text-xs text-amber-900">{hint}</p>
+          ))}
+        </div>
+      )}
       <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden print:shadow-none print:border-gray-300">
         <div className="px-6 py-5 border-b border-gray-100 bg-gradient-to-b from-slate-50 to-white print:bg-white">
           <div className="text-center max-w-2xl mx-auto">
@@ -236,6 +246,7 @@ export function IncomeStatementToolbar({
   from,
   to,
   loading,
+  serverToday,
   onFromChange,
   onToChange,
   onRefresh,
@@ -243,12 +254,18 @@ export function IncomeStatementToolbar({
   from: string;
   to: string;
   loading?: boolean;
+  serverToday?: string;
   onFromChange: (v: string) => void;
   onToChange: (v: string) => void;
   onRefresh: () => void;
 }) {
   return (
     <div className="flex flex-wrap items-end gap-3 print:hidden">
+      {serverToday && (
+        <p className="text-xs text-gray-500 w-full mb-1">
+          Books date (server): <strong>{serverToday}</strong> — use this as the &quot;To&quot; date to include today&apos;s POS sales.
+        </p>
+      )}
       <div>
         <label className="block text-xs text-gray-500 mb-1">From</label>
         <input type="date" value={from} onChange={(e) => onFromChange(e.target.value)} className="input-field text-sm" />

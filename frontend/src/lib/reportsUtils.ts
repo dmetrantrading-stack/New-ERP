@@ -18,6 +18,7 @@ export type ReportDef = {
   singleDate?: boolean;
   noDateRange?: boolean;
   exportable?: boolean;
+  embedded?: boolean;
 };
 
 export const ALL_REPORTS: ReportDef[] = [
@@ -39,6 +40,7 @@ export const ALL_REPORTS: ReportDef[] = [
   { id: 'vat', label: 'VAT Report', section: 'finance', perm: 'reports.view', exportable: true },
   { id: 'bir-2550q', label: 'BIR 2550Q Worksheet', section: 'finance', perm: 'reports.view', exportable: true },
   { id: 'branch-summary', label: 'Branch / Location Summary', section: 'finance', perm: 'reports.view', exportable: true },
+  { id: 'comparative-profit-loss', label: 'Comparative Profit and Loss', section: 'finance', perm: 'reports.view', noDateRange: true, embedded: true },
   { id: 'withholding-tax', label: 'Withholding Tax', section: 'finance', perm: 'reports.view', exportable: true },
   { id: 'slsp-sales', label: 'SLSP Sales', section: 'finance', perm: 'reports.view', exportable: true },
   { id: 'slsp-purchases', label: 'SLSP Purchases', section: 'finance', perm: 'reports.view', exportable: true },

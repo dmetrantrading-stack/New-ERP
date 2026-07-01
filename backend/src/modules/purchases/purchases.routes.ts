@@ -23,6 +23,9 @@ import {
   normalizePurchaseCostBasis,
 } from '../../utils/purchaseTax';
 import { auditAfter, auditBefore, auditSnapshot, AUDIT_FIELDS } from '../../utils/auditHelpers';
+import { calculateBaseUnitCost, convertToBaseQty, resolveLineUom, resolveReceiveLineUomFromPo, resolvePurchaseDocLineUomFields, resolvePurchaseRequestItems, purchaseQtyFromPiecesNeeded } from '../../utils/uom';
+import { loadProductUoms } from '../../utils/productUomDb';
+import { enrichPurchasePrintLineUoms } from '../../utils/purchasePrintUom';
 import { assertApprovalLimit } from '../../utils/approvalLimit';
 import { repriceFromCostChange } from '../../utils/productPricing';
 
@@ -30,6 +33,22 @@ const router = Router();
 
 const poView = hasUserPerm('purchases.purchase-order.view');
 const grView = hasUserPerm('purchases.receiving-report.view');
+
+const PR_ITEM_SELECT = `
+  SELECT pri.*, p.sku, p.name as product_name,
+         COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure,
+         COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as uom_code
+  FROM purchase_requisition_items pri
+  JOIN products p ON pri.product_id = p.id
+  LEFT JOIN uoms u ON pri.uom_id = u.id`;
+
+const GR_ITEM_SELECT = `
+  SELECT gri.*, p.sku, p.name as product_name,
+         COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure,
+         COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as uom_code
+  FROM goods_receipt_items gri
+  JOIN products p ON gri.product_id = p.id
+  LEFT JOIN uoms u ON gri.uom_id = u.id`;
 
 // Helper to generate reference numbers
 const generateRefNumber = async (prefix: string, table: string, column: string): Promise<string> => {
@@ -55,9 +74,20 @@ router.post('/requisitions', authenticate, hasUserPerm('purchases.purchase-order
     );
 
     for (const item of items || []) {
+      const qty = parseFloat(item.quantity) || 0;
+      const uomFields = item.product_id
+        ? await resolvePurchaseDocLineUomFields({ query }, item.product_id, item, qty, loadProductUoms)
+        : {
+          enteredQty: qty,
+          uom_id: item.uom_id || null,
+          conversion_to_base: parseFloat(item.conversion_to_base) || 1,
+          base_qty: qty,
+        };
       await query(
-        'INSERT INTO purchase_requisition_items (id, pr_id, product_id, quantity, estimated_cost, tax_type) VALUES ($1, $2, $3, $4, $5, $6)',
-        [uuidv4(), id, item.product_id, item.quantity, item.estimated_cost, item.tax_type || 'VAT']
+        `INSERT INTO purchase_requisition_items (id, pr_id, product_id, quantity, estimated_cost, tax_type, uom_id, entered_qty, conversion_to_base, base_qty)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [uuidv4(), id, item.product_id, uomFields.enteredQty, item.estimated_cost, item.tax_type || 'VAT',
+         uomFields.uom_id, uomFields.enteredQty, uomFields.conversion_to_base, uomFields.base_qty]
       );
     }
 
@@ -96,11 +126,7 @@ router.get('/requisitions/:id', authenticate, poView, async (req: AuthRequest, r
     );
     if (pr.rows.length === 0) return res.status(404).json({ error: 'Requisition not found' });
     const items = await query(
-      `SELECT pri.*, p.sku, p.name as product_name,
-              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
-       FROM purchase_requisition_items pri
-       JOIN products p ON pri.product_id = p.id
-       WHERE pri.pr_id = $1`,
+      `${PR_ITEM_SELECT} WHERE pri.pr_id = $1`,
       [req.params.id]
     );
     res.json({ ...pr.rows[0], items: items.rows });
@@ -124,25 +150,22 @@ router.get('/requisitions/:id/print', authenticate, poView, async (req: AuthRequ
     const d = pr.rows[0];
 
     const items = await query(
-      `SELECT pri.*, p.sku, p.name as product_name,
-              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
-       FROM purchase_requisition_items pri
-       JOIN products p ON pri.product_id = p.id
-       WHERE pri.pr_id = $1 ORDER BY pri.id`,
+      `${PR_ITEM_SELECT} WHERE pri.pr_id = $1 ORDER BY pri.id`,
       [req.params.id],
     );
+    const printItems = await enrichPurchasePrintLineUoms({ query }, items.rows);
 
     const biz = await query('SELECT * FROM business_details WHERE id = 1');
     const b = biz.rows[0] || {};
 
-    const itemRows = items.rows.map((row: any, idx: number) => {
+    const itemRows = printItems.map((row: any, idx: number) => {
       const lineTotal = parseFloat(row.quantity) * parseFloat(row.estimated_cost || 0);
       const taxLabel = formatTaxLabel(row.tax_type);
       return tableRow([
         { html: String(idx + 1), align: 'c' },
         { html: row.sku || '—', align: 'c' },
         { html: row.product_name || '—' },
-        { html: row.unit_of_measure || 'pc', align: 'c' },
+        { html: row.display_uom || row.unit_of_measure || 'pc', align: 'c' },
         { html: String(parseFloat(row.quantity)), align: 'c' },
         { html: fmtCurrency(row.estimated_cost), align: 'r' },
         { html: taxLabel, align: 'c' },
@@ -150,14 +173,14 @@ router.get('/requisitions/:id/print', authenticate, poView, async (req: AuthRequ
       ]);
     }).join('');
 
-    const estTotal = items.rows.reduce(
+    const estTotal = printItems.reduce(
       (s: number, r: any) => s + parseFloat(r.quantity) * parseFloat(r.estimated_cost || 0),
       0,
     );
-    const totalQty = items.rows.reduce((s: number, r: any) => s + parseFloat(r.quantity), 0);
+    const totalQty = printItems.reduce((s: number, r: any) => s + parseFloat(r.quantity), 0);
 
     const summaryRows = [
-      { label: 'Total Items', value: String(items.rows.length) },
+      { label: 'Total Items', value: String(printItems.length) },
       { label: 'Total Quantity', value: String(totalQty) },
       { label: 'ESTIMATED TOTAL', value: fmtCurrency(estTotal), total: true },
     ];
@@ -260,9 +283,17 @@ router.post('/requisitions/generate-from-low-stock', authenticate, hasUserPerm('
       const onHand = parseFloat(row.total_qty);
       const orderQty = Math.max(reorder - onHand, reorder * 0.5);
       if (orderQty <= 0) continue;
+      const uomRows = await loadProductUoms({ query }, row.product_id);
+      const prod = await query('SELECT default_purchase_uom_id FROM products WHERE id = $1', [row.product_id]);
+      const uom = resolveLineUom(uomRows, null, prod.rows[0]?.default_purchase_uom_id);
+      const qtyFromPieces = purchaseQtyFromPiecesNeeded(Math.ceil(orderQty), uom);
+      if (qtyFromPieces.enteredQty <= 0) continue;
+      const estimatedCost = parseFloat(String(uom?.purchase_price)) || parseFloat(row.cost) || 0;
       await query(
-        'INSERT INTO purchase_requisition_items (id, pr_id, product_id, quantity, estimated_cost, tax_type) VALUES ($1, $2, $3, $4, $5, $6)',
-        [uuidv4(), id, row.product_id, Math.ceil(orderQty), row.cost || 0, 'VAT']
+        `INSERT INTO purchase_requisition_items (id, pr_id, product_id, quantity, estimated_cost, tax_type, uom_id, entered_qty, conversion_to_base, base_qty)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [uuidv4(), id, row.product_id, qtyFromPieces.enteredQty, estimatedCost, 'VAT',
+         qtyFromPieces.uom_id, qtyFromPieces.enteredQty, qtyFromPieces.conversion_to_base, qtyFromPieces.base_qty]
       );
       itemCount++;
     }
@@ -309,11 +340,7 @@ router.get('/requisitions/:id/copy-to-po', authenticate, hasUserPerm('purchases.
       return res.status(400).json({ error: `PO ${existingPo.rows[0].po_number} already exists for this requisition` });
     }
     const items = await query(
-      `SELECT pri.*, p.sku, p.name as product_name,
-              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
-       FROM purchase_requisition_items pri
-       JOIN products p ON pri.product_id = p.id
-       WHERE pri.pr_id = $1`,
+      `${PR_ITEM_SELECT} WHERE pri.pr_id = $1`,
       [req.params.id]
     );
     res.json({
@@ -324,9 +351,12 @@ router.get('/requisitions/:id/copy-to-po', authenticate, hasUserPerm('purchases.
         product_id: i.product_id,
         product_name: i.product_name,
         sku: i.sku,
-        quantity: parseFloat(i.quantity),
+        quantity: parseFloat(i.entered_qty ?? i.quantity),
         unit_cost: parseFloat(i.estimated_cost || 0),
-        unit_of_measure: i.unit_of_measure,
+        unit_of_measure: i.uom_code || i.unit_of_measure,
+        uom_id: i.uom_id || null,
+        conversion_to_base: parseFloat(i.conversion_to_base) || 1,
+        base_qty: parseFloat(i.base_qty ?? i.quantity),
         tax_type: i.tax_type || 'VAT',
       })),
     });
@@ -344,7 +374,8 @@ router.post('/orders', authenticate, hasUserPerm('purchases.purchase-order.creat
     const id = uuidv4();
     const costBasis = normalizePurchaseCostBasis(vat_mode);
 
-    const { orderItems, subtotal, totalLineDiscount, totals } = buildPurchaseOrderItemsFromRequest(items || [], costBasis);
+    const resolvedItems = await resolvePurchaseRequestItems({ query }, items || [], loadProductUoms);
+    const { orderItems, subtotal, totalLineDiscount, totals } = buildPurchaseOrderItemsFromRequest(resolvedItems, costBasis);
 
     await query(
       `INSERT INTO purchase_orders (id, po_number, supplier_id, pr_id, status, order_date, expected_date, payment_terms, notes, terms_conditions, subtotal, discount, tax, vat_mode, vat_amount, vatable_amount, total, created_by)
@@ -355,11 +386,12 @@ router.post('/orders', authenticate, hasUserPerm('purchases.purchase-order.creat
 
     for (const item of orderItems) {
       await query(
-        `INSERT INTO purchase_order_items (id, po_id, product_id, quantity, unit_cost, discount_type, discount_value, discount_amount, net_unit_cost, net_total, total_cost, tax_type)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+        `INSERT INTO purchase_order_items (id, po_id, product_id, quantity, unit_cost, discount_type, discount_value, discount_amount, net_unit_cost, net_total, total_cost, tax_type, uom_id, entered_qty, conversion_to_base, base_qty)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
         [uuidv4(), id, item.product_id, item.quantity, item.unit_cost,
          item.discount_type, item.discount_value, item.discount_amount,
-         item.net_unit_cost, item.net_total, item.net_total, item.tax_type]
+         item.net_unit_cost, item.net_total, item.net_total, item.tax_type,
+         item.uom_id || null, item.entered_qty ?? item.quantity, item.conversion_to_base ?? 1, item.base_qty ?? item.quantity]
       );
     }
 
@@ -417,9 +449,11 @@ router.get('/orders/:id', authenticate, poView, async (req: AuthRequest, res: Re
 
     const items = await query(
       `SELECT poi.*, p.sku, p.name as product_name,
-              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
+              COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure,
+              COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as uom_code
        FROM purchase_order_items poi
        JOIN products p ON poi.product_id = p.id
+       LEFT JOIN uoms u ON poi.uom_id = u.id
        WHERE poi.po_id = $1`,
       [req.params.id]
     );
@@ -456,7 +490,8 @@ router.put('/orders/:id', authenticate, hasUserPerm('purchases.purchase-order.ed
     if (!supplier_id) return res.status(400).json({ error: 'Supplier is required' });
     const costBasis = normalizePurchaseCostBasis(vat_mode);
 
-    const { orderItems, subtotal, totalLineDiscount, totals } = buildPurchaseOrderItemsFromRequest(items || [], costBasis);
+    const resolvedItems = await resolvePurchaseRequestItems({ query }, items || [], loadProductUoms);
+    const { orderItems, subtotal, totalLineDiscount, totals } = buildPurchaseOrderItemsFromRequest(resolvedItems, costBasis);
 
     await query(
       `UPDATE purchase_orders SET supplier_id = $1, expected_date = $2, payment_terms = $3, notes = $4, terms_conditions = $5,
@@ -470,11 +505,12 @@ router.put('/orders/:id', authenticate, hasUserPerm('purchases.purchase-order.ed
     await query('DELETE FROM purchase_order_items WHERE po_id = $1', [req.params.id]);
     for (const item of orderItems) {
       await query(
-        `INSERT INTO purchase_order_items (id, po_id, product_id, quantity, unit_cost, discount_type, discount_value, discount_amount, net_unit_cost, net_total, total_cost, tax_type)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+        `INSERT INTO purchase_order_items (id, po_id, product_id, quantity, unit_cost, discount_type, discount_value, discount_amount, net_unit_cost, net_total, total_cost, tax_type, uom_id, entered_qty, conversion_to_base, base_qty)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
         [uuidv4(), req.params.id, item.product_id, item.quantity, item.unit_cost,
          item.discount_type, item.discount_value, item.discount_amount,
-         item.net_unit_cost, item.net_total, item.net_total, item.tax_type]
+         item.net_unit_cost, item.net_total, item.net_total, item.tax_type,
+         item.uom_id || null, item.entered_qty ?? item.quantity, item.conversion_to_base ?? 1, item.base_qty ?? item.quantity]
       );
     }
 
@@ -512,22 +548,66 @@ router.post('/receipts', authenticate, hasUserPerm('purchases.receiving-report.c
 
     for (const item of items || []) {
       const batchId = uuidv4();
+      const enteredQty = parseFloat(item.entered_qty ?? item.quantity ?? '0');
+      if (enteredQty <= 0) throw new AppError('Receive quantity must be greater than zero');
       const discAmt = parseFloat(item.discount_amount || '0');
       const netUnitCost = parseFloat(item.net_unit_cost || item.unit_cost || '0');
-      const totalCost = parseFloat(item.quantity) * netUnitCost;
+      const totalCost = enteredQty * netUnitCost;
+
+      const prodRow = await client.query(
+        'SELECT id, unit_of_measure, default_purchase_uom_id FROM products WHERE id = $1',
+        [item.product_id],
+      );
+      let poItemRow: {
+        quantity?: number;
+        received_quantity?: number;
+        uom_id?: number;
+        conversion_to_base?: number;
+        unit_cost?: number;
+        net_unit_cost?: number;
+      } | null = null;
+      if (item.po_item_id) {
+        const poi = await client.query(
+          'SELECT quantity, received_quantity, uom_id, conversion_to_base, unit_cost, net_unit_cost FROM purchase_order_items WHERE id = $1',
+          [item.po_item_id],
+        );
+        if (poi.rows.length === 0) throw new AppError('PO line item not found');
+        const poLine = poi.rows[0];
+        poItemRow = poLine;
+        const ordered = parseFloat(String(poLine.quantity));
+        const received = parseFloat(String(poLine.received_quantity || 0));
+        const remaining = ordered - received;
+        if (enteredQty > remaining + 0.0001) {
+          throw new AppError(`Receive quantity ${enteredQty} exceeds PO remaining ${remaining}`);
+        }
+      }
+      const uomRows = await loadProductUoms({ query: client.query.bind(client) }, item.product_id);
+      const uom = resolveReceiveLineUomFromPo(
+        uomRows,
+        item.uom_id ?? poItemRow?.uom_id,
+        poItemRow,
+        prodRow.rows[0]?.default_purchase_uom_id,
+      );
+      const conversionToBase = parseFloat(String(uom?.conversion_to_base ?? poItemRow?.conversion_to_base)) || 1;
+      const baseQty = convertToBaseQty(enteredQty, conversionToBase);
+      const baseUnitCost = calculateBaseUnitCost(netUnitCost, 1, conversionToBase);
 
       await client.query(
         `INSERT INTO batches (id, product_id, location_id, batch_number, supplier_batch, manufacturing_date, expiry_date, quantity, unit_cost)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
         [batchId, item.product_id, location_id, item.batch_number || `BATCH-${Date.now()}`, item.supplier_batch,
-         item.manufacturing_date, item.expiry_date, item.quantity, netUnitCost]
+         item.manufacturing_date, item.expiry_date, baseQty, baseUnitCost]
       );
 
-      await client.query(
-        `INSERT INTO goods_receipt_items (id, gr_id, po_item_id, product_id, batch_id, quantity, unit_cost, discount_amount, net_unit_cost, total_cost, expiry_date, batch_number)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-        [uuidv4(), id, item.po_item_id, item.product_id, batchId, item.quantity, item.unit_cost, discAmt, netUnitCost, totalCost, item.expiry_date, item.batch_number]
+      const griInsert = await client.query(
+        `INSERT INTO goods_receipt_items (id, gr_id, po_item_id, product_id, batch_id, quantity, unit_cost, discount_amount, net_unit_cost, total_cost, expiry_date, batch_number,
+          uom_id, entered_qty, conversion_to_base, base_qty)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+         RETURNING id`,
+        [uuidv4(), id, item.po_item_id || null, item.product_id, batchId, enteredQty, item.unit_cost, discAmt, netUnitCost, totalCost, item.expiry_date, item.batch_number,
+          uom?.uom_id || null, enteredQty, conversionToBase, baseQty]
       );
+      const grItemId = griInsert.rows[0]?.id;
 
       const inventory = await client.query(
         'SELECT * FROM inventory WHERE product_id = $1 AND location_id = $2',
@@ -537,9 +617,9 @@ router.post('/receipts', authenticate, hasUserPerm('purchases.receiving-report.c
       if (inventory.rows.length > 0) {
         const currentQty = parseFloat(inventory.rows[0].quantity);
         const currentCost = parseFloat(inventory.rows[0].unit_cost);
-        const newQty = currentQty + parseFloat(item.quantity);
+        const newQty = currentQty + baseQty;
 
-        const totalValue = (currentCost * currentQty) + (netUnitCost * parseFloat(item.quantity));
+        const totalValue = (currentCost * currentQty) + (baseUnitCost * baseQty);
         const newAvgCost = newQty > 0 ? totalValue / newQty : 0;
 
         await client.query(
@@ -549,52 +629,47 @@ router.post('/receipts', authenticate, hasUserPerm('purchases.receiving-report.c
       } else {
         await client.query(
           'INSERT INTO inventory (product_id, location_id, quantity, unit_cost) VALUES ($1, $2, $3, $4) ON CONFLICT (product_id, location_id) DO UPDATE SET quantity = EXCLUDED.quantity, unit_cost = EXCLUDED.unit_cost',
-          [item.product_id, location_id, item.quantity, netUnitCost]
+          [item.product_id, location_id, baseQty, baseUnitCost]
         );
       }
 
       const currentQty = inventory.rows.length > 0 ? parseFloat(inventory.rows[0].quantity) : 0;
-      const newRunningQty = currentQty + parseFloat(item.quantity);
+      const newRunningQty = currentQty + baseQty;
       await client.query(
         `INSERT INTO inventory_ledger (id, product_id, location_id, batch_id, reference_type, reference_id, transaction_type, quantity, running_quantity, unit_cost, total_cost, notes, created_by)
          VALUES ($1, $2, $3, $4, 'Goods Receipt', $5, 'IN', $6, $7, $8, $9, $10, $11)`,
-        [uuidv4(), item.product_id, location_id, batchId, id, item.quantity, newRunningQty, netUnitCost, totalCost, notes, req.user!.id]
+        [uuidv4(), item.product_id, location_id, batchId, id, baseQty, newRunningQty, baseUnitCost, baseUnitCost * baseQty, notes, req.user!.id]
       );
 
-      // Update PO received quantity
       if (item.po_item_id) {
         await client.query(
           'UPDATE purchase_order_items SET received_quantity = received_quantity + $1 WHERE id = $2',
-          [item.quantity, item.po_item_id]
+          [enteredQty, item.po_item_id]
         );
       }
 
-      // Save supplier price history (isolated via savepoint to avoid aborting main transaction)
       await client.query('SAVEPOINT sph_save');
       try {
         const prod = await client.query('SELECT name, unit_of_measure FROM products WHERE id = $1', [item.product_id]);
         const supp = await client.query('SELECT supplier_name FROM suppliers WHERE id = $1', [supplier_id]);
         const poData = po_id ? await client.query('SELECT po_number FROM purchase_orders WHERE id = $1', [po_id]) : { rows: [] };
         const loc = await client.query('SELECT name FROM locations WHERE id = $1', [location_id]);
-        const grItemRes = await client.query(
-          'SELECT id FROM goods_receipt_items WHERE gr_id = $1 AND product_id = $2 AND po_item_id = $3 LIMIT 1',
-          [id, item.product_id, item.po_item_id]
-        );
+        if (!grItemId) throw new Error('GR line id missing after insert');
 
         await savePriceHistoryFromGR(client, {
           product_id: item.product_id,
-          supplier_id: parseInt(supplier_id),
+          supplier_id: parseInt(supplier_id, 10),
           product_name: prod.rows[0]?.name || '',
           supplier_name: supp.rows[0]?.supplier_name || '',
           po_id: po_id || null,
           po_number: poData.rows[0]?.po_number || null,
           gr_id: id,
           gr_number: gr_number,
-          gr_item_id: grItemRes.rows.length > 0 ? grItemRes.rows[0].id : null,
+          gr_item_id: grItemId,
           received_date: new Date().toISOString().split('T')[0],
           unit_cost: netUnitCost,
-          quantity_received: parseFloat(item.quantity),
-          uom: prod.rows[0]?.unit_of_measure || 'pc',
+          quantity_received: enteredQty,
+          uom: uom?.uom_code || prod.rows[0]?.unit_of_measure || 'pc',
           location_id: parseInt(location_id),
           location_name: loc.rows[0]?.name || '',
           batch_number: item.batch_number || '',
@@ -795,10 +870,7 @@ router.get('/receipts/:id', authenticate, grView, async (req: AuthRequest, res: 
     if (gr.rows.length === 0) return res.status(404).json({ error: 'Goods receipt not found' });
 
     const items = await query(
-      `SELECT gri.*, p.sku, p.name as product_name, COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
-       FROM goods_receipt_items gri
-       JOIN products p ON gri.product_id = p.id
-       WHERE gri.gr_id = $1 ORDER BY gri.id`,
+      `${GR_ITEM_SELECT} WHERE gri.gr_id = $1 ORDER BY gri.id`,
       [req.params.id]
     );
 
@@ -827,24 +899,22 @@ router.get('/receipts/:id/print', authenticate, hasUserPerm('purchases.receiving
     const d = gr.rows[0];
 
     const items = await query(
-      `SELECT gri.*, p.sku, p.name as product_name, COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
-       FROM goods_receipt_items gri
-       JOIN products p ON gri.product_id = p.id
-       WHERE gri.gr_id = $1 ORDER BY gri.id`,
+      `${GR_ITEM_SELECT} WHERE gri.gr_id = $1 ORDER BY gri.id`,
       [req.params.id]
     );
+    const printItems = await enrichPurchasePrintLineUoms({ query }, items.rows);
 
     const biz = await query('SELECT * FROM business_details WHERE id = 1');
     const b = biz.rows[0] || {};
 
-    const totalQty = items.rows.reduce((s: number, r: any) => s + parseFloat(r.quantity || 0), 0);
-    const totalAmount = items.rows.reduce((s: number, r: any) => s + parseFloat(r.total_cost || 0), 0);
+    const totalQty = printItems.reduce((s: number, r: any) => s + parseFloat(r.quantity || 0), 0);
+    const totalAmount = printItems.reduce((s: number, r: any) => s + parseFloat(r.total_cost || 0), 0);
 
-    const itemRows = items.rows.map((row: any, idx: number) => tableRow([
+    const itemRows = printItems.map((row: any, idx: number) => tableRow([
       { html: String(idx + 1), align: 'c' },
       { html: row.product_name || '—' },
       { html: String(parseFloat(row.quantity)), align: 'c' },
-      { html: row.unit_of_measure || 'pc', align: 'c' },
+      { html: row.display_uom || row.unit_of_measure || 'pc', align: 'c' },
       { html: row.batch_number || '—', align: 'c' },
       { html: row.expiry_date ? fmtDate(row.expiry_date, 'short') : '—', align: 'c' },
       { html: fmtCurrency(row.net_unit_cost || row.unit_cost), align: 'r' },
@@ -852,7 +922,7 @@ router.get('/receipts/:id/print', authenticate, hasUserPerm('purchases.receiving
     ])).join('');
 
     const summaryRows = [
-      { label: 'Total Items', value: String(items.rows.length) },
+      { label: 'Total Items', value: String(printItems.length) },
       { label: 'Total Quantity', value: String(totalQty) },
       { label: 'TOTAL RECEIVED', value: fmtCurrency(totalAmount), total: true },
     ];
@@ -1024,19 +1094,37 @@ router.post('/returns', authenticate, hasUserPerm('purchases.receiving-report.ed
 
     let totalReturn = 0;
     for (const item of items || []) {
+      const enteredQty = parseFloat(item.quantity);
+      if (enteredQty <= 0) throw new AppError('Return quantity must be greater than zero');
+
+      let baseQty = enteredQty;
+      if (item.uom_id != null || item.conversion_to_base != null) {
+        if (item.product_id) {
+          const uomFields = await resolvePurchaseDocLineUomFields(
+            { query: client.query.bind(client) },
+            item.product_id,
+            item,
+            enteredQty,
+            loadProductUoms,
+          );
+          baseQty = uomFields.base_qty;
+        } else {
+          baseQty = convertToBaseQty(enteredQty, parseFloat(item.conversion_to_base) || 1);
+        }
+      }
+
       const netCost = parseFloat(item.net_unit_cost || item.unit_cost || '0');
-      const qty = parseFloat(item.quantity);
-      const total = qty * netCost;
+      const total = enteredQty * netCost;
       totalReturn += total;
 
       await client.query(
         `INSERT INTO purchase_return_items (id, return_id, product_id, location_id, batch_id, quantity, unit_cost, net_unit_cost, total_cost)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
         [uuidv4(), id, item.product_id, item.location_id || 1, item.batch_id || null,
-         qty, parseFloat(item.unit_cost || netCost), netCost, total]
+         enteredQty, parseFloat(item.unit_cost || netCost), netCost, total]
       );
 
-      // Deduct from inventory
+      // Deduct from inventory (always in base pieces)
       const inventory = await client.query(
         'SELECT * FROM inventory WHERE product_id = $1 AND location_id = $2',
         [item.product_id, item.location_id || 1]
@@ -1045,7 +1133,7 @@ router.post('/returns', authenticate, hasUserPerm('purchases.receiving-report.ed
         throw new AppError('No inventory record for this product at the selected location');
       }
       const currentQty = parseFloat(inventory.rows[0].quantity);
-      const newQty = currentQty - qty;
+      const newQty = currentQty - baseQty;
       if (newQty < 0) throw new AppError('Return quantity exceeds available stock');
       await client.query('UPDATE inventory SET quantity = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [newQty, inventory.rows[0].id]);
 
@@ -1053,13 +1141,13 @@ router.post('/returns', authenticate, hasUserPerm('purchases.receiving-report.ed
       await client.query(
         `INSERT INTO inventory_ledger (id, product_id, location_id, reference_type, reference_id, transaction_type, quantity, running_quantity, unit_cost, total_cost, created_by)
          VALUES ($1, $2, $3, 'Purchase Return', $4, 'OUT', $5, $6, $7, $8, $9)`,
-        [uuidv4(), item.product_id, item.location_id || 1, id, qty, newQty,
-         netCost, total, req.user!.id]
+        [uuidv4(), item.product_id, item.location_id || 1, id, baseQty, newQty,
+         netCost, netCost * baseQty, req.user!.id]
       );
 
       // Deduct from batch
       if (item.batch_id) {
-        await client.query('UPDATE batches SET quantity = quantity - $1 WHERE id = $2', [item.quantity, item.batch_id]);
+        await client.query('UPDATE batches SET quantity = quantity - $1 WHERE id = $2', [baseQty, item.batch_id]);
       }
     }
 
@@ -1119,19 +1207,23 @@ router.get('/orders/:id/print', authenticate, hasUserPerm('purchases.purchase-or
 
     const items = await query(
       `SELECT poi.*, p.sku, p.name as product_name,
-              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
+              COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure,
+              COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as uom_code
        FROM purchase_order_items poi
        JOIN products p ON poi.product_id = p.id
+       LEFT JOIN uoms u ON poi.uom_id = u.id
        WHERE poi.po_id = $1 ORDER BY poi.id`,
       [req.params.id]
     );
 
-    const itemRows = items.rows.map((row: any) => {
+    const printItems = await enrichPurchasePrintLineUoms({ query }, items.rows);
+
+    const itemRows = printItems.map((row: any) => {
       const taxLabel = formatTaxLabel(row.tax_type);
       return tableRow([
         { html: row.product_name || '—' },
         { html: String(parseFloat(row.quantity)), align: 'c' },
-        { html: row.unit_of_measure || 'pc', align: 'c' },
+        { html: row.display_uom || row.unit_of_measure || 'pc', align: 'c' },
         { html: fmtCurrency(row.unit_cost), align: 'r' },
         { html: taxLabel, align: 'c' },
         { html: fmtCurrency(row.discount_amount || 0), align: 'r' },
@@ -1144,7 +1236,7 @@ router.get('/orders/:id/print', authenticate, hasUserPerm('purchases.purchase-or
     const vatableAmt = parseFloat(d.vatable_amount) || 0;
     const vatAmt = parseFloat(d.vat_amount) || 0;
     const total = parseFloat(d.total) || 0;
-    const totalQty = items.rows.reduce((s: number, r: any) => s + parseFloat(r.quantity), 0);
+    const totalQty = printItems.reduce((s: number, r: any) => s + parseFloat(r.quantity), 0);
     let vatExemptAmt = 0;
     let zeroRatedAmt = 0;
     for (const row of items.rows) {
@@ -1157,7 +1249,7 @@ router.get('/orders/:id/print', authenticate, hasUserPerm('purchases.purchase-or
     const b = biz.rows[0] || {};
 
     const summaryRows = [
-      { label: 'Total Items', value: String(items.rows.length) },
+      { label: 'Total Items', value: String(printItems.length) },
       { label: 'Total Quantity', value: String(totalQty) },
       { label: 'Trade Subtotal', value: fmtCurrency(grossTotal) },
       ...(discountAmt > 0 ? [{ label: 'Less Discount', value: fmtCurrency(discountAmt) }] : []),

@@ -7,7 +7,7 @@ echo.
 echo  ============================================
 echo   D METRAN ERP - Thermal Print Server
 echo   Hybrid: run on EACH cashier PC (not cloud)
-echo   Keep this window open while using POS.
+echo   Auto-restarts if it crashes. Ctrl+C to stop.
 echo  ============================================
 echo.
 
@@ -33,16 +33,19 @@ if not exist node_modules (
   echo.
 )
 
+:restart
 echo Starting print server on http://localhost:9999 ...
-echo Press Ctrl+C to stop.
+echo Press Ctrl+C to stop (will not auto-restart after Ctrl+C).
 echo.
 
-npm start
+node server.js
 if errorlevel 1 (
   echo.
-  echo [ERROR] Print server exited with an error.
-  pause
-  exit /b 1
+  echo [WARN] Print server exited with an error.
+) else (
+  echo.
+  echo [INFO] Print server stopped.
 )
-
-pause
+echo Restarting in 5 seconds...
+timeout /t 5 /nobreak
+goto restart

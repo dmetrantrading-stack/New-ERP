@@ -1,4 +1,5 @@
 import { query } from '../config/database';
+import { ProductUomRow, resolveLineUom } from './uom';
 
 export const SUPPLIER_CATALOG_STOCK_SQL = `
   SELECT
@@ -23,7 +24,14 @@ export const SUPPLIER_CATALOG_STOCK_SQL = `
       WHERE sph.product_id = p.id AND sph.supplier_id = sci.supplier_id
       ORDER BY sph.received_date DESC, sph.created_at DESC
       LIMIT 1
-    ) AS last_supplier_cost
+    ) AS last_supplier_cost,
+    (
+      SELECT sph.uom
+      FROM supplier_price_history sph
+      WHERE sph.product_id = p.id AND sph.supplier_id = sci.supplier_id
+      ORDER BY sph.received_date DESC, sph.created_at DESC
+      LIMIT 1
+    ) AS last_supplier_uom
   FROM supplier_catalog_items sci
   JOIN products p ON sci.product_id = p.id AND p.is_active = true
   LEFT JOIN inventory s_store ON p.id = s_store.product_id AND s_store.location_id = 1
@@ -37,11 +45,11 @@ export function computeStandardOrderQty(
   orderQtyMultiplier: number,
   fixedOrderQty: number | null | undefined,
 ): number | null {
-  if (reorderLevel <= 0) return null;
   if (fixedOrderQty != null && parseFloat(String(fixedOrderQty)) > 0) {
     return parseFloat(String(fixedOrderQty));
   }
-  const multiplier = orderQtyMultiplier > 0 ? orderQtyMultiplier : 2;
+  if (reorderLevel <= 0) return null;
+  const multiplier = orderQtyMultiplier > 0 ? orderQtyMultiplier : 1;
   return reorderLevel * multiplier;
 }
 
@@ -59,12 +67,15 @@ export function computeSuggestedOrderQty(
 export function enrichCatalogRow(row: any) {
   const totalQty = parseFloat(row.total_qty ?? 0);
   const reorderLevel = parseFloat(row.reorder_level ?? 0);
-  const multiplier = parseFloat(row.order_qty_multiplier ?? 2);
+  const multiplier = parseFloat(row.order_qty_multiplier ?? 1);
   const fixedOrderQty = row.fixed_order_qty != null ? parseFloat(row.fixed_order_qty) : null;
   const isLowStock = reorderLevel > 0 && totalQty <= reorderLevel;
   const standardOrderQty = computeStandardOrderQty(reorderLevel, multiplier, fixedOrderQty);
   const suggestedOrderQty = isLowStock ? standardOrderQty : null;
-  const unitCost = parseFloat(row.last_supplier_cost ?? row.cost ?? 0);
+  const lastSupplierCost = row.last_supplier_cost != null && row.last_supplier_cost !== ''
+    ? parseFloat(String(row.last_supplier_cost))
+    : null;
+  const unitCost = lastSupplierCost ?? parseFloat(row.cost ?? 0);
 
   return {
     catalog_item_id: row.catalog_item_id,
@@ -84,9 +95,38 @@ export function enrichCatalogRow(row: any) {
     order_qty_multiplier: multiplier,
     fixed_order_qty: fixedOrderQty,
     unit_cost: unitCost,
+    unit_cost_uom: row.last_supplier_uom || 'pc',
+    has_supplier_price: lastSupplierCost != null,
     tax_type: row.tax_type || 'VAT',
     sort_order: row.sort_order ?? 0,
   };
+}
+
+/** Pick purchase UOM for catalog copy — prefer supplier's last-received UOM when known. */
+export function resolveCatalogPurchaseUom(
+  uomRows: ProductUomRow[],
+  supplierUomCode: string | null | undefined,
+  defaultPurchaseUomId?: number | null,
+): ProductUomRow | null {
+  const code = String(supplierUomCode || '').trim().toLowerCase();
+  if (code && uomRows.length) {
+    const byCode = uomRows.find((r) => String(r.uom_code || '').trim().toLowerCase() === code);
+    if (byCode) return byCode;
+  }
+  return resolveLineUom(uomRows, null, defaultPurchaseUomId ?? null);
+}
+
+/** Supplier-specific cost wins over product UOM purchase price when history exists. */
+export function resolveCatalogUnitCost(
+  catalogItem: { unit_cost?: number; has_supplier_price?: boolean },
+  uom: ProductUomRow | null,
+): number {
+  if (catalogItem.has_supplier_price && parseFloat(String(catalogItem.unit_cost)) > 0) {
+    return parseFloat(String(catalogItem.unit_cost));
+  }
+  const uomPrice = parseFloat(String(uom?.purchase_price)) || 0;
+  if (uomPrice > 0) return uomPrice;
+  return parseFloat(String(catalogItem.unit_cost)) || 0;
 }
 
 export async function fetchSupplierCatalogItems(supplierId: number, lowStockOnly = false) {
@@ -142,7 +182,7 @@ export async function addProductsToSupplierCatalog(
       continue;
     }
 
-    const multiplier = input.order_qty_multiplier != null ? parseFloat(String(input.order_qty_multiplier)) : 2;
+    const multiplier = input.order_qty_multiplier != null ? parseFloat(String(input.order_qty_multiplier)) : 1;
     const fixedQty = input.fixed_order_qty != null && String(input.fixed_order_qty).trim() !== ''
       ? parseFloat(String(input.fixed_order_qty))
       : null;

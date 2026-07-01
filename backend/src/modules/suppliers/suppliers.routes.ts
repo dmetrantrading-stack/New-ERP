@@ -7,7 +7,15 @@ import { authenticate, hasUserPerm, hasUserAnyPerm, AuthRequest } from '../../mi
 import { AppError } from '../../middleware/errorHandler';
 import { auditLog } from '../../middleware/audit';
 import { auditAfter, auditBefore, auditSnapshot, AUDIT_FIELDS } from '../../utils/auditHelpers';
-import { fetchSupplierCatalogItems, addProductsToSupplierCatalog, resolveProductIdBySkuOrName } from '../../utils/supplierCatalog';
+import {
+  fetchSupplierCatalogItems,
+  addProductsToSupplierCatalog,
+  resolveProductIdBySkuOrName,
+  resolveCatalogPurchaseUom,
+  resolveCatalogUnitCost,
+} from '../../utils/supplierCatalog';
+import { loadProductUoms } from '../../utils/productUomDb';
+import { purchaseQtyFromPiecesNeeded } from '../../utils/uom';
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 }, fileFilter: (_req, file, cb) => { const ok = file.mimetype === 'text/csv' || file.originalname.endsWith('.csv') || file.mimetype === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' || file.originalname.endsWith('.xlsx'); cb(null, ok); } });
@@ -27,6 +35,26 @@ const esc = (v: any) => {
 
 const importCell = (row: string[], hm: Record<string, number>, col: string, fallback = '') =>
   String(hm[col] !== undefined ? row[hm[col]] ?? fallback : fallback).trim();
+
+const SUPPLIER_ENTITY_TYPES = ['Corporation', 'Sole Proprietorship'] as const;
+type SupplierEntityType = (typeof SUPPLIER_ENTITY_TYPES)[number];
+
+const normalizeEntityType = (value: string | null | undefined, fallback: SupplierEntityType = 'Corporation'): SupplierEntityType => {
+  const raw = String(value || '').trim();
+  if (!raw) return fallback;
+  if (SUPPLIER_ENTITY_TYPES.includes(raw as SupplierEntityType)) return raw as SupplierEntityType;
+  const v = raw.toLowerCase();
+  if (v === 'corporation' || v === 'corp' || v === 'company' || v === 'inc' || v === 'incorporated') return 'Corporation';
+  if (v === 'sole prop' || v === 'sole proprietorship' || v === 'sole proprietor' || v === 'proprietorship') return 'Sole Proprietorship';
+  return fallback;
+};
+
+const parseEntityTypeQuery = (value: string | undefined): SupplierEntityType | null => {
+  if (!value) return null;
+  const normalized = normalizeEntityType(value);
+  if (SUPPLIER_ENTITY_TYPES.includes(normalized)) return normalized;
+  return null;
+};
 
 const parseFile = (buffer: Buffer, originalName: string): { headers: string[]; rows: string[][] } => {
   if (originalName.endsWith('.xlsx')) {
@@ -68,13 +96,20 @@ router.get('/', authenticate, supplierLookup, async (req: AuthRequest, res: Resp
     const limit = parseInt(req.query.limit as string) || 50;
     const offset = (page - 1) * limit;
     const search = req.query.search as string || '';
+    const entityType = parseEntityTypeQuery(req.query.entity_type as string | undefined);
 
     let whereClause = 'WHERE s.is_active = true';
     const params: any[] = [];
     let paramIndex = 1;
 
+    if (entityType) {
+      whereClause += ` AND COALESCE(s.entity_type, 'Corporation') = $${paramIndex}`;
+      params.push(entityType);
+      paramIndex++;
+    }
+
     if (search) {
-      whereClause += ` AND (s.supplier_name ILIKE $${paramIndex} OR s.supplier_code ILIKE $${paramIndex})`;
+      whereClause += ` AND (s.supplier_name ILIKE $${paramIndex} OR s.supplier_code ILIKE $${paramIndex} OR s.contact_person ILIKE $${paramIndex} OR s.tin ILIKE $${paramIndex})`;
       params.push(`%${search}%`);
       paramIndex++;
     }
@@ -93,7 +128,7 @@ router.get('/', authenticate, supplierLookup, async (req: AuthRequest, res: Resp
 });
 
 router.get('/export/template', authenticate, supplierView, async (_req: AuthRequest, res: Response) => {
-  const headerRow = ['Supplier Name','Contact Person','Address','Phone','Email','Payment Terms','TIN','Default Discount Percent'];
+  const headerRow = ['Supplier Name','Entity Type','Contact Person','Address','Phone','Email','Payment Terms','TIN','Default Discount Percent'];
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename=supplier_import_template.csv');
   res.send('\uFEFF' + headerRow.map(esc).join(','));
@@ -102,7 +137,18 @@ router.get('/export/template', authenticate, supplierView, async (_req: AuthRequ
 router.get('/export', authenticate, supplierView, async (req: AuthRequest, res: Response) => {
   try {
     const format = (req.query.format as string) || 'csv';
-    const result = await query('SELECT supplier_name, contact_person, address, phone, email, payment_terms, tin, default_discount_percent, is_active FROM suppliers WHERE is_active = true ORDER BY supplier_name');
+    const entityType = parseEntityTypeQuery(req.query.entity_type as string | undefined);
+    const params: any[] = [];
+    let whereClause = 'WHERE is_active = true';
+    if (entityType) {
+      whereClause += ` AND COALESCE(entity_type, 'Corporation') = $1`;
+      params.push(entityType);
+    }
+    const result = await query(
+      `SELECT supplier_name, COALESCE(entity_type, 'Corporation') AS entity_type, contact_person, address, phone, email, payment_terms, tin, default_discount_percent, is_active
+       FROM suppliers ${whereClause} ORDER BY supplier_name`,
+      params
+    );
     const rows = result.rows;
 
     if (format === 'xlsx') {
@@ -115,9 +161,9 @@ router.get('/export', authenticate, supplierView, async (req: AuthRequest, res: 
       return res.send(buf);
     }
 
-    const headerRow = ['Supplier Name','Contact Person','Address','Phone','Email','Payment Terms','TIN','Default Discount Percent','Active'];
+    const headerRow = ['Supplier Name','Entity Type','Contact Person','Address','Phone','Email','Payment Terms','TIN','Default Discount Percent','Active'];
     const csv = '\uFEFF' + headerRow.join(',') + '\n' + rows.map((r: any) => [
-      esc(r.supplier_name), esc(r.contact_person), esc(r.address), esc(r.phone),
+      esc(r.supplier_name), esc(r.entity_type), esc(r.contact_person), esc(r.address), esc(r.phone),
       esc(r.email), esc(r.payment_terms), esc(r.tin), r.default_discount_percent ?? '', r.is_active
     ].join(',')).join('\n');
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
@@ -137,6 +183,7 @@ router.post('/import/preview', authenticate, hasUserPerm('purchases.suppliers.ed
     for (let i = 0; i < headers.length; i++) {
       const h = headers[i].toLowerCase();
       if (h === 'supplier name' || h === 'name') hm['Supplier Name'] = i;
+      else if (h === 'entity type' || h === 'type') hm['Entity Type'] = i;
       else if (h === 'contact person') hm['Contact Person'] = i;
       else if (h === 'address') hm['Address'] = i;
       else if (h === 'phone') hm['Phone'] = i;
@@ -148,6 +195,8 @@ router.post('/import/preview', authenticate, hasUserPerm('purchases.suppliers.ed
     }
 
     if (!('Supplier Name' in hm)) throw new AppError('Missing required column: Supplier Name');
+
+    const defaultEntityType = normalizeEntityType(req.body?.default_entity_type);
 
     const existing = await query('SELECT id, supplier_name FROM suppliers');
     const byName = new Map(existing.rows.map((r: any) => [r.supplier_name.toLowerCase(), r]));
@@ -161,6 +210,10 @@ router.post('/import/preview', authenticate, hasUserPerm('purchases.suppliers.ed
       const rowNum = ri + 2;
       const entry: any = { row: rowNum, has_errors: false, errors: [] };
       entry.supplier_name = hm['Supplier Name'] !== undefined ? row[hm['Supplier Name']] || '' : '';
+      entry.entity_type = normalizeEntityType(
+        hm['Entity Type'] !== undefined ? row[hm['Entity Type']] || '' : '',
+        defaultEntityType,
+      );
       entry.contact_person = hm['Contact Person'] !== undefined ? row[hm['Contact Person']] || '' : '';
       entry.address = hm['Address'] !== undefined ? row[hm['Address']] || '' : '';
       entry.phone = hm['Phone'] !== undefined ? row[hm['Phone']] || '' : '';
@@ -203,6 +256,7 @@ router.post('/import/execute', authenticate, hasUserPerm('purchases.suppliers.ed
     for (let i = 0; i < headers.length; i++) {
       const h = headers[i].toLowerCase();
       if (h === 'supplier name' || h === 'name') hm['Supplier Name'] = i;
+      else if (h === 'entity type' || h === 'type') hm['Entity Type'] = i;
       else if (h === 'contact person') hm['Contact Person'] = i;
       else if (h === 'address') hm['Address'] = i;
       else if (h === 'phone') hm['Phone'] = i;
@@ -214,6 +268,8 @@ router.post('/import/execute', authenticate, hasUserPerm('purchases.suppliers.ed
     }
 
     if (!('Supplier Name' in hm)) throw new AppError('Missing required column: Supplier Name');
+
+    const defaultEntityType = normalizeEntityType(req.body?.default_entity_type);
 
     const existing = await query('SELECT id, supplier_name, supplier_code FROM suppliers');
     const byName = new Map(existing.rows.map((r: any) => [r.supplier_name.toLowerCase(), r]));
@@ -228,6 +284,10 @@ router.post('/import/execute', authenticate, hasUserPerm('purchases.suppliers.ed
         const supplier_name = importCell(row, hm, 'Supplier Name');
         if (!supplier_name) { errors.push({ row: rowNum, message: 'Supplier name is required' }); continue; }
 
+        const entity_type = normalizeEntityType(
+          importCell(row, hm, 'Entity Type') || req.body?.default_entity_type,
+          defaultEntityType,
+        );
         const contact_person = importCell(row, hm, 'Contact Person') || null;
         const address = importCell(row, hm, 'Address') || null;
         const phone = importCell(row, hm, 'Phone') || null;
@@ -243,11 +303,11 @@ router.post('/import/execute', authenticate, hasUserPerm('purchases.suppliers.ed
 
         if (match) {
           const setClauses = [
-            'supplier_name = $1', 'contact_person = $2', 'address = $3', 'phone = $4',
-            'email = $5', 'payment_terms = $6', 'tin = $7', 'default_discount_percent = $8',
+            'supplier_name = $1', 'entity_type = $2', 'contact_person = $3', 'address = $4', 'phone = $5',
+            'email = $6', 'payment_terms = $7', 'tin = $8', 'default_discount_percent = $9',
             'updated_at = CURRENT_TIMESTAMP'
           ];
-          const params: any[] = [supplier_name, contact_person, address, phone, email, payment_terms, tin, default_discount_percent];
+          const params: any[] = [supplier_name, entity_type, contact_person, address, phone, email, payment_terms, tin, default_discount_percent];
           if (is_active !== undefined) {
             setClauses.push('is_active = $' + (params.length + 1));
             params.push(is_active);
@@ -259,9 +319,9 @@ router.post('/import/execute', authenticate, hasUserPerm('purchases.suppliers.ed
           const codeResult = await query("SELECT COALESCE(MAX(CAST(SUBSTRING(supplier_code FROM 5) AS INTEGER)), 0) + 1 as next FROM suppliers WHERE supplier_code ~ '^DMS-'");
           const code = `DMS-${String(codeResult.rows[0].next).padStart(5, '0')}`;
           await query(
-            `INSERT INTO suppliers (supplier_code, supplier_name, contact_person, address, phone, email, payment_terms, tin, default_discount_percent)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-            [code, supplier_name, contact_person, address, phone, email, payment_terms, tin, default_discount_percent]
+            `INSERT INTO suppliers (supplier_code, supplier_name, entity_type, contact_person, address, phone, email, payment_terms, tin, default_discount_percent)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+            [code, supplier_name, entity_type, contact_person, address, phone, email, payment_terms, tin, default_discount_percent]
           );
           created++;
         }
@@ -395,7 +455,7 @@ router.post('/:id/catalog', authenticate, hasUserPerm('purchases.suppliers.edit'
         id,
         supplierId,
         product_id,
-        order_qty_multiplier != null ? parseFloat(String(order_qty_multiplier)) : 2,
+        order_qty_multiplier != null ? parseFloat(String(order_qty_multiplier)) : 1,
         fixed_order_qty != null && String(fixed_order_qty).trim() !== '' ? parseFloat(String(fixed_order_qty)) : null,
         sort_order != null ? parseInt(String(sort_order), 10) : 0,
       ],
@@ -487,7 +547,7 @@ const buildCatalogImportPreview = async (supplierId: number, headers: string[], 
 
     entry.sku = hm.SKU !== undefined ? row[hm.SKU] || '' : '';
     entry.name = hm['Product Name'] !== undefined ? row[hm['Product Name']] || '' : '';
-    entry.order_qty_multiplier = hm['Order Qty Multiplier'] !== undefined ? row[hm['Order Qty Multiplier']] || '2' : '2';
+    entry.order_qty_multiplier = hm['Order Qty Multiplier'] !== undefined ? row[hm['Order Qty Multiplier']] || '1' : '';
     entry.fixed_order_qty = hm['Fixed Order Qty'] !== undefined ? row[hm['Fixed Order Qty']] || '' : '';
 
     if (!entry.sku.trim() && !entry.name.trim()) {
@@ -500,7 +560,7 @@ const buildCatalogImportPreview = async (supplierId: number, headers: string[], 
       entry.has_errors = true;
       entry.errors.push('Order Qty Multiplier must be a number');
     } else {
-      entry.order_qty_multiplier = Number.isNaN(multiplier) ? 2 : multiplier;
+      entry.order_qty_multiplier = Number.isNaN(multiplier) ? 1 : multiplier;
     }
 
     if (entry.fixed_order_qty !== '' && Number.isNaN(parseFloat(entry.fixed_order_qty))) {
@@ -661,17 +721,34 @@ router.post('/:id/catalog/copy-to-po', authenticate, hasUserPerm('purchases.purc
       return res.status(400).json({ error: 'No matching catalog products found' });
     }
 
-    const poItems = selected
-      .map((i) => ({
-        product_id: i.product_id,
-        product_name: i.name,
-        sku: i.sku,
-        quantity: i.standard_order_qty,
-        unit_cost: i.unit_cost,
-        unit_of_measure: i.unit_of_measure,
-        tax_type: i.tax_type,
+    const poItems = (
+      await Promise.all(selected.map(async (i) => {
+        const piecesNeeded = parseFloat(String(i.standard_order_qty)) || 0;
+        if (piecesNeeded <= 0) return null;
+        const uomRows = await loadProductUoms({ query }, i.product_id);
+        const prod = await query('SELECT default_purchase_uom_id FROM products WHERE id = $1', [i.product_id]);
+        const uom = resolveCatalogPurchaseUom(
+          uomRows,
+          i.unit_cost_uom,
+          prod.rows[0]?.default_purchase_uom_id,
+        );
+        const qtyFromPieces = purchaseQtyFromPiecesNeeded(piecesNeeded, uom);
+        if (qtyFromPieces.enteredQty <= 0) return null;
+        const unitCost = resolveCatalogUnitCost(i, uom);
+        return {
+          product_id: i.product_id,
+          product_name: i.name,
+          sku: i.sku,
+          quantity: qtyFromPieces.enteredQty,
+          unit_cost: unitCost,
+          unit_of_measure: qtyFromPieces.uom_code || i.unit_of_measure,
+          uom_id: qtyFromPieces.uom_id,
+          conversion_to_base: qtyFromPieces.conversion_to_base,
+          base_qty: qtyFromPieces.base_qty,
+          tax_type: i.tax_type,
+        };
       }))
-      .filter((i) => i.quantity != null && i.quantity > 0);
+    ).filter(Boolean);
 
     if (poItems.length === 0) {
       return res.status(400).json({ error: 'Selected items have no order quantity — set reorder level on the product first' });
@@ -691,16 +768,17 @@ router.post('/:id/catalog/copy-to-po', authenticate, hasUserPerm('purchases.purc
 
 router.post('/', authenticate, hasUserPerm('purchases.suppliers.create'), auditLog('Suppliers', 'Create'), async (req: AuthRequest, res: Response) => {
   try {
-    const { supplier_name, contact_person, address, phone, email, payment_terms, tin } = req.body;
+    const { supplier_name, contact_person, address, phone, email, payment_terms, tin, entity_type } = req.body;
     if (!supplier_name) return res.status(400).json({ error: 'Supplier name is required' });
+    const normalizedEntityType = normalizeEntityType(entity_type);
 
     const codeResult = await query("SELECT COALESCE(MAX(CAST(SUBSTRING(supplier_code FROM 5) AS INTEGER)), 0) + 1 as next FROM suppliers WHERE supplier_code ~ '^DMS-'");
     const code = `DMS-${String(codeResult.rows[0].next).padStart(5, '0')}`;
 
     const result = await query(
-      `INSERT INTO suppliers (supplier_code, supplier_name, contact_person, address, phone, email, payment_terms, tin)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-      [code, supplier_name, contact_person, address, phone, email, payment_terms, tin]
+      `INSERT INTO suppliers (supplier_code, supplier_name, entity_type, contact_person, address, phone, email, payment_terms, tin)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+      [code, supplier_name, normalizedEntityType, contact_person, address, phone, email, payment_terms, tin]
     );
     res.status(201).json(result.rows[0]);
   } catch (error: any) {
@@ -714,13 +792,18 @@ router.put('/:id', authenticate, hasUserPerm('purchases.suppliers.edit'), auditL
     if (existing.rows.length === 0) return res.status(404).json({ error: 'Supplier not found' });
     auditBefore(req, auditSnapshot(existing.rows[0], AUDIT_FIELDS.supplier));
 
-    const { supplier_name, contact_person, address, phone, email, payment_terms, tin, is_active } = req.body;
+    const { supplier_name, contact_person, address, phone, email, payment_terms, tin, is_active, entity_type } = req.body;
+    const priorType = existing.rows[0].entity_type || 'Corporation';
+    const nextEntityType = entity_type !== undefined && entity_type !== null && String(entity_type).trim() !== ''
+      ? normalizeEntityType(entity_type)
+      : normalizeEntityType(priorType);
     const result = await query(
       `UPDATE suppliers SET supplier_name = COALESCE($1, supplier_name), contact_person = COALESCE($2, contact_person),
         address = COALESCE($3, address), phone = COALESCE($4, phone), email = COALESCE($5, email),
         payment_terms = COALESCE($6, payment_terms), tin = COALESCE($7, tin),
-        is_active = COALESCE($8, is_active), updated_at = CURRENT_TIMESTAMP WHERE id = $9 RETURNING *`,
-      [supplier_name, contact_person, address, phone, email, payment_terms, tin, is_active, req.params.id]
+        entity_type = $8,
+        is_active = COALESCE($9, is_active), updated_at = CURRENT_TIMESTAMP WHERE id = $10 RETURNING *`,
+      [supplier_name, contact_person, address, phone, email, payment_terms, tin, nextEntityType, is_active, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Supplier not found' });
     auditAfter(req, auditSnapshot(result.rows[0], AUDIT_FIELDS.supplier));

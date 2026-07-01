@@ -10,6 +10,7 @@ import { buildReceiveFormFromPo, fetchPoForReceive, navigateApvFromGr } from '..
 import { beginCopyNavigation, endCopyNavigation } from '../../lib/copyNavigationGuard';
 import DocumentNotesTermsPanel from '../../components/DocumentNotesTermsPanel';
 import { ATTACHMENT_REF } from '../../lib/documentAttachments';
+import { convertToBaseQty, resolvePurchaseUom, resolveReceiveUomFromPoLine } from '../../lib/uomUtils';
 import { printDocument } from '../../lib/printDocument';
 
 const PRIMARY = '#1E40AF';
@@ -82,7 +83,30 @@ export default function GoodsReceipts() {
         toast.error('No remaining quantity to receive on this PO');
         return;
       }
-      setReceiveForm(form);
+      const items = await Promise.all(form.items.map(async (item: any) => {
+        try {
+          const ur = await api.get(`/products/${item.product_id}/uoms`);
+          const uoms = ur.data || [];
+          const def = resolveReceiveUomFromPoLine(uoms, {
+            uom_id: item.uom_id,
+            conversion_to_base: item.conversion_to_base,
+            unit_cost: item.unit_cost,
+            net_unit_cost: item.net_unit_cost,
+            unit_of_measure: item.unit_of_measure,
+          });
+          return {
+            ...item,
+            uoms,
+            uom_id: def?.uom_id ?? item.uom_id,
+            conversion_to_base: def?.conversion_to_base ?? item.conversion_to_base ?? 1,
+            unit_of_measure: def?.uom_code || item.unit_of_measure || 'pc',
+            entered_qty: item.quantity,
+          };
+        } catch {
+          return { ...item, uoms: [], entered_qty: item.quantity };
+        }
+      }));
+      setReceiveForm({ ...form, items });
       setReceiving(true);
     } catch {
       toast.error('Failed to load purchase order');
@@ -103,6 +127,19 @@ export default function GoodsReceipts() {
     setReceiveForm((prev: any) => {
       const items = [...prev.items];
       items[idx] = { ...items[idx], [field]: value };
+      if (field === 'uom_id' && value) {
+        const uom = resolvePurchaseUom(items[idx].uoms || [], parseInt(String(value), 10), null);
+        if (uom) {
+          items[idx].uom_id = uom.uom_id;
+          items[idx].conversion_to_base = uom.conversion_to_base;
+          items[idx].unit_of_measure = uom.uom_code || items[idx].unit_of_measure;
+          const uomCost = parseFloat(String(uom.purchase_price));
+          if (uomCost > 0) {
+            items[idx].net_unit_cost = uomCost;
+            items[idx].unit_cost = uomCost;
+          }
+        }
+      }
       return { ...prev, items };
     });
   };
@@ -126,16 +163,25 @@ export default function GoodsReceipts() {
         supplier_invoice_number: receiveForm.supplier_invoice_number,
         notes: receiveForm.notes,
         terms_conditions: receiveForm.terms_conditions,
-        items: receiveForm.items.map((i: any) => ({
-          po_item_id: i.po_item_id,
-          product_id: i.product_id,
-          quantity: parseFloat(i.quantity),
-          unit_cost: parseFloat(i.unit_cost),
-          net_unit_cost: parseFloat(i.net_unit_cost || i.unit_cost),
-          discount_amount: parseFloat(i.discount_amount || 0),
-          batch_number: i.batch_number,
-          expiry_date: i.expiry_date || undefined,
-        })),
+        items: receiveForm.items.map((i: any) => {
+          const uom = resolvePurchaseUom(i.uoms || [], i.uom_id, null);
+          const enteredQty = parseFloat(i.quantity);
+          const conversion = uom?.conversion_to_base ?? i.conversion_to_base ?? 1;
+          return {
+            po_item_id: i.po_item_id,
+            product_id: i.product_id,
+            quantity: enteredQty,
+            entered_qty: enteredQty,
+            uom_id: i.uom_id || uom?.uom_id || null,
+            conversion_to_base: conversion,
+            base_qty: convertToBaseQty(enteredQty, conversion),
+            unit_cost: parseFloat(i.unit_cost),
+            net_unit_cost: parseFloat(i.net_unit_cost || i.unit_cost),
+            discount_amount: parseFloat(i.discount_amount || 0),
+            batch_number: i.batch_number,
+            expiry_date: i.expiry_date || undefined,
+          };
+        }),
       });
       toast.success(`Goods receipt ${res.data.gr_number} created`);
       setReceiving(false);
@@ -254,6 +300,8 @@ export default function GoodsReceipts() {
                       <th className="px-2 py-2 text-left">Product</th>
                       <th className="px-2 py-2 text-center w-20">Ordered</th>
                       <th className="px-2 py-2 text-center w-20">Recv Qty</th>
+                      <th className="px-2 py-2 text-center w-20">UOM</th>
+                      <th className="px-2 py-2 text-center w-24">= Base</th>
                       <th className="px-2 py-2 text-right w-24">Net Cost</th>
                       <th className="px-2 py-2 text-left w-28">Batch #</th>
                       <th className="px-2 py-2 text-left w-28">Expiry</th>
@@ -263,18 +311,39 @@ export default function GoodsReceipts() {
                   <tbody className="divide-y divide-gray-100">
                     {receiveForm.items.map((item: any, i: number) => {
                       const lineTotal = parseFloat(item.quantity || 0) * parseFloat(item.net_unit_cost || item.unit_cost || 0);
+                      const uom = resolvePurchaseUom(item.uoms || [], item.uom_id, null);
+                      const basePreview = convertToBaseQty(
+                        parseFloat(item.quantity || 0),
+                        uom?.conversion_to_base ?? item.conversion_to_base ?? 1,
+                      );
                       return (
                         <tr key={i} className="hover:bg-blue-50/30">
                           <td className="px-2 py-2">
                             <div className="font-medium text-gray-800">{item.product_name}</div>
                             <div className="text-[10px] text-gray-400">{item.sku}</div>
                           </td>
-                          <td className="px-2 py-2 text-center text-gray-500">{item.already_received} / {item.ordered_qty}</td>
+                          <td className="px-2 py-2 text-center text-gray-500">
+                            {item.already_received} / {item.ordered_qty}
+                            <span className="block text-[9px] uppercase text-gray-400">{(uom?.uom_code || item.unit_of_measure || 'pc')}</span>
+                          </td>
                           <td className="px-2 py-2">
                             <input type="number" step="any" min="0" value={item.quantity}
                               onChange={(e) => updateReceiveItem(i, 'quantity', e.target.value)}
                               className="w-full px-2 py-1 border border-gray-200 rounded text-center text-xs" />
                           </td>
+                          <td className="px-2 py-2">
+                            {(item.uoms?.length || 0) > 1 ? (
+                              <select value={item.uom_id || ''} onChange={(e) => updateReceiveItem(i, 'uom_id', parseInt(e.target.value, 10))}
+                                className="w-full px-1 py-1 border border-gray-200 rounded text-xs uppercase">
+                                {(item.uoms || []).map((u: any) => (
+                                  <option key={u.uom_id} value={u.uom_id}>{(u.uom_code || '').toUpperCase()}</option>
+                                ))}
+                              </select>
+                            ) : (
+                              <span className="text-xs uppercase text-gray-600">{(uom?.uom_code || 'pc').toUpperCase()}</span>
+                            )}
+                          </td>
+                          <td className="px-2 py-2 text-center text-xs text-gray-600">{basePreview} pc</td>
                           <td className="px-2 py-2 text-right font-mono">{formatCurrency(parseFloat(item.net_unit_cost || item.unit_cost))}</td>
                           <td className="px-2 py-2">
                             <input type="text" value={item.batch_number || ''} onChange={(e) => updateReceiveItem(i, 'batch_number', e.target.value)}

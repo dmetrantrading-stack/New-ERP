@@ -11,6 +11,15 @@ import { lineTaxTypeFromProduct, PURCHASE_TAX_TYPE_OPTIONS } from '../../lib/pur
 import DocumentNotesTermsPanel from '../../components/DocumentNotesTermsPanel';
 import { ATTACHMENT_REF } from '../../lib/documentAttachments';
 import { printDocument } from '../../lib/printDocument';
+import {
+  applyPurchaseUomToLine,
+  blankPurchaseDocLine,
+  buildPurchaseDocItemPayload,
+  lineBaseQty,
+  loadProductUoms,
+  pickPurchaseLineUom,
+} from '../../lib/purchaseDocUom';
+import { resolvePurchaseUom } from '../../lib/uomUtils';
 
 const PRIMARY = '#1E40AF';
 
@@ -50,7 +59,7 @@ export default function PurchaseRequisitions() {
     api.get('/products?limit=500').then((r) => setProducts(r.data.data || [])).catch(() => {});
   }, []);
 
-  const blankItem = () => ({ product_id: '', quantity: 1, estimated_cost: 0, unit_of_measure: '', tax_type: 'VAT' });
+  const blankItem = () => blankPurchaseDocLine();
 
   const generateFromLowStock = async () => {
     if (!window.confirm('Create a draft PR from all low-stock products?')) return;
@@ -73,17 +82,32 @@ export default function PurchaseRequisitions() {
 
   const addItem = () => setForm({ ...form, items: [...form.items, blankItem()] });
 
-  const updateItem = (idx: number, field: string, value: any) => {
+  const updateItem = async (idx: number, field: string, value: any) => {
     const items = [...form.items];
     items[idx] = { ...items[idx], [field]: value };
     if (field === 'product_id' && value) {
       const p = products.find((x) => x.id === value);
-      if (p) {
-        items[idx].product_name = p.name;
-        items[idx].sku = p.sku;
-        items[idx].estimated_cost = p.cost || 0;
-        items[idx].unit_of_measure = p.unit_of_measure || 'pc';
-        items[idx].tax_type = lineTaxTypeFromProduct(p);
+      const uoms = await loadProductUoms(value);
+      items[idx] = applyPurchaseUomToLine(
+        {
+          ...items[idx],
+          product_name: p?.name,
+          sku: p?.sku,
+          tax_type: p ? lineTaxTypeFromProduct(p) : items[idx].tax_type,
+        },
+        uoms,
+        null,
+        p,
+        p?.cost || 0,
+      );
+    }
+    if (field === 'uom_id' && value) {
+      const uom = resolvePurchaseUom(items[idx].uoms || [], parseInt(String(value), 10), null);
+      if (uom) {
+        items[idx].uom_id = uom.uom_id;
+        items[idx].unit_of_measure = uom.uom_code || 'pc';
+        items[idx].conversion_to_base = parseFloat(String(uom.conversion_to_base)) || 1;
+        items[idx].estimated_cost = parseFloat(String(uom.purchase_price)) || items[idx].estimated_cost || 0;
       }
     }
     setForm({ ...form, items });
@@ -99,12 +123,7 @@ export default function PurchaseRequisitions() {
       const res = await api.post('/purchases/requisitions', {
         notes: form.notes,
         terms_conditions: form.terms_conditions,
-        items: items.map((i: any) => ({
-          product_id: i.product_id,
-          quantity: parseFloat(i.quantity),
-          estimated_cost: parseFloat(i.estimated_cost || 0),
-          tax_type: i.tax_type || 'VAT',
-        })),
+        items: items.map((i: any) => buildPurchaseDocItemPayload(i)),
       });
       toast.success(`Requisition ${res.data.pr_number} created`);
       setCreating(false);
@@ -267,8 +286,9 @@ export default function PurchaseRequisitions() {
                     <tr className="bg-gray-50 text-[9px] font-semibold text-gray-500 uppercase">
                       <th className="px-3 py-2 text-left w-8">#</th>
                       <th className="px-3 py-2 text-left">Product</th>
-                      <th className="px-3 py-2 text-center w-16">UOM</th>
-                      <th className="px-3 py-2 text-right w-20">Qty</th>
+                      <th className="line-uom-col px-3 py-2 text-center">UOM</th>
+                      <th className="px-3 py-2 text-right w-20">Qty (UOM)</th>
+                      <th className="px-3 py-2 text-center w-16">= Base</th>
                       <th className="px-3 py-2 text-right w-24">Est. Cost</th>
                       <th className="px-3 py-2 text-center w-16">Tax</th>
                       <th className="px-3 py-2 text-right w-24">Total</th>
@@ -278,6 +298,8 @@ export default function PurchaseRequisitions() {
                   <tbody className="divide-y divide-gray-100">
                     {form.items.map((item: any, idx: number) => {
                       const lineTotal = (parseFloat(item.quantity) || 0) * (parseFloat(item.estimated_cost) || 0);
+                      const uom = pickPurchaseLineUom(item.uoms || [], item);
+                      const basePreview = lineBaseQty(item);
                       return (
                         <tr key={idx} className="hover:bg-blue-50/30">
                           <td className="px-3 py-1.5 text-gray-400">{idx + 1}</td>
@@ -290,26 +312,45 @@ export default function PurchaseRequisitions() {
                               getPrice={(p) => p.cost || 0}
                               searchFn={searchProducts}
                               autoFocus={idx === form.items.length - 1 && !item.product_id}
-                              onSelect={(p) => {
+                              onSelect={async (p) => {
                                 if (!products.find((x) => x.id === p.id)) setProducts((prev) => [...prev, p]);
+                                const uoms = await loadProductUoms(p.id);
                                 const items = [...form.items];
-                                items[idx] = {
-                                  ...items[idx],
-                                  product_id: p.id,
-                                  product_name: p.name,
-                                  sku: p.sku,
-                                  estimated_cost: p.cost || 0,
-                                  unit_of_measure: p.unit_of_measure || 'pc',
-                                  tax_type: lineTaxTypeFromProduct(p),
-                                };
+                                items[idx] = applyPurchaseUomToLine(
+                                  {
+                                    ...items[idx],
+                                    product_id: p.id,
+                                    product_name: p.name,
+                                    sku: p.sku,
+                                    tax_type: lineTaxTypeFromProduct(p),
+                                  },
+                                  uoms,
+                                  null,
+                                  p,
+                                  p.cost || 0,
+                                );
                                 setForm({ ...form, items });
                               }}
                             />
                           </td>
-                          <td className="px-3 py-1.5 text-center text-gray-500">{item.unit_of_measure || 'pc'}</td>
+                          <td className="line-uom-col px-3 py-1.5 text-center">
+                            {(item.uoms?.length || 0) > 1 ? (
+                              <select value={item.uom_id || ''} onChange={(e) => updateItem(idx, 'uom_id', parseInt(e.target.value, 10))}
+                                className="line-uom-select px-1 py-1 border border-gray-200 rounded text-[10px] uppercase">
+                                {(item.uoms || []).map((u: any) => (
+                                  <option key={u.uom_id} value={u.uom_id}>{(u.uom_code || '').toUpperCase()}</option>
+                                ))}
+                              </select>
+                            ) : (
+                              <span className="text-xs uppercase text-gray-600">{(uom?.uom_code || item.unit_of_measure || 'pc').toUpperCase()}</span>
+                            )}
+                          </td>
                           <td className="px-3 py-1.5">
                             <input type="number" min="0.01" step="0.01" value={item.quantity} onChange={(e) => updateItem(idx, 'quantity', e.target.value)}
                               className="w-full px-1 py-1 border border-gray-200 rounded text-right text-xs" />
+                          </td>
+                          <td className="px-3 py-1.5 text-center text-[10px] text-gray-500 font-mono">
+                            {item.product_id ? `${basePreview} pc` : '—'}
                           </td>
                           <td className="px-3 py-1.5">
                             <input type="number" min="0" step="0.01" value={item.estimated_cost} onChange={(e) => updateItem(idx, 'estimated_cost', e.target.value)}

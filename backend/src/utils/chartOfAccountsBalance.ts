@@ -89,11 +89,13 @@ export const CATEGORY_GL_ACCOUNTS: Array<[string, string, string]> = [
   ['4012', 'Sales - Pork Meat', 'Income'],
   ['4013', 'Sales - Beef Meat', 'Income'],
   ['4014', 'Sales - Frozen Foods', 'Income'],
+  ['4015', 'Sales - Rice', 'Income'],
   ['5110', 'Cost of Sales - Fish', 'Cost of Goods Sold'],
   ['5111', 'Cost of Sales - Vegetable', 'Cost of Goods Sold'],
   ['5112', 'Cost of Sales - Pork Meat', 'Cost of Goods Sold'],
   ['5113', 'Cost of Sales - Beef Meat', 'Cost of Goods Sold'],
   ['5114', 'Cost of Sales - Frozen Foods', 'Cost of Goods Sold'],
+  ['5115', 'Cost of Sales - Rice', 'Cost of Goods Sold'],
 ];
 
 /** Category name aliases → [revenue_code, cogs_code] */
@@ -103,6 +105,7 @@ export const CATEGORY_ACCOUNT_ALIASES: Array<[string[], string, string]> = [
   [['pork meat', 'pork', 'pork pigue', 'pork pata'], '4012', '5112'],
   [['beef meat', 'beef', 'beef tenderloin', 'beef spareribs', 'beef kamto'], '4013', '5113'],
   [['frozen foods', 'frozen food', 'frozen'], '4014', '5114'],
+  [['rice', 'rice products', 'grains'], '4015', '5115'],
 ];
 
 export async function ensureCategoryGlAccounts(db: { query: typeof query }) {
@@ -130,4 +133,11 @@ export async function ensureCategoryGlAccounts(db: { query: typeof query }) {
       );
     }
   }
+
+  await db.query(
+    `UPDATE categories SET revenue_account_code = '4015', cogs_account_code = '5115', updated_at = CURRENT_TIMESTAMP
+     WHERE is_active = true AND name ILIKE '%rice%'
+       AND (revenue_account_code IS NULL OR revenue_account_code IN ('4000'))
+       AND (cogs_account_code IS NULL OR cogs_account_code IN ('5000'))`,
+  );
 }

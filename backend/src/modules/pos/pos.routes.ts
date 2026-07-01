@@ -11,15 +11,74 @@ import {
   insertRevenueCreditLines,
   insertRevenueDebitLines,
   loadCategoryAccountsForProducts,
-  posLineNetRevenue,
   sumLineGlCogs,
 } from '../../utils/categoryGlPosting';
 import { deductInventoryFefo } from '../../utils/batchFefo';
+import { convertToBaseQty, formatInsufficientStockMessage, getEquivalentUomDisplay } from '../../utils/uom';
+import {
+  computePosTaxTotals,
+  NO_VAT_TAX_TYPE,
+  posLineRevenueAmount,
+} from '../../utils/retailTaxPolicy';
+import { applyLoyaltyOnPosSale, applyLoyaltyOnPosReturn, insertLoyaltyDiscountGlLine, loyaltyDiscountPortion, reverseLoyaltyOnPosVoid } from '../../utils/loyaltyService';
+import { getLoyaltySettings, loyaltySettingsToApi } from '../../utils/loyaltySettings';
+import { loadProductUoms, lookupBarcodeUom } from '../../utils/productUomDb';
 import { v4 as uuidv4 } from 'uuid';
 
 const router = Router();
 
 const posView = hasUserPerm('pos.view');
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isUuid(value: string): boolean {
+  return UUID_RE.test(value);
+}
+
+async function loadPosTransactionDetail(transactionId: string) {
+  if (!isUuid(transactionId)) return null;
+  const txn = await query(
+    `SELECT pt.*, u.full_name as cashier_name
+     FROM pos_transactions pt
+     LEFT JOIN users u ON pt.cashier_id = u.id
+     WHERE pt.id = $1`,
+    [transactionId],
+  );
+  if (txn.rows.length === 0) return null;
+
+  const items = await query(
+    `SELECT pti.*, p.description,
+        COALESCE(u.code, 'pc') AS uom_code,
+        COALESCE(pti.entered_qty, pti.quantity) AS sold_entered_qty,
+        COALESCE(pti.returned_entered_qty, 0) AS returned_entered_qty,
+        GREATEST(COALESCE(pti.entered_qty, pti.quantity) - COALESCE(pti.returned_entered_qty, 0), 0) AS remaining_entered_qty
+     FROM pos_transaction_items pti
+     LEFT JOIN products p ON pti.product_id = p.id
+     LEFT JOIN uoms u ON pti.uom_id = u.id
+     WHERE pti.transaction_id = $1
+     ORDER BY pti.created_at`,
+    [transactionId],
+  );
+
+  const returns = await query(
+    `SELECT pr.*, u.full_name AS created_by_name
+     FROM pos_returns pr
+     LEFT JOIN users u ON pr.created_by = u.id
+     WHERE pr.pos_transaction_id = $1
+     ORDER BY pr.created_at DESC`,
+    [transactionId],
+  );
+
+  return { ...txn.rows[0], items: items.rows, returns: returns.rows };
+}
+
+const pmShiftColumn = (paymentMethod: string) =>
+  paymentMethod === 'GCash' ? 'gcash_sales'
+    : paymentMethod === 'Maya' ? 'maya_sales'
+    : paymentMethod === 'Credit Card' ? 'card_sales'
+    : paymentMethod === 'Bank Transfer' ? 'bank_transfer_sales'
+    : paymentMethod === 'Charge' || paymentMethod === 'Check' || paymentMethod === 'Salary Deduction' ? 'charge_sales'
+    : 'cash_sales';
 
 const generateRefNumber = async (prefix: string, table: string, column: string): Promise<string> => {
   const safePrefix = prefix.replace(/[^A-Z]/g, '');
@@ -29,6 +88,27 @@ const generateRefNumber = async (prefix: string, table: string, column: string):
     `SELECT COALESCE(MAX(CAST(SUBSTRING(${safeColumn}, ${safePrefix.length + 2}) AS INTEGER)), 0) + 1 as next FROM ${safeTable} WHERE ${safeColumn} ~ '^${safePrefix}-'`
   );
   return `${safePrefix}-${String(result.rows[0]?.next || 1).padStart(5, '0')}`;
+};
+
+const POS_RECEIPT_PAD = 6;
+
+/** Numeric receipt # only — e.g. 000001 (continues after legacy POS-00001 rows). */
+async function generatePosReceiptNumber(): Promise<string> {
+  const result = await query(`
+    SELECT GREATEST(
+      COALESCE((
+        SELECT MAX(CAST(transaction_number AS BIGINT))
+        FROM pos_transactions
+        WHERE transaction_number ~ '^[0-9]+$'
+      ), 0),
+      COALESCE((
+        SELECT MAX(CAST(SUBSTRING(transaction_number FROM 5) AS INTEGER))
+        FROM pos_transactions
+        WHERE transaction_number ~ '^POS-[0-9]+$'
+      ), 0)
+    ) + 1 AS next
+  `);
+  return String(result.rows[0]?.next || 1).padStart(POS_RECEIPT_PAD, '0');
 };
 
 // ==================== POS SHIFTS ====================
@@ -196,12 +276,12 @@ router.post('/transactions', authenticate, hasUserPerm('pos.write'), auditLog('P
   const client = await getClient();
   try {
     await client.query('BEGIN');
-    const transaction_number = await generateRefNumber('POS', 'pos_transactions', 'transaction_number');
+    const transaction_number = await generatePosReceiptNumber();
     const {
       shift_id, customer_id, customer_name, employee_id, price_mode, items, payment_method,
-      payment_details, amount_tendered, location_id
+      payment_details, amount_tendered, location_id: rawLocationId
     } = req.body;
-    if (!location_id) throw new Error('Location ID is required');
+    const location_id = rawLocationId ?? 1;
 
     if (payment_method === 'Salary Deduction' && !employee_id) {
       return res.status(400).json({ error: 'Employee is required for salary deduction' });
@@ -233,17 +313,13 @@ router.post('/transactions', authenticate, hasUserPerm('pos.write'), auditLog('P
       return { ...item, quantity: qty, unit_price: price, discount: disc, total: lineFinal };
     });
 
-    // Per-item tax computation based on product settings
-    let totalVatable = 0;
-    let totalVat = 0;
-    let totalVatExempt = 0;
-    let totalZeroRated = 0;
+    // POS retail policy: no output VAT (see retailTaxPolicy.ts)
     const productIds = [...new Set(transactionItems.map((i: any) => i.product_id))];
     const productTaxMap: Record<string, { tax_type: string; price_type: string }> = {};
     if (productIds.length > 0) {
       const prodResult = await client.query(
         `SELECT id, tax_type, price_type FROM products WHERE id = ANY($1::uuid[])`,
-        [productIds]
+        [productIds],
       );
       for (const p of prodResult.rows) {
         productTaxMap[p.id] = { tax_type: p.tax_type || 'VAT', price_type: p.price_type || 'VAT Inclusive' };
@@ -251,54 +327,77 @@ router.post('/transactions', authenticate, hasUserPerm('pos.write'), auditLog('P
     }
 
     for (const item of transactionItems) {
-      const tax = productTaxMap[item.product_id] || { tax_type: 'VAT', price_type: 'VAT Inclusive' };
-      const lineFinal = item.total;
-      item.netRevenue = posLineNetRevenue(lineFinal, tax);
-      if (tax.tax_type === 'VAT Exempt') {
-        totalVatExempt += lineFinal;
-      } else if (tax.tax_type === 'Zero Rated') {
-        totalZeroRated += lineFinal;
-      } else if (tax.tax_type === 'VAT' || tax.tax_type === 'VATable') {
-        if (tax.price_type === 'VAT Inclusive') {
-          const net = lineFinal / 1.12;
-          totalVatable += net;
-          totalVat += lineFinal - net;
-        } else {
-          totalVatable += lineFinal;
-          totalVat += lineFinal * 0.12;
-        }
-      } else {
-        // LGU or other — treat as VAT-inclusive for now
-        const net = lineFinal / 1.12;
-        totalVatable += net;
-        totalVat += lineFinal - net;
-      }
+      item.netRevenue = posLineRevenueAmount(item.total);
     }
+
+    const {
+      totalVatable,
+      totalVat,
+      totalVatExempt,
+      totalZeroRated,
+    } = computePosTaxTotals(transactionItems.map((i: any) => i.total));
 
     const grossTotal = total;
     const vatAmount = totalVat;
 
+    let saleTotal = grossTotal;
+    let loyaltyPointsRedeemed = 0;
+    let loyaltyPointsEarned = 0;
+    let loyaltyDiscount = 0;
+    const loyaltyRates = await getLoyaltySettings(client);
+
+    if (req.body.loyalty_points_redeemed && !customer_id) {
+      return res.status(400).json({ error: 'Customer is required to redeem loyalty points' });
+    }
+    if (req.body.loyalty_points_redeemed && !loyaltyRates.enabled) {
+      return res.status(400).json({ error: 'Loyalty program is disabled' });
+    }
+
+    if (customer_id) {
+      const loyalty = await applyLoyaltyOnPosSale(client, {
+        customerId: customer_id,
+        saleTotalBeforeLoyalty: grossTotal,
+        requestedRedeemPoints: req.body.loyalty_points_redeemed || 0,
+        posTransactionId: id,
+        createdBy: req.user!.id,
+        rates: loyaltyRates,
+      });
+      loyaltyPointsRedeemed = loyalty.pointsRedeemed;
+      loyaltyPointsEarned = loyalty.pointsEarned;
+      loyaltyDiscount = loyalty.loyaltyDiscount;
+      saleTotal = loyalty.finalTotal;
+      discountTotal += loyaltyDiscount;
+    }
+
     await client.query(
       `INSERT INTO pos_transactions (id, transaction_number, shift_id, customer_id, customer_name, price_mode,
         subtotal, discount_total, tax_total, total, payment_method, payment_details, amount_tendered, change_amount,
+        loyalty_points_redeemed, loyalty_points_earned, loyalty_discount,
         status, cashier_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'Completed', $15)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, 'Completed', $19)`,
       [id, transaction_number, shift_id, customer_id, customer_name, price_mode || 'Retail',
-        subtotal, discountTotal, vatAmount, grossTotal, payment_method,
+        subtotal, discountTotal, vatAmount, saleTotal, payment_method,
         payment_details ? JSON.stringify(payment_details) : null,
-        amount_tendered || grossTotal, Math.max(0, parseFloat(amount_tendered || 0) - grossTotal),
+        amount_tendered || saleTotal, Math.max(0, parseFloat(amount_tendered || 0) - saleTotal),
+        loyaltyPointsRedeemed, loyaltyPointsEarned, loyaltyDiscount,
         req.user!.id]
     );
 
     for (const item of transactionItems) {
       const itemId = uuidv4();
       const locId = location_id;
+      const conversionToBase = parseFloat(item.conversion_to_base) || 1;
+      const enteredQty = parseFloat(item.quantity) || 0;
+      const baseQty = item.base_qty != null
+        ? parseFloat(item.base_qty)
+        : convertToBaseQty(enteredQty, conversionToBase);
+
       const inv = await client.query('SELECT * FROM inventory WHERE product_id = $1 AND location_id = $2', [item.product_id, locId]);
       if (inv.rows.length > 0) {
         const availableQty = parseFloat(inv.rows[0].quantity);
         const setting = await client.query("SELECT setting_value FROM system_settings WHERE setting_key = 'enable_negative_inventory'");
-        if (item.quantity > availableQty && setting.rows[0]?.setting_value !== 'true') {
-          throw new Error(`Insufficient stock for ${item.description || item.product_id}`);
+        if (baseQty > availableQty && setting.rows[0]?.setting_value !== 'true') {
+          throw new Error(formatInsufficientStockMessage(availableQty, baseQty, item.uom_code || 'pc'));
         }
       } else {
         const setting = await client.query("SELECT setting_value FROM system_settings WHERE setting_key = 'enable_negative_inventory'");
@@ -310,7 +409,7 @@ router.post('/transactions', authenticate, hasUserPerm('pos.write'), auditLog('P
       const fefo = await deductInventoryFefo(client, {
         product_id: item.product_id,
         location_id: locId,
-        quantity: item.quantity,
+        quantity: baseQty,
         reference_type: 'POS Sale',
         reference_id: id,
         created_by: req.user!.id,
@@ -318,10 +417,12 @@ router.post('/transactions', authenticate, hasUserPerm('pos.write'), auditLog('P
       item.cost = fefo.unitCost;
 
       await client.query(
-        `INSERT INTO pos_transaction_items (id, transaction_id, product_id, variant_id, description, quantity, unit_price, discount, total, cost, selected_variant)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-        [itemId, id, item.product_id, item.variant_id, item.description, item.quantity, item.unit_price,
-         item.discount || 0, item.total, fefo.unitCost, item.selected_variant || null]
+        `INSERT INTO pos_transaction_items (id, transaction_id, product_id, variant_id, description, quantity, unit_price, discount, total, cost, selected_variant,
+          uom_id, entered_qty, conversion_to_base, base_qty)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+        [itemId, id, item.product_id, item.variant_id, item.description, enteredQty, item.unit_price,
+         item.discount || 0, item.total, fefo.unitCost, item.selected_variant || null,
+         item.uom_id || null, enteredQty, conversionToBase, baseQty]
       );
     }
 
@@ -329,40 +430,44 @@ router.post('/transactions', authenticate, hasUserPerm('pos.write'), auditLog('P
     if (shift_id) {
       if (payment_method === 'Cash') {
         await client.query('UPDATE pos_shifts SET total_sales = total_sales + $1, cash_sales = cash_sales + $1, discount_total = discount_total + $2, net_sales = net_sales + $3, expected_cash = expected_cash + $1 WHERE id = $4',
-          [grossTotal, discountTotal, grossTotal, shift_id]);
+          [saleTotal, discountTotal, saleTotal, shift_id]);
       } else if (payment_method === 'GCash') {
         await client.query('UPDATE pos_shifts SET total_sales = total_sales + $1, gcash_sales = gcash_sales + $1, discount_total = discount_total + $2, net_sales = net_sales + $3 WHERE id = $4',
-          [grossTotal, discountTotal, grossTotal, shift_id]);
+          [saleTotal, discountTotal, saleTotal, shift_id]);
       } else if (payment_method === 'Maya') {
         await client.query('UPDATE pos_shifts SET total_sales = total_sales + $1, maya_sales = maya_sales + $1, discount_total = discount_total + $2, net_sales = net_sales + $3 WHERE id = $4',
-          [grossTotal, discountTotal, grossTotal, shift_id]);
+          [saleTotal, discountTotal, saleTotal, shift_id]);
       } else if (payment_method === 'Credit Card') {
         await client.query('UPDATE pos_shifts SET total_sales = total_sales + $1, card_sales = card_sales + $1, discount_total = discount_total + $2, net_sales = net_sales + $3 WHERE id = $4',
-          [grossTotal, discountTotal, grossTotal, shift_id]);
+          [saleTotal, discountTotal, saleTotal, shift_id]);
       } else if (payment_method === 'Bank Transfer') {
         await client.query('UPDATE pos_shifts SET total_sales = total_sales + $1, bank_transfer_sales = bank_transfer_sales + $1, discount_total = discount_total + $2, net_sales = net_sales + $3 WHERE id = $4',
-          [grossTotal, discountTotal, grossTotal, shift_id]);
+          [saleTotal, discountTotal, saleTotal, shift_id]);
       } else {
         await client.query('UPDATE pos_shifts SET total_sales = total_sales + $1, charge_sales = charge_sales + $1, discount_total = discount_total + $2, net_sales = net_sales + $3 WHERE id = $4',
-          [grossTotal, discountTotal, grossTotal, shift_id]);
+          [saleTotal, discountTotal, saleTotal, shift_id]);
       }
     }
 
     // Update customer balance for charge sales
     if (customer_id && payment_method === 'Charge') {
-      await client.query('UPDATE customers SET balance = balance + $1 WHERE id = $2', [grossTotal, customer_id]);
+      await client.query('UPDATE customers SET balance = balance + $1 WHERE id = $2', [saleTotal, customer_id]);
     }
 
     // Accounting entries
     const entryId = uuidv4();
     const entryNumber = await generateRefNumber('JE', 'journal_entries', 'entry_number');
-    const totalCost = transactionItems.reduce((sum: number, i: any) => sum + (i.quantity * (i.cost || 0)), 0);
+    const totalCost = transactionItems.reduce((sum: number, i: any) => {
+      const baseQty = i.base_qty != null ? parseFloat(i.base_qty) : parseFloat(i.quantity) || 0;
+      return sum + baseQty * (i.cost || 0);
+    }, 0);
     // GL COGS uses net-of-VAT cost (inventory stored VAT-inclusive for operational GP)
     const posCogsGlLines = transactionItems.map((item: any) => {
       const tax = productTaxMap[item.product_id] || { tax_type: 'VAT', price_type: 'VAT Inclusive' };
+      const baseQty = item.base_qty != null ? parseFloat(item.base_qty) : parseFloat(item.quantity) || 0;
       return {
         product_id: item.product_id,
-        cogsGrossAmount: item.quantity * (item.cost || 0),
+        cogsGrossAmount: baseQty * (item.cost || 0),
         tax_type: tax.tax_type,
       };
     });
@@ -387,7 +492,7 @@ router.post('/transactions', authenticate, hasUserPerm('pos.write'), auditLog('P
     await client.query(
       `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
        VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = $3), $4, $5, 0, 'POS Sale', $6)`,
-      [uuidv4(), entryId, debitAccount, `${payment_method} Sales ${transaction_number}`, grossTotal, id]
+      [uuidv4(), entryId, debitAccount, `${payment_method} Sales ${transaction_number}`, saleTotal, id]
     );
 
     const posCategoryMap = await loadCategoryAccountsForProducts(client, productIds as string[]);
@@ -401,19 +506,28 @@ router.post('/transactions', authenticate, hasUserPerm('pos.write'), auditLog('P
       'revenueAmount',
     );
 
-    const revenueTotal = totalVatable + totalVatExempt + totalZeroRated;
     await insertRevenueCreditLines(
       client, entryId, posRevenueBuckets, 'POS Sale', id, `Sales Revenue ${transaction_number}`,
     );
 
-    // Credit VAT Payable
-    if (vatAmount > 0) {
-      await client.query(
-        `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
-         VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '2100'), $3, 0, $4, 'POS Sale', $5)`,
-        [uuidv4(), entryId, `VAT ${transaction_number}`, vatAmount, id]
-      );
+    if (loyaltyDiscount > 0) {
+      await insertLoyaltyDiscountGlLine(client, {
+        entryId,
+        amount: loyaltyDiscount,
+        debit: loyaltyDiscount,
+        credit: 0,
+        referenceType: 'POS Sale',
+        referenceId: id,
+        description: `Loyalty discount ${transaction_number}`,
+      });
     }
+
+    const revenuePosted = [...posRevenueBuckets.values()].reduce((s, v) => s + (v || 0), 0);
+    if (grossTotal > 0.009 && revenuePosted < grossTotal - 0.02) {
+      throw new Error(`Revenue GL posting incomplete (posted ₱${revenuePosted.toFixed(2)} of ₱${grossTotal.toFixed(2)}). Check product category GL accounts.`);
+    }
+
+    // No VAT Payable for POS (retailTaxPolicy)
 
     // Debit Cost of Sales / Credit Inventory (by category)
     if (totalCost > 0) {
@@ -428,7 +542,7 @@ router.post('/transactions', authenticate, hasUserPerm('pos.write'), auditLog('P
       await client.query(
         `INSERT INTO cash_transactions (id, transaction_number, transaction_type, amount, reference_type, reference_id, notes, created_by)
          VALUES ($1, $2, 'Cash In', $3, 'POS Sale', $4, $5, $6)`,
-        [uuidv4(), await generateRefNumber('CT', 'cash_transactions', 'transaction_number'), grossTotal, id, `POS Sale ${transaction_number}`, req.user!.id]
+        [uuidv4(), await generateRefNumber('CT', 'cash_transactions', 'transaction_number'), saleTotal, id, `POS Sale ${transaction_number}`, req.user!.id]
       );
     }
 
@@ -442,9 +556,9 @@ router.post('/transactions', authenticate, hasUserPerm('pos.write'), auditLog('P
         await client.query(
           `INSERT INTO bank_transactions (id, bank_account_id, transaction_type, amount, transaction_date, notes, created_by)
            VALUES ($1, $2, 'Deposit', $3, CURRENT_DATE, $4, $5)`,
-          [uuidv4(), bank.rows[0].id, grossTotal, `POS Sale ${transaction_number}`, req.user!.id]
+          [uuidv4(), bank.rows[0].id, saleTotal, `POS Sale ${transaction_number}`, req.user!.id]
         );
-        await client.query('UPDATE bank_accounts SET balance = balance + $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [grossTotal, bank.rows[0].id]);
+        await client.query('UPDATE bank_accounts SET balance = balance + $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [saleTotal, bank.rows[0].id]);
       }
     }
 
@@ -456,38 +570,92 @@ router.post('/transactions', authenticate, hasUserPerm('pos.write'), auditLog('P
         const invNumber = `SI-${new Date().getFullYear()}-${String(Date.now()).slice(-6)}`;
         const siId = uuidv4();
         await client.query(
-          `INSERT INTO sales_invoices (id, invoice_number, customer_type, employee_id, customer_name, price_mode, invoice_date, payment_method, payment_terms, status, subtotal, discount, tax, tax_type, total, amount_paid, balance, cashier_id, created_by)
-           VALUES ($1,$2,'Employee',$3,$4,$5,CURRENT_DATE,'Salary Deduction','Salary Deduction','Posted',$6,$7,$8,'VAT',$9,0,$10,$11,$12)`,
+          `INSERT INTO sales_invoices (id, invoice_number, customer_type, employee_id, customer_name, price_mode, invoice_date, payment_method, payment_terms, status, subtotal, discount, tax, tax_type, total, amount_paid, balance, vatable_sales, vat_exempt_sales, vat_amount, cashier_id, created_by)
+           VALUES ($1,$2,'Employee',$3,$4,$5,CURRENT_DATE,'Salary Deduction','Salary Deduction','Posted',$6,$7,0,$8,$9,0,$10,0,$9,0,$11,$12)`,
           [siId, invNumber, e.id, `${e.last_name}, ${e.first_name}`, price_mode || 'Retail',
-           subtotal, discountTotal, totalVat, grossTotal, grossTotal, req.user!.id, req.user!.id]
+           subtotal, discountTotal, NO_VAT_TAX_TYPE, saleTotal, saleTotal, req.user!.id, req.user!.id]
         );
         for (const item of transactionItems) {
           await client.query(
-            `INSERT INTO sales_invoice_items (id, invoice_id, product_id, description, quantity, unit_price, discount, tax, total, cost, location_id)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-            [uuidv4(), siId, item.product_id, item.description, item.quantity, item.unit_price, item.discount || 0, 0, item.total, item.cost || 0, location_id]
+            `INSERT INTO sales_invoice_items (id, invoice_id, product_id, description, quantity, unit_price, discount, tax, total, cost, location_id, tax_type, vat_amount)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,0,$8,$9,$10,$11,0)`,
+            [uuidv4(), siId, item.product_id, item.description, item.quantity, item.unit_price, item.discount || 0, item.total, item.cost || 0, location_id, NO_VAT_TAX_TYPE]
           );
         }
-        await client.query('UPDATE employees SET grocery_credit_balance = grocery_credit_balance + $1 WHERE id = $2', [grossTotal, e.id]);
+        await client.query('UPDATE employees SET grocery_credit_balance = grocery_credit_balance + $1 WHERE id = $2', [saleTotal, e.id]);
       }
     }
 
     await client.query('COMMIT');
-    const grossProfit = grossTotal - totalCost;
-    const marginPct = grossTotal > 0 ? ((grossProfit / grossTotal) * 100) : 0;
+    const grossProfit = saleTotal - totalCost;
+    const marginPct = saleTotal > 0 ? ((grossProfit / saleTotal) * 100) : 0;
     res.status(201).json({
       id, transaction_number,
-      total: grossTotal,
+      total: saleTotal,
       total_cost: totalCost,
       gross_profit: grossProfit,
       margin_pct: Math.round(marginPct * 100) / 100,
-      change: Math.max(0, parseFloat(amount_tendered || 0) - grossTotal),
+      change: Math.max(0, parseFloat(amount_tendered || 0) - saleTotal),
+      loyalty_points_earned: loyaltyPointsEarned,
+      loyalty_points_redeemed: loyaltyPointsRedeemed,
+      loyalty_discount: loyaltyDiscount,
     });
   } catch (error: any) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: error.message });
   } finally {
     client.release();
+  }
+});
+
+async function handleReceiptLookup(req: AuthRequest, res: Response) {
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.status(400).json({ error: 'Search query required' });
+
+  if (isUuid(q)) {
+    const detail = await loadPosTransactionDetail(q);
+    if (!detail) return res.status(404).json({ error: 'Transaction not found' });
+    return res.json(detail);
+  }
+
+  const exact = await query(
+    `SELECT id FROM pos_transactions WHERE UPPER(transaction_number) = UPPER($1) LIMIT 1`,
+    [q],
+  );
+  if (exact.rows.length > 0) {
+    const detail = await loadPosTransactionDetail(exact.rows[0].id);
+    return res.json(detail);
+  }
+
+  const partial = await query(
+    `SELECT id, transaction_number, total, status, created_at, customer_name, payment_method
+     FROM pos_transactions
+     WHERE transaction_number ILIKE $1 OR COALESCE(customer_name, '') ILIKE $1
+     ORDER BY created_at DESC
+     LIMIT 15`,
+    [`%${q}%`],
+  );
+  if (partial.rows.length === 1) {
+    const detail = await loadPosTransactionDetail(partial.rows[0].id);
+    return res.json(detail);
+  }
+  res.json({ matches: partial.rows });
+}
+
+// Receipt lookup — dedicated path avoids /transactions/:id catching "lookup"
+router.get('/receipts/lookup', authenticate, posView, async (req: AuthRequest, res: Response) => {
+  try {
+    await handleReceiptLookup(req, res);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/transactions/lookup', authenticate, posView, async (req: AuthRequest, res: Response) => {
+  try {
+    await handleReceiptLookup(req, res);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -570,25 +738,12 @@ router.get('/transactions', authenticate, posView, async (req: AuthRequest, res:
 // Get single transaction with items
 router.get('/transactions/:id', authenticate, posView, async (req: AuthRequest, res: Response) => {
   try {
-    const txn = await query(
-      `SELECT pt.*, u.full_name as cashier_name
-       FROM pos_transactions pt
-       LEFT JOIN users u ON pt.cashier_id = u.id
-       WHERE pt.id = $1`,
-      [req.params.id]
-    );
-    if (txn.rows.length === 0) return res.status(404).json({ error: 'Transaction not found' });
-
-    const items = await query(
-      `SELECT pti.*, p.description
-       FROM pos_transaction_items pti
-       LEFT JOIN products p ON pti.product_id = p.id
-       WHERE pti.transaction_id = $1
-       ORDER BY pti.created_at`,
-      [req.params.id]
-    );
-
-    res.json({ ...txn.rows[0], items: items.rows });
+    if (!isUuid(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid transaction ID' });
+    }
+    const detail = await loadPosTransactionDetail(req.params.id);
+    if (!detail) return res.status(404).json({ error: 'Transaction not found' });
+    res.json(detail);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -604,11 +759,31 @@ router.post('/transactions/:id/void', authenticate, hasUserPerm('pos.write'), au
     if (txn.rows.length === 0) return res.status(404).json({ error: 'Transaction not found' });
 
     const t = txn.rows[0];
+    if (t.status === 'Void') return res.status(400).json({ error: 'Transaction already voided' });
+    if (t.status === 'Suspended') return res.status(400).json({ error: 'Cannot void suspended transaction' });
+
+    const priorReturns = await client.query(
+      `SELECT COALESCE(SUM(returned_entered_qty), 0) AS qty FROM pos_transaction_items WHERE transaction_id = $1`,
+      [req.params.id],
+    );
+    if (parseFloat(priorReturns.rows[0]?.qty || 0) > 0) {
+      return res.status(400).json({ error: 'Cannot void a transaction that has returns — process remaining return instead' });
+    }
 
     await client.query(
       "UPDATE pos_transactions SET status = 'Void', void_reason = $1, voided_at = CURRENT_TIMESTAMP, voided_by = $2 WHERE id = $3",
       [reason, req.user!.id, req.params.id]
     );
+
+    if (t.customer_id) {
+      await reverseLoyaltyOnPosVoid(client, {
+        customerId: t.customer_id,
+        pointsEarned: parseInt(t.loyalty_points_earned || '0', 10) || 0,
+        pointsRedeemed: parseInt(t.loyalty_points_redeemed || '0', 10) || 0,
+        posTransactionId: req.params.id,
+        createdBy: req.user!.id,
+      });
+    }
 
     // Restore inventory at the same location used for the original sale
     const items = await client.query(
@@ -622,13 +797,14 @@ router.post('/transactions/:id/void', authenticate, hasUserPerm('pos.write'), au
     );
     for (const item of items.rows) {
       const locId = item.location_id || 1;
+      const restoreQty = item.base_qty != null ? parseFloat(item.base_qty) : parseFloat(item.quantity);
       await client.query('UPDATE inventory SET quantity = quantity + $1 WHERE product_id = $2 AND location_id = $3',
-        [item.quantity, item.product_id, locId]);
+        [restoreQty, item.product_id, locId]);
 
       await client.query(
         `INSERT INTO inventory_ledger (id, product_id, location_id, reference_type, reference_id, transaction_type, quantity, created_by)
          VALUES ($1, $2, $3, 'POS Void', $4, 'IN', $5, $6)`,
-        [uuidv4(), item.product_id, locId, req.params.id, item.quantity, req.user!.id]
+        [uuidv4(), item.product_id, locId, req.params.id, restoreQty, req.user!.id]
       );
     }
 
@@ -649,9 +825,17 @@ router.post('/transactions/:id/void', authenticate, hasUserPerm('pos.write'), au
     // Reversing journal entry
     const voidEntryId = uuidv4();
     const voidEntryNumber = await generateRefNumber('JE', 'journal_entries', 'entry_number');
-    const grossTotal = parseFloat(t.total);
-    const totalCost = items.rows.reduce((sum: number, i: any) => sum + (i.quantity * parseFloat(i.cost || 0)), 0);
-    const jeTotal = grossTotal + totalCost;
+    const paidTotal = parseFloat(t.total);
+    const loyaltyDiscVoid = parseFloat(t.loyalty_discount || 0);
+    const itemRevenueTotal = items.rows.reduce(
+      (sum: number, i: any) => sum + posLineRevenueAmount(parseFloat(i.total)),
+      0,
+    );
+    const totalCost = items.rows.reduce((sum: number, i: any) => {
+      const baseQty = i.base_qty != null ? parseFloat(i.base_qty) : parseFloat(i.quantity) || 0;
+      return sum + baseQty * parseFloat(i.cost || 0);
+    }, 0);
+    const jeTotal = itemRevenueTotal + totalCost;
 
     const voidProductIds = [...new Set(items.rows.map((i: any) => i.product_id))];
     const voidProductTaxMap: Record<string, { tax_type: string; price_type: string }> = {};
@@ -666,43 +850,26 @@ router.post('/transactions/:id/void', authenticate, hasUserPerm('pos.write'), au
     }
     const voidPosCategoryMap = await loadCategoryAccountsForProducts(client, voidProductIds as string[]);
     const voidPosRevenueBuckets = aggregateByAccountCode(
-      items.rows.map((item: any) => {
-        const tax = voidProductTaxMap[item.product_id] || { tax_type: 'VAT', price_type: 'VAT Inclusive' };
-        return {
-          product_id: item.product_id,
-          revenueAmount: posLineNetRevenue(parseFloat(item.total), tax),
-        };
-      }),
+      items.rows.map((item: any) => ({
+        product_id: item.product_id,
+        revenueAmount: posLineRevenueAmount(parseFloat(item.total)),
+      })),
       voidPosCategoryMap,
       'revenue_account_code',
       'revenueAmount',
     );
     const voidPosCogsGlLines = items.rows.map((item: any) => {
       const tax = voidProductTaxMap[item.product_id] || { tax_type: 'VAT', price_type: 'VAT Inclusive' };
+      const baseQty = item.base_qty != null ? parseFloat(item.base_qty) : parseFloat(item.quantity) || 0;
       return {
         product_id: item.product_id,
-        cogsGrossAmount: parseFloat(item.quantity) * parseFloat(item.cost || 0),
+        cogsGrossAmount: baseQty * parseFloat(item.cost || 0),
         tax_type: tax.tax_type,
       };
     });
     const voidPosCogsBuckets = aggregateGlCogsByAccountCode(voidPosCogsGlLines, voidPosCategoryMap);
 
-    let voidVatAmount = 0;
-    for (const item of items.rows) {
-      const tax = voidProductTaxMap[item.product_id] || { tax_type: 'VAT', price_type: 'VAT Inclusive' };
-      const lineFinal = parseFloat(item.total);
-      if (tax.tax_type === 'VAT Exempt' || tax.tax_type === 'Zero Rated') continue;
-      if (tax.tax_type === 'VAT' || tax.tax_type === 'VATable') {
-        if (tax.price_type === 'VAT Inclusive') {
-          voidVatAmount += lineFinal - lineFinal / 1.12;
-        } else {
-          voidVatAmount += lineFinal * 0.12;
-        }
-      } else {
-        voidVatAmount += lineFinal - lineFinal / 1.12;
-      }
-    }
-    voidVatAmount = Math.round(voidVatAmount * 100) / 100;
+    // No VAT reversal for POS void (retailTaxPolicy)
 
     await client.query(
       `INSERT INTO journal_entries (id, entry_number, entry_date, reference_type, reference_id, description, total_debit, total_credit, created_by)
@@ -722,18 +889,23 @@ router.post('/transactions/:id/void', authenticate, hasUserPerm('pos.write'), au
     const reverseAccount = bankAcctVoid.rows.length > 0
       ? bankAcctVoid.rows[0].gl_account_code
       : (reverseFallback[pm as string] || '1000');
-    if (voidVatAmount > 0) {
-      await client.query(
-        `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
-         VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = '2100'), $3, $4, 0, 'Void POS', $5)`,
-        [uuidv4(), voidEntryId, `Reverse VAT ${t.transaction_number}`, voidVatAmount, req.params.id],
-      );
-    }
     await client.query(
       `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
        VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = $3), $4, 0, $5, 'Void POS', $6)`,
-      [uuidv4(), voidEntryId, reverseAccount, `Reverse ${pm} ${t.transaction_number}`, grossTotal, req.params.id],
+      [uuidv4(), voidEntryId, reverseAccount, `Reverse ${pm} ${t.transaction_number}`, paidTotal, req.params.id],
     );
+
+    if (loyaltyDiscVoid > 0) {
+      await insertLoyaltyDiscountGlLine(client, {
+        entryId: voidEntryId,
+        amount: loyaltyDiscVoid,
+        debit: 0,
+        credit: loyaltyDiscVoid,
+        referenceType: 'Void POS',
+        referenceId: req.params.id,
+        description: `Reverse loyalty discount ${t.transaction_number}`,
+      });
+    }
 
     if (totalCost > 0) {
       await insertCogsInventoryReversalLines(
@@ -746,7 +918,7 @@ router.post('/transactions/:id/void', authenticate, hasUserPerm('pos.write'), au
       await client.query(
         `INSERT INTO cash_transactions (id, transaction_number, transaction_type, amount, reference_type, reference_id, notes, created_by)
          VALUES ($1, $2, 'Void', $3, 'POS Sale', $4, $5, $6)`,
-        [uuidv4(), await generateRefNumber('CT', 'cash_transactions', 'transaction_number'), grossTotal, req.params.id,
+        [uuidv4(), await generateRefNumber('CT', 'cash_transactions', 'transaction_number'), paidTotal, req.params.id,
          `Void POS ${t.transaction_number}`, req.user!.id]
       );
     }
@@ -761,10 +933,10 @@ router.post('/transactions/:id/void', authenticate, hasUserPerm('pos.write'), au
         await client.query(
           `INSERT INTO bank_transactions (id, bank_account_id, transaction_type, amount, transaction_date, notes, created_by)
            VALUES ($1, $2, 'Withdrawal', $3, CURRENT_DATE, $4, $5)`,
-          [uuidv4(), bankVoid.rows[0].id, grossTotal, `Void POS ${t.transaction_number}`, req.user!.id]
+          [uuidv4(), bankVoid.rows[0].id, paidTotal, `Void POS ${t.transaction_number}`, req.user!.id]
         );
         await client.query('UPDATE bank_accounts SET balance = balance - $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
-          [grossTotal, bankVoid.rows[0].id]);
+          [paidTotal, bankVoid.rows[0].id]);
       }
     }
 
@@ -778,18 +950,340 @@ router.post('/transactions/:id/void', authenticate, hasUserPerm('pos.write'), au
   }
 });
 
+// Partial or full POS return
+router.post('/transactions/:id/return', authenticate, hasUserPerm('pos.write'), auditLog('POS', 'Return'), async (req: AuthRequest, res: Response) => {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    const { reason, items: returnItems } = req.body;
+    if (!returnItems?.length) return res.status(400).json({ error: 'At least one item is required' });
+    if (!reason?.trim()) return res.status(400).json({ error: 'Return reason is required' });
+
+    const txn = await client.query('SELECT * FROM pos_transactions WHERE id = $1', [req.params.id]);
+    if (txn.rows.length === 0) return res.status(404).json({ error: 'Transaction not found' });
+    const t = txn.rows[0];
+    if (t.status === 'Void') return res.status(400).json({ error: 'Cannot return a voided transaction' });
+    if (t.status === 'Suspended') return res.status(400).json({ error: 'Cannot return a suspended transaction' });
+
+    const returnId = uuidv4();
+    const returnNumber = await generateRefNumber('PR', 'pos_returns', 'return_number');
+    const pm = t.payment_method || 'Cash';
+    let totalReturn = 0;
+    let totalCost = 0;
+    const returnGlLines: Array<{ product_id: string; revenueAmount: number; cogsGrossAmount: number; tax_type?: string }> = [];
+    const processedLines: any[] = [];
+
+    for (const reqItem of returnItems) {
+      const qty = parseFloat(reqItem.quantity);
+      if (!reqItem.transaction_item_id || !Number.isFinite(qty) || qty <= 0) {
+        throw new Error('Each return line needs a valid item and quantity');
+      }
+
+      const line = await client.query(
+        `SELECT pti.*,
+          (SELECT il.location_id FROM inventory_ledger il
+           WHERE il.reference_id = pti.transaction_id AND il.product_id = pti.product_id
+             AND il.transaction_type = 'OUT'
+           ORDER BY il.created_at DESC LIMIT 1) AS location_id
+         FROM pos_transaction_items pti
+         WHERE pti.id = $1 AND pti.transaction_id = $2`,
+        [reqItem.transaction_item_id, req.params.id],
+      );
+      if (line.rows.length === 0) throw new Error('Invalid transaction line item');
+      const invLine = line.rows[0];
+
+      const soldEntered = parseFloat(invLine.entered_qty ?? invLine.quantity);
+      const returnedSoFar = parseFloat(invLine.returned_entered_qty || 0);
+      const remaining = soldEntered - returnedSoFar;
+      if (qty > remaining + 0.0001) {
+        throw new Error(`Return qty exceeds remaining for ${invLine.description || 'item'}`);
+      }
+
+      const soldBase = parseFloat(invLine.base_qty ?? invLine.quantity);
+      const returnedBaseSoFar = parseFloat(invLine.returned_base_qty || 0);
+      const returnBaseQty = soldEntered > 0
+        ? ((soldBase - returnedBaseSoFar) / (soldEntered - returnedSoFar)) * qty
+        : qty;
+
+      const lineTotal = (parseFloat(invLine.total) / soldEntered) * qty;
+      const cost = parseFloat(invLine.cost || 0);
+      const locId = reqItem.location_id || invLine.location_id || 1;
+      totalReturn += lineTotal;
+      totalCost += cost * returnBaseQty;
+
+      returnGlLines.push({
+        product_id: invLine.product_id,
+        revenueAmount: posLineRevenueAmount(lineTotal),
+        cogsGrossAmount: cost * returnBaseQty,
+      });
+
+      await client.query(
+        `UPDATE pos_transaction_items
+         SET returned_entered_qty = COALESCE(returned_entered_qty, 0) + $1,
+             returned_base_qty = COALESCE(returned_base_qty, 0) + $2
+         WHERE id = $3`,
+        [qty, returnBaseQty, invLine.id],
+      );
+
+      const invRow = await client.query(
+        'SELECT * FROM inventory WHERE product_id = $1 AND location_id = $2',
+        [invLine.product_id, locId],
+      );
+      if (invRow.rows.length > 0) {
+        const newQty = parseFloat(invRow.rows[0].quantity) + returnBaseQty;
+        await client.query('UPDATE inventory SET quantity = $1 WHERE id = $2', [newQty, invRow.rows[0].id]);
+        await client.query(
+          `INSERT INTO inventory_ledger (id, product_id, location_id, reference_type, reference_id, transaction_type, quantity, running_quantity, unit_cost, total_cost, created_by)
+           VALUES ($1, $2, $3, 'POS Return', $4, 'IN', $5, $6, $7, $8, $9)`,
+          [uuidv4(), invLine.product_id, locId, returnId, returnBaseQty, newQty, cost, cost * returnBaseQty, req.user!.id],
+        );
+      } else {
+        await client.query(
+          'INSERT INTO inventory (product_id, location_id, quantity, unit_cost) VALUES ($1, $2, $3, $4)',
+          [invLine.product_id, locId, returnBaseQty, cost],
+        );
+        await client.query(
+          `INSERT INTO inventory_ledger (id, product_id, location_id, reference_type, reference_id, transaction_type, quantity, running_quantity, unit_cost, total_cost, created_by)
+           VALUES ($1, $2, $3, 'POS Return', $4, 'IN', $5, $6, $7, $8, $9)`,
+          [uuidv4(), invLine.product_id, locId, returnId, returnBaseQty, returnBaseQty, cost, cost * returnBaseQty, req.user!.id],
+        );
+      }
+
+      processedLines.push({
+        pos_transaction_item_id: invLine.id,
+        product_id: invLine.product_id,
+        entered_qty: qty,
+        base_qty: returnBaseQty,
+        unit_price: parseFloat(invLine.unit_price),
+        discount: parseFloat(invLine.discount || 0),
+        total: lineTotal,
+        cost,
+        location_id: locId,
+      });
+    }
+
+    const grossItemRow = await client.query(
+      `SELECT COALESCE(SUM(total), 0) AS gross FROM pos_transaction_items WHERE transaction_id = $1`,
+      [req.params.id],
+    );
+    const grossItemTotal = parseFloat(grossItemRow.rows[0]?.gross || 0);
+    const loyaltyDisc = parseFloat(t.loyalty_discount || 0);
+    const loyaltyReturnPortion = loyaltyDiscountPortion(totalReturn, grossItemTotal, loyaltyDisc);
+    const cashRefund = Math.round((totalReturn - loyaltyReturnPortion) * 100) / 100;
+
+    let loyaltyReturnAdjust = { earnClawback: 0, redeemRestore: 0 };
+    if (t.customer_id) {
+      const earned = parseInt(t.loyalty_points_earned || '0', 10) || 0;
+      const redeemed = parseInt(t.loyalty_points_redeemed || '0', 10) || 0;
+      if (earned > 0 || redeemed > 0) {
+        loyaltyReturnAdjust = await applyLoyaltyOnPosReturn(client, {
+          customerId: t.customer_id,
+          pointsEarned: earned,
+          pointsRedeemed: redeemed,
+          returnAmount: totalReturn,
+          grossItemTotal,
+          posTransactionId: req.params.id,
+          returnId,
+          createdBy: req.user!.id,
+        });
+      }
+    }
+
+    const shiftId = t.shift_id;
+    await client.query(
+      `INSERT INTO pos_returns (id, return_number, pos_transaction_id, shift_id, total, refund_method, reason, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [returnId, returnNumber, req.params.id, shiftId, totalReturn, pm, reason.trim(), req.user!.id],
+    );
+
+    for (const pl of processedLines) {
+      await client.query(
+        `INSERT INTO pos_return_items (id, return_id, pos_transaction_item_id, product_id, entered_qty, base_qty, unit_price, discount, total, cost, location_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [uuidv4(), returnId, pl.pos_transaction_item_id, pl.product_id, pl.entered_qty, pl.base_qty,
+          pl.unit_price, pl.discount, pl.total, pl.cost, pl.location_id],
+      );
+    }
+
+    const allReturned = await client.query(
+      `SELECT BOOL_AND(COALESCE(returned_entered_qty, 0) >= COALESCE(entered_qty, quantity)) AS fully_returned
+       FROM pos_transaction_items WHERE transaction_id = $1`,
+      [req.params.id],
+    );
+    if (allReturned.rows[0]?.fully_returned) {
+      await client.query("UPDATE pos_transactions SET status = 'Returned' WHERE id = $1", [req.params.id]);
+    }
+
+    if (shiftId) {
+      const pmColumn = pmShiftColumn(pm);
+      await client.query(
+        `UPDATE pos_shifts SET total_sales = total_sales - $1, ${pmColumn} = ${pmColumn} - $1,
+          net_sales = net_sales - $1, return_total = return_total + $1
+         WHERE id = $2`,
+        [cashRefund, shiftId],
+      );
+      if (pm === 'Cash') {
+        await client.query(
+          'UPDATE pos_shifts SET expected_cash = expected_cash - $1 WHERE id = $2',
+          [cashRefund, shiftId],
+        );
+      }
+    }
+
+    if (t.customer_id && pm === 'Charge') {
+      await client.query(
+        'UPDATE customers SET balance = GREATEST(balance - $1, 0) WHERE id = $2',
+        [cashRefund, t.customer_id],
+      );
+    }
+
+    if (pm === 'Salary Deduction') {
+      const si = await client.query(
+        `SELECT employee_id FROM sales_invoices
+         WHERE payment_method = 'Salary Deduction' AND cashier_id = $1
+           AND invoice_date = ($2::timestamptz)::date
+           AND ABS(total - $3) < 0.02
+         ORDER BY created_at DESC LIMIT 1`,
+        [t.cashier_id, t.created_at, parseFloat(t.total)],
+      );
+      if (si.rows.length > 0 && si.rows[0].employee_id) {
+        await client.query(
+          'UPDATE employees SET grocery_credit_balance = GREATEST(grocery_credit_balance - $1, 0) WHERE id = $2',
+          [totalReturn, si.rows[0].employee_id],
+        );
+      }
+    }
+
+    const returnProductIds = [...new Set(returnGlLines.map((l) => l.product_id))];
+    const returnProductTaxMap: Record<string, { tax_type: string; price_type: string }> = {};
+    if (returnProductIds.length > 0) {
+      const prodResult = await client.query(
+        `SELECT id, tax_type, price_type FROM products WHERE id = ANY($1::uuid[])`,
+        [returnProductIds],
+      );
+      for (const p of prodResult.rows) {
+        returnProductTaxMap[p.id] = { tax_type: p.tax_type || 'VAT', price_type: p.price_type || 'VAT Inclusive' };
+      }
+    }
+    const returnCategoryMap = await loadCategoryAccountsForProducts(client, returnProductIds as string[]);
+    const returnRevenueBuckets = aggregateByAccountCode(
+      returnGlLines,
+      returnCategoryMap,
+      'revenue_account_code',
+      'revenueAmount',
+    );
+    const returnCogsGlLines = returnGlLines.map((item) => ({
+      product_id: item.product_id,
+      cogsGrossAmount: item.cogsGrossAmount,
+      tax_type: returnProductTaxMap[item.product_id]?.tax_type || 'VAT',
+    }));
+    const returnCogsBuckets = aggregateGlCogsByAccountCode(returnCogsGlLines, returnCategoryMap);
+    const glCogs = sumLineGlCogs(returnCogsGlLines);
+    const jeTotal = totalReturn + glCogs;
+
+    const entryId = uuidv4();
+    const entryNumber = await generateRefNumber('JE', 'journal_entries', 'entry_number');
+    await client.query(
+      `INSERT INTO journal_entries (id, entry_number, entry_date, reference_type, reference_id, description, total_debit, total_credit, created_by)
+       VALUES ($1, $2, CURRENT_DATE, 'POS Return', $3, $4, $5, $5, $6)`,
+      [entryId, entryNumber, returnId, `POS Return ${returnNumber} — ${t.transaction_number}`, jeTotal, req.user!.id],
+    );
+
+    await insertRevenueDebitLines(
+      client, entryId, returnRevenueBuckets, 'POS Return', returnId, `Reverse Revenue ${t.transaction_number}`,
+    );
+
+    const bankAcctReturn = await client.query(
+      'SELECT gl_account_code FROM bank_accounts WHERE pos_payment_method = $1 AND is_active = true LIMIT 1',
+      [pm],
+    );
+    const refundFallback: Record<string, string> = { Cash: '1000', Charge: '1100', 'Salary Deduction': '1120' };
+    const refundAccount = bankAcctReturn.rows.length > 0
+      ? bankAcctReturn.rows[0].gl_account_code
+      : (refundFallback[pm as string] || '1000');
+    await client.query(
+      `INSERT INTO journal_entry_lines (id, entry_id, account_id, description, debit, credit, reference_type, reference_id)
+       VALUES ($1, $2, (SELECT id FROM chart_of_accounts WHERE account_code = $3), $4, 0, $5, 'POS Return', $6)`,
+      [uuidv4(), entryId, refundAccount, `Refund ${pm} ${t.transaction_number}`, cashRefund, returnId],
+    );
+
+    if (loyaltyReturnPortion > 0) {
+      await insertLoyaltyDiscountGlLine(client, {
+        entryId,
+        amount: loyaltyReturnPortion,
+        debit: 0,
+        credit: loyaltyReturnPortion,
+        referenceType: 'POS Return',
+        referenceId: returnId,
+        description: `Reverse loyalty discount ${t.transaction_number}`,
+      });
+    }
+
+    if (glCogs > 0) {
+      await insertCogsInventoryReversalLines(
+        client, entryId, returnCogsBuckets, 'POS Return', returnId, returnNumber,
+      );
+    }
+
+    if (pm === 'Cash') {
+      await client.query(
+        `INSERT INTO cash_transactions (id, transaction_number, transaction_type, amount, reference_type, reference_id, notes, created_by)
+         VALUES ($1, $2, 'Cash Out', $3, 'POS Return', $4, $5, $6)`,
+        [uuidv4(), await generateRefNumber('CT', 'cash_transactions', 'transaction_number'), cashRefund, returnId,
+          `POS Return ${returnNumber} — ${t.transaction_number}`, req.user!.id],
+      );
+    }
+
+    if (['GCash', 'Maya', 'Credit Card', 'Bank Transfer'].includes(pm)) {
+      const bankReturn = await client.query(
+        'SELECT id FROM bank_accounts WHERE pos_payment_method = $1 AND is_active = true LIMIT 1',
+        [pm],
+      );
+      if (bankReturn.rows.length > 0) {
+        await client.query(
+          `INSERT INTO bank_transactions (id, bank_account_id, transaction_type, amount, transaction_date, notes, created_by)
+           VALUES ($1, $2, 'Withdrawal', $3, CURRENT_DATE, $4, $5)`,
+          [uuidv4(), bankReturn.rows[0].id, cashRefund, `POS Return ${returnNumber} — ${t.transaction_number}`, req.user!.id],
+        );
+        await client.query(
+          'UPDATE bank_accounts SET balance = balance - $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+          [cashRefund, bankReturn.rows[0].id],
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+    res.status(201).json({
+      id: returnId,
+      return_number: returnNumber,
+      total: totalReturn,
+      cash_refund: cashRefund,
+      loyalty_return_portion: loyaltyReturnPortion,
+      loyalty_earn_clawback: loyaltyReturnAdjust.earnClawback,
+      loyalty_redeem_restore: loyaltyReturnAdjust.redeemRestore,
+      transaction_number: t.transaction_number,
+    });
+  } catch (error: any) {
+    await client.query('ROLLBACK');
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 // ==================== SUSPENDED SALES ====================
 router.post('/suspend', authenticate, hasUserPerm('pos.write'), auditLog('POS', 'Suspend Sale'), async (req: AuthRequest, res: Response) => {
   try {
     const txn_number = await generateRefNumber('SUS', 'suspended_sales', 'transaction_number');
-    const { customer_id, customer_name, price_mode, items, subtotal, discount_total, tax_total, total, shift_id } = req.body;
+    const { customer_id, customer_name, price_mode, items, subtotal, discount_total, tax_total, total, shift_id, loyalty_redeem_points } = req.body;
     const id = uuidv4();
 
     await query(
-      `INSERT INTO suspended_sales (id, transaction_number, shift_id, customer_id, customer_name, price_mode, items, subtotal, discount_total, tax_total, total, cashier_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+      `INSERT INTO suspended_sales (id, transaction_number, shift_id, customer_id, customer_name, price_mode, items, subtotal, discount_total, tax_total, total, loyalty_redeem_points, cashier_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
       [id, txn_number, shift_id, customer_id, customer_name, price_mode,
-       JSON.stringify(items), subtotal, discount_total, tax_total, total, req.user!.id]
+       JSON.stringify(items), subtotal, discount_total, tax_total, total,
+       Math.max(0, Math.floor(loyalty_redeem_points || 0)), req.user!.id]
     );
 
     res.status(201).json({ id, transaction_number: txn_number });
@@ -899,6 +1393,117 @@ router.post('/cash-out', authenticate, hasUserPerm('pos.write'), auditLog('POS',
 
     res.json({ id: ctId, transaction_number: ctNum, expected_cash: newExpected });
   } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+const STOCK_SQL = 'COALESCE(i.quantity, 0)';
+
+function buildPriceInquiryRow(row: any, uoms: any[]) {
+  const stock = parseFloat(row.stock) || 0;
+  return {
+    id: row.id,
+    sku: row.sku,
+    name: row.name,
+    barcode: row.barcode,
+    stock,
+    stock_display: getEquivalentUomDisplay(
+      stock,
+      uoms.map((u: any) => ({ uom_code: u.uom_code, conversion_to_base: u.conversion_to_base })),
+      row.unit_of_measure || 'pc',
+    ),
+    retail_price: parseFloat(row.retail_price) || 0,
+    wholesale_price: parseFloat(row.wholesale_price) || 0,
+    distributor_price: parseFloat(row.distributor_price) || 0,
+    chilled_price: row.chilled_price != null ? parseFloat(row.chilled_price) : null,
+    has_chilled_variant: !!row.has_chilled_variant,
+    uoms: uoms.map((u: any) => ({
+      uom_id: u.uom_id,
+      uom_code: u.uom_code,
+      conversion_to_base: parseFloat(u.conversion_to_base) || 1,
+      retail_price: parseFloat(u.retail_price) || 0,
+      wholesale_price: parseFloat(u.wholesale_price) || 0,
+      distributor_price: parseFloat(u.distributor_price) || 0,
+    })),
+  };
+}
+
+router.get('/loyalty-policy', authenticate, posView, async (_req: AuthRequest, res: Response) => {
+  try {
+    res.json(loyaltySettingsToApi(await getLoyaltySettings()));
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/loyalty/:customerId', authenticate, posView, async (req: AuthRequest, res: Response) => {
+  try {
+    const customerId = parseInt(req.params.customerId, 10);
+    if (!Number.isFinite(customerId)) return res.status(400).json({ error: 'Invalid customer ID' });
+    const result = await query(
+      `SELECT id, customer_code, customer_name, loyalty_points, default_price_mode, phone
+       FROM customers WHERE id = $1 AND is_active = true`,
+      [customerId],
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Customer not found' });
+    res.json(result.rows[0]);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/price-inquiry', authenticate, posView, async (req: AuthRequest, res: Response) => {
+  try {
+    const q = (req.query.q as string || '').trim();
+    if (!q) return res.status(400).json({ error: 'Search query required' });
+    const location_id = parseInt(String(req.query.location_id ?? '1'), 10) || 1;
+
+    const bcHit = await lookupBarcodeUom({ query }, q);
+    if (bcHit) {
+      const result = await query(
+        `SELECT p.id, p.sku, p.name, p.barcode, p.retail_price, p.wholesale_price, p.distributor_price,
+          p.has_chilled_variant, p.chilled_price,
+          COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') AS unit_of_measure, ${STOCK_SQL} AS stock
+         FROM products p
+         LEFT JOIN inventory i ON i.product_id = p.id AND i.location_id = $2
+         WHERE p.id = $1 AND p.is_active = true`,
+        [bcHit.product_id, location_id],
+      );
+      const row = result.rows[0];
+      if (!row) return res.status(404).json({ error: 'Product not found' });
+      const uoms = await loadProductUoms({ query }, bcHit.product_id);
+      return res.json(buildPriceInquiryRow(row, uoms));
+    }
+
+    const exact = await query(
+      `SELECT p.id, p.sku, p.name, p.barcode, p.retail_price, p.wholesale_price, p.distributor_price,
+        p.has_chilled_variant, p.chilled_price,
+        COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') AS unit_of_measure, ${STOCK_SQL} AS stock
+       FROM products p
+       LEFT JOIN inventory i ON i.product_id = p.id AND i.location_id = $2
+       WHERE p.is_active = true AND (p.barcode = $1 OR p.sku ILIKE $1)
+       ORDER BY CASE WHEN p.barcode = $1 THEN 0 WHEN p.sku ILIKE $1 THEN 1 ELSE 2 END
+       LIMIT 1`,
+      [q, location_id],
+    );
+    let row = exact.rows[0];
+    if (!row) {
+      const fuzzy = await query(
+        `SELECT p.id, p.sku, p.name, p.barcode, p.retail_price, p.wholesale_price, p.distributor_price,
+          p.has_chilled_variant, p.chilled_price,
+          COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') AS unit_of_measure, ${STOCK_SQL} AS stock
+         FROM products p
+         LEFT JOIN inventory i ON i.product_id = p.id AND i.location_id = $2
+         WHERE p.is_active = true AND (p.name ILIKE $1 OR p.sku ILIKE $1 OR p.barcode ILIKE $1)
+         ORDER BY p.name LIMIT 1`,
+        [`%${q}%`, location_id],
+      );
+      row = fuzzy.rows[0];
+    }
+    if (!row) return res.status(404).json({ error: 'Product not found' });
+    const uoms = await loadProductUoms({ query }, row.id);
+    res.json(buildPriceInquiryRow(row, uoms));
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 export default router;

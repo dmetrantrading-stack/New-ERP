@@ -59,6 +59,10 @@ export function mapSqCopyToOrderItems(items: any[] = []) {
     tax_type: i.tax_type || 'VAT',
     vat_amount: i.vat_amount || 0,
     uom: i.uom || i.unit_of_measure || '',
+    uom_id: i.uom_id ?? null,
+    conversion_to_base: i.conversion_to_base ?? 1,
+    entered_qty: i.entered_qty ?? i.quantity,
+    base_qty: i.base_qty ?? i.quantity,
   }));
 }
 
@@ -140,6 +144,9 @@ export function mapSoItemsForDrGrid(items: any[] = []) {
     ...i,
     id: i.order_item_id || i.id,
     deliver_qty: parseFloat(i.remaining_qty || 0),
+    unit_of_measure: i.unit_of_measure || i.uom || '',
+    uom_id: i.uom_id ?? null,
+    conversion_to_base: i.conversion_to_base ?? 1,
   }));
 }
 
@@ -149,6 +156,9 @@ export function buildDrFormFromSoCopy(payload: any, autoSelectAll = true) {
     product_name: i.product_name || i.description || '',
     remaining: parseFloat(i.remaining_qty || 0),
     quantity: parseFloat(i.remaining_qty || 0),
+    uom_id: i.uom_id ?? null,
+    conversion_to_base: i.conversion_to_base ?? 1,
+    unit_of_measure: i.unit_of_measure || i.uom || '',
   }));
   return {
     so_id: payload.source_so_id || payload.order?.id || '',
@@ -199,7 +209,11 @@ export function buildInvoiceFormFromCopyPayload(
       location_id: i.location_id || 1,
       available_qty: 0,
       unit_cost: parseFloat(i.unit_cost || 0),
-      unit_of_measure: i.unit_of_measure || '',
+      unit_of_measure: i.unit_of_measure || i.uom || '',
+      uom_id: i.uom_id ?? null,
+      conversion_to_base: i.conversion_to_base ?? 1,
+      entered_qty: i.entered_qty ?? i.quantity,
+      base_qty: i.base_qty ?? i.quantity,
     })),
     invoiceTaxType: mapTaxTypeForInvoice(payload.invoice_tax_type || payload.tax_type),
     ewtRate: payload.ewt_rate || '0',
@@ -245,7 +259,11 @@ export async function enrichInvoiceItemsWithProducts(items: any[], products: any
       ...item,
       available_qty,
       unit_cost: product?.cost ?? item.unit_cost ?? 0,
-      unit_of_measure: product?.unit_of_measure || item.unit_of_measure || '',
+      unit_of_measure: item.unit_of_measure || item.uom || product?.unit_of_measure || 'pc',
+      uom_id: item.uom_id ?? null,
+      conversion_to_base: item.conversion_to_base ?? 1,
+      entered_qty: item.entered_qty ?? item.quantity,
+      base_qty: item.base_qty ?? item.quantity,
     });
   }
   return enriched;

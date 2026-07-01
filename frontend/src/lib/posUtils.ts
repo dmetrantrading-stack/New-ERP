@@ -1,4 +1,5 @@
 import { PRIMARY, FINANCE_FONT, financeTabClass } from './financeUtils';
+import { POS_SALES_NO_VAT } from './retailTaxPolicy';
 
 export { PRIMARY, FINANCE_FONT, financeTabClass };
 
@@ -18,7 +19,7 @@ export const THERMAL_PRINT_SERVER =
 /** Screen preview / browser print use Unicode ₱; thermal server converts to CP850 peso byte before printing. */
 
 export const THERMAL_PRINT_START_HINT =
-  'Thermal print bridge is not running on this PC. Double-click start-print-server.bat (in the project folder), or run: npm run start:print. Keep that window open while using POS — even when ERP is hosted online.';
+  'Thermal print bridge is not running on this PC. Double-click start-print-server.bat, or run install-print-server-autostart.bat once so it starts automatically at Windows login. Logs: logs\\print-server.log';
 
 export const PAYMENT_METHODS_UI = [
   { label: 'Cash', value: 'Cash' },
@@ -132,6 +133,31 @@ export type ReceiptPrintOpts = {
   paperSize?: number;
 };
 
+/** Map a POS transaction API payload to printable receipt data. */
+export function txnToReceiptData(txn: any, opts?: { cashierName?: string }): ReceiptData {
+  const items = (txn.items || []).map((i: any) => ({
+    name: i.description || i.name || 'Item',
+    quantity: parseFloat(i.sold_entered_qty ?? i.entered_qty ?? i.quantity) || 0,
+    unit_price: parseFloat(i.unit_price) || 0,
+    discount: parseFloat(i.discount || 0),
+    total: parseFloat(i.total) || 0,
+  }));
+  return {
+    transaction_number: txn.transaction_number,
+    date: new Date(txn.created_at),
+    items,
+    subtotal: parseFloat(txn.subtotal || 0),
+    totalDiscount: parseFloat(txn.discount_total || 0),
+    vat: parseFloat(txn.tax_total || 0),
+    netTotal: parseFloat(txn.total || 0),
+    paymentMethod: txn.payment_method || 'Cash',
+    tendered: parseFloat(txn.amount_tendered ?? txn.total ?? 0),
+    change: parseFloat(txn.change_amount || 0),
+    customerName: txn.customer_name || 'Walk-in',
+    priceMode: txn.price_mode,
+  };
+}
+
 export function buildReceiptText(r: ReceiptData, opts: ReceiptPrintOpts) {
   const W = paperChars(opts.paperSize);
   const ft = (v: number) => formatReceiptAmount(v);
@@ -165,9 +191,11 @@ export function buildReceiptText(r: ReceiptData, opts: ReceiptPrintOpts) {
   text += dash + '\n';
   text += leftRightText('Subtotal:', ft(r.subtotal), W) + '\n';
   if (r.totalDiscount > 0) text += leftRightText('Discount:', ft(r.totalDiscount), W) + '\n';
-  const vatableSales = r.netTotal - r.vat;
-  text += leftRightText('VATable Sales:', ft(vatableSales), W) + '\n';
-  text += leftRightText('VAT 12%:', ft(r.vat), W) + '\n';
+  if (!POS_SALES_NO_VAT) {
+    const vatableSales = r.netTotal - r.vat;
+    text += leftRightText('VATable Sales:', ft(vatableSales), W) + '\n';
+    text += leftRightText('VAT 12%:', ft(r.vat), W) + '\n';
+  }
   text += dash + '\n';
   text += leftRightText('TOTAL:', ft(r.netTotal), W) + '\n';
   text += leftRightText(`${r.paymentMethod}:`, ft(r.tendered), W) + '\n';
@@ -302,10 +330,20 @@ export function buildZReadingText(
 
 export const RECENT_PRODUCTS_KEY = 'pos_recent_products';
 
-export function pushRecentProduct(product: { id: string; name: string; sku?: string }) {
+export type RecentProductRecord = {
+  id: string;
+  name: string;
+  sku?: string;
+  unit_price?: number;
+  uom_code?: string;
+  stock?: number;
+  price_mode?: string;
+};
+
+export function pushRecentProduct(product: RecentProductRecord) {
   try {
     const raw = localStorage.getItem(RECENT_PRODUCTS_KEY);
-    const list: any[] = raw ? JSON.parse(raw) : [];
+    const list: RecentProductRecord[] = raw ? JSON.parse(raw) : [];
     const next = [product, ...list.filter((p) => p.id !== product.id)].slice(0, 8);
     localStorage.setItem(RECENT_PRODUCTS_KEY, JSON.stringify(next));
     return next;
@@ -314,7 +352,7 @@ export function pushRecentProduct(product: { id: string; name: string; sku?: str
   }
 }
 
-export function loadRecentProducts() {
+export function loadRecentProducts(): RecentProductRecord[] {
   try {
     const raw = localStorage.getItem(RECENT_PRODUCTS_KEY);
     return raw ? JSON.parse(raw) : [];

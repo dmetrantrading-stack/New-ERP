@@ -93,7 +93,7 @@ export async function repairDuplicateInvoiceCogs(
     const cogsLines = await db.query(
       `SELECT jel.id FROM journal_entry_lines jel
        JOIN chart_of_accounts coa ON coa.id = jel.account_id
-       WHERE jel.entry_id = $1 AND coa.account_code IN ('5110','5111','5112','5113','5114','5000','1200')`,
+       WHERE jel.entry_id = $1 AND coa.account_code IN ('5110','5111','5112','5113','5114','5115','5000','1200')`,
       [je.id],
     );
     for (const line of cogsLines.rows) {

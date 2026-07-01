@@ -2,8 +2,10 @@ import React from 'react';
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { useAuth } from './store/auth';
 import Layout from './components/layout/Layout';
+import PosShell from './components/layout/PosShell';
 import AccessDenied from './components/AccessDenied';
 import LoginPage from './pages/auth/LoginPage';
+import RegisterPage from './pages/auth/RegisterPage';
 import ExecutiveDashboard from './pages/dashboard/ExecutiveDashboard';
 import ProductsPage from './pages/products/ProductsPage';
 import StockOpsPage from './pages/stockOps/StockOpsPage';
@@ -22,7 +24,7 @@ import CollectionsPage from './pages/sales/CollectionsPage';
 import CustomerStatementDetail from './pages/sales/CustomerStatementDetail';
 import POSPage from './pages/pos/POSPage';
 import CustomerList from './pages/customers/CustomerList';
-import SupplierList from './pages/suppliers/SupplierList';
+import SuppliersPage from './pages/suppliers/SuppliersPage';
 import SupplierCatalogPage from './pages/suppliers/SupplierCatalogPage';
 import UserList from './pages/users/UserList';
 import AccountingPage from './pages/accounting/AccountingPage';
@@ -50,6 +52,14 @@ const ProtectedRoute = ({ children, perm, permAny }: { children: React.ReactNode
   return <Layout>{children}</Layout>;
 };
 
+const PosProtectedRoute = ({ children }: { children: React.ReactNode }) => {
+  const { user, loading, hasAnyPerm } = useAuth();
+  if (loading) return <div className="flex items-center justify-center h-screen"><div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600" /></div>;
+  if (!user) return <Navigate to="/login" />;
+  if (!hasAnyPerm(['pos.view', 'pos.write'])) return <Layout><AccessDenied /></Layout>;
+  return <PosShell>{children}</PosShell>;
+};
+
 function DefaultRedirect() {
   const { hasPerm, hasAnyPerm } = useAuth();
   return <Navigate to={getDefaultLandingPath(hasPerm, hasAnyPerm)} replace />;
@@ -61,6 +71,7 @@ export default function App() {
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />
+      <Route path="/register" element={<RegisterPage />} />
 
       <Route path="/" element={<ProtectedRoute perm={perm('dashboard.view')}><ExecutiveDashboard /></ProtectedRoute>} />
       <Route path="/products" element={<ProtectedRoute perm={perm('inventory.inventory.view')}><ProductsPage /></ProtectedRoute>} />
@@ -77,7 +88,7 @@ export default function App() {
       <Route path="/purchase-memos" element={<ProtectedRoute permAny={['purchases.apv.view', 'purchases.apv.create']}><PurchaseMemos /></ProtectedRoute>} />
       <Route path="/payables" element={<ProtectedRoute permAny={['purchases.apv.view', 'purchases.payment-voucher.view']}><PayablesPage /></ProtectedRoute>} />
 
-      <Route path="/pos" element={<ProtectedRoute permAny={['pos.view', 'pos.write']}><POSPage /></ProtectedRoute>} />
+      <Route path="/pos" element={<PosProtectedRoute><POSPage /></PosProtectedRoute>} />
       <Route path="/sales" element={<ProtectedRoute perm={perm('sales.sales-invoice.view')}><SalesInvoices /></ProtectedRoute>} />
       <Route path="/sales-returns" element={<ProtectedRoute perm={perm('sales.sales-invoice.view')}><SalesReturns /></ProtectedRoute>} />
       <Route path="/sales-memos" element={<ProtectedRoute perm={perm('sales.sales-invoice.view')}><SalesMemos /></ProtectedRoute>} />
@@ -88,7 +99,7 @@ export default function App() {
       <Route path="/customer-statement/:customerId" element={<ProtectedRoute perm={perm('sales.collections.view')}><CustomerStatementDetail /></ProtectedRoute>} />
       <Route path="/customers" element={<ProtectedRoute perm={perm('sales.customers.view')}><CustomerList /></ProtectedRoute>} />
 
-      <Route path="/suppliers" element={<ProtectedRoute perm={perm('purchases.suppliers.view')}><SupplierList /></ProtectedRoute>} />
+      <Route path="/suppliers" element={<ProtectedRoute perm={perm('purchases.suppliers.view')}><SuppliersPage /></ProtectedRoute>} />
       <Route path="/suppliers/:supplierId/catalog" element={<ProtectedRoute perm={perm('purchases.suppliers.view')}><SupplierCatalogPage /></ProtectedRoute>} />
 
       <Route path="/accounting" element={<ProtectedRoute perm={perm('finance.accounting.view')}><AccountingPage /></ProtectedRoute>} />

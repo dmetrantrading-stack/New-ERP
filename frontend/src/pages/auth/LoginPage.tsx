@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../store/auth';
 import { getLandingPathForUser } from '../../lib/defaultLandingPath';
 import {
@@ -51,8 +51,11 @@ export default function LoginPage() {
   const [fadeIn, setFadeIn] = useState(false);
   const [logoUrl, setLogoUrl] = useState<string | null>(null);
   const [businessName, setBusinessName] = useState('D METRAN TRADING');
+  const [registrationEnabled, setRegistrationEnabled] = useState(false);
   const { login, user } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
+  const registerState = location.state as { registeredUsername?: string; pendingApproval?: boolean } | null;
 
   useEffect(() => {
     setFadeIn(true);
@@ -68,6 +71,23 @@ export default function LoginPage() {
       })
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    fetch('/api/auth/register-config')
+      .then((r) => r.json())
+      .then((d) => setRegistrationEnabled(Boolean(d?.enabled)))
+      .catch(() => setRegistrationEnabled(false));
+  }, []);
+
+  useEffect(() => {
+    if (registerState?.registeredUsername) {
+      setUsername(registerState.registeredUsername);
+      if (registerState.pendingApproval) {
+        toast('Account created. Wait for administrator approval before signing in.', { duration: 8000 });
+      }
+      navigate('/login', { replace: true, state: null });
+    }
+  }, [registerState, navigate]);
 
   useEffect(() => {
     const savedUser = localStorage.getItem('remembered_user');
@@ -269,21 +289,24 @@ export default function LoginPage() {
                 )}
               </button>
 
-              <div className="flex items-center gap-3 py-1">
-                <span className="flex-1 h-px bg-gray-200" />
-                <span className="text-xs text-gray-400 uppercase">or</span>
-                <span className="flex-1 h-px bg-gray-200" />
-              </div>
+              {registrationEnabled && (
+                <>
+                  <div className="flex items-center gap-3 py-1">
+                    <span className="flex-1 h-px bg-gray-200" />
+                    <span className="text-xs text-gray-400 uppercase">or</span>
+                    <span className="flex-1 h-px bg-gray-200" />
+                  </div>
 
-              <button
-                type="button"
-                onClick={() => toast('New accounts are created by an administrator under Users.')}
-                className="w-full py-3.5 rounded-lg text-sm font-semibold flex items-center justify-center gap-2 border-2 transition-colors hover:bg-green-50"
-                style={{ borderColor: GREEN, color: GREEN_DARK }}
-              >
-                <UserPlus size={18} />
-                Register Account
-              </button>
+                  <Link
+                    to="/register"
+                    className="w-full py-3.5 rounded-lg text-sm font-semibold flex items-center justify-center gap-2 border-2 transition-colors hover:bg-green-50"
+                    style={{ borderColor: GREEN, color: GREEN_DARK }}
+                  >
+                    <UserPlus size={18} />
+                    Register Account
+                  </Link>
+                </>
+              )}
             </form>
           </div>
 

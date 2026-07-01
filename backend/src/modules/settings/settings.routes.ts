@@ -3,14 +3,51 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { query, getClient } from '../../config/database';
-import { authenticate, AuthRequest, hasUserPerm } from '../../middleware/auth';
+import { authenticate, AuthRequest, hasUserPerm, hasUserAnyPerm } from '../../middleware/auth';
 import { auditLog } from '../../middleware/audit';
 import { AppError } from '../../middleware/errorHandler';
 import { getInvoiceCopyMode, setInvoiceCopyMode, InvoiceCopyMode } from '../../utils/salesSettings';
 import { getAccountingLockDate, setAccountingLockDate } from '../../utils/periodLock';
 import { runOpeningBalanceImport } from '../../utils/openingBalanceImport';
+import { getRegistrationSettings, setRegistrationSettings } from '../../utils/registrationSettings';
+import { getLoyaltySettings, loyaltySettingsToApi, setLoyaltySettings } from '../../utils/loyaltySettings';
 
 const router = Router();
+
+const loyaltyView = hasUserAnyPerm(['system.settings.view', 'pos.view', 'pos.write']);
+
+router.get('/loyalty', authenticate, loyaltyView, async (_req: AuthRequest, res: Response) => {
+  try {
+    res.json(loyaltySettingsToApi(await getLoyaltySettings()));
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+router.put('/loyalty', authenticate, hasUserPerm('system.settings.edit'), auditLog('Settings', 'Update Loyalty'), async (req: AuthRequest, res: Response) => {
+  try {
+    const { enabled, earn_peso_per_point, redeem_peso_per_point } = req.body;
+    const payload: {
+      enabled?: boolean;
+      earn_peso_per_point?: number;
+      redeem_peso_per_point?: number;
+    } = {};
+    if (typeof enabled === 'boolean') payload.enabled = enabled;
+    if (earn_peso_per_point != null) {
+      const n = parseFloat(String(earn_peso_per_point));
+      if (!Number.isFinite(n) || n <= 0) {
+        return res.status(400).json({ error: 'earn_peso_per_point must be a positive number' });
+      }
+      payload.earn_peso_per_point = n;
+    }
+    if (redeem_peso_per_point != null) {
+      const n = parseFloat(String(redeem_peso_per_point));
+      if (!Number.isFinite(n) || n <= 0) {
+        return res.status(400).json({ error: 'redeem_peso_per_point must be a positive number' });
+      }
+      payload.redeem_peso_per_point = n;
+    }
+    res.json(loyaltySettingsToApi(await setLoyaltySettings(payload)));
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
 
 router.post('/reset-transactions', authenticate, hasUserPerm('system.settings.edit'), auditLog('Settings', 'Reset Transactions'), async (req: AuthRequest, res: Response) => {
   const client = await getClient();
@@ -230,6 +267,23 @@ router.put('/inventory-cost', authenticate, hasUserPerm('system.settings.edit'),
       auto_update_cost_from_rr: map.auto_update_cost_from_rr === 'true',
       auto_reprice_on_gr: map.auto_reprice_on_gr === 'true',
     });
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+router.get('/registration', authenticate, async (_req: AuthRequest, res: Response) => {
+  try {
+    res.json(await getRegistrationSettings());
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
+});
+
+router.put('/registration', authenticate, hasUserPerm('system.settings.edit'), auditLog('Settings', 'Update Registration'), async (req: AuthRequest, res: Response) => {
+  try {
+    const { enabled, require_approval, default_role } = req.body;
+    const payload: Partial<{ enabled: boolean; require_approval: boolean; default_role: string }> = {};
+    if (typeof enabled === 'boolean') payload.enabled = enabled;
+    if (typeof require_approval === 'boolean') payload.require_approval = require_approval;
+    if (typeof default_role === 'string' && default_role.trim()) payload.default_role = default_role.trim();
+    res.json(await setRegistrationSettings(payload));
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 

@@ -26,15 +26,18 @@ export async function fetchGrCopyToApv(grId: string) {
 export function buildReceiveFormFromPo(po: any) {
   const items = (po.items || [])
     .map((i: any) => {
-      const remaining = parseFloat(i.quantity) - parseFloat(i.received_quantity || 0);
+      const orderedQty = parseFloat(i.entered_qty ?? i.quantity);
+      const remaining = orderedQty - parseFloat(i.received_quantity || 0);
       if (remaining <= 0) return null;
       return {
         po_item_id: i.id,
         product_id: i.product_id,
         product_name: i.product_name,
         sku: i.sku,
-        unit_of_measure: i.unit_of_measure || 'pc',
-        ordered_qty: parseFloat(i.quantity),
+        unit_of_measure: i.uom_code || i.unit_of_measure || 'pc',
+        uom_id: i.uom_id || null,
+        conversion_to_base: parseFloat(i.conversion_to_base) || 1,
+        ordered_qty: orderedQty,
         already_received: parseFloat(i.received_quantity || 0),
         quantity: remaining,
         unit_cost: i.unit_cost,
@@ -79,7 +82,9 @@ export function buildApvFormFromCopy(payload: any) {
       product_id: i.product_id,
       description: i.description || i.product_name || '',
       qty: parseFloat(i.qty ?? i.quantity ?? 1),
-      uom: i.uom || i.unit_of_measure || 'pc',
+      uom: (i.uom || i.unit_of_measure || 'pc').toUpperCase(),
+      uom_id: i.uom_id || null,
+      conversion_to_base: i.conversion_to_base || 1,
       unit_cost: parseFloat(i.unit_cost || 0),
       discount_amount: parseFloat(i.discount_amount || 0),
       tax_type: i.tax_type || 'VAT',
@@ -123,10 +128,12 @@ export function buildPoFormFromPrCopy(payload: any) {
       quantity: i.quantity,
       unit_cost: i.unit_cost || 0,
       unit_of_measure: i.unit_of_measure || 'pc',
+      uom_id: i.uom_id || null,
+      conversion_to_base: i.conversion_to_base || 1,
+      base_qty: i.base_qty,
       discount_type: '%',
       discount_value: '0',
       tax_type: i.tax_type || 'VAT',
-      location_id: 1,
     })),
     vat_mode: 'VAT Inclusive',
     payment_terms: '',
@@ -153,12 +160,13 @@ export function buildPoFormFromSupplierCatalog(payload: any) {
       product_name: i.product_name,
       sku: i.sku,
       quantity: i.quantity,
-      unit_cost: i.unit_cost || 0,
+      unit_cost: parseFloat(String(i.unit_cost)) || 0,
       unit_of_measure: i.unit_of_measure || 'pc',
+      uom_id: i.uom_id || null,
+      conversion_to_base: i.conversion_to_base || 1,
       discount_type: '%',
       discount_value: '0',
       tax_type: i.tax_type || 'VAT',
-      location_id: 1,
     })),
     vat_mode: 'VAT Inclusive',
     payment_terms: payload.payment_terms || '',

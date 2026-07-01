@@ -60,6 +60,8 @@ const seed = async () => {
       { code: '4012', name: 'Sales - Pork Meat', type: 'Income' },
       { code: '4013', name: 'Sales - Beef Meat', type: 'Income' },
       { code: '4014', name: 'Sales - Frozen Foods', type: 'Income' },
+      { code: '4015', name: 'Sales - Rice', type: 'Income' },
+      { code: '4050', name: 'Sales Discounts - Loyalty', type: 'Income' },
       { code: '4100', name: 'Service Income', type: 'Income' },
       { code: '4200', name: 'Other Income', type: 'Income' },
       { code: '4500', name: 'Employee Sales', type: 'Income' },
@@ -70,6 +72,7 @@ const seed = async () => {
       { code: '5112', name: 'Cost of Sales - Pork Meat', type: 'Cost of Goods Sold' },
       { code: '5113', name: 'Cost of Sales - Beef Meat', type: 'Cost of Goods Sold' },
       { code: '5114', name: 'Cost of Sales - Frozen Foods', type: 'Cost of Goods Sold' },
+      { code: '5115', name: 'Cost of Sales - Rice', type: 'Cost of Goods Sold' },
       { code: '5010', name: 'Purchase Discounts', type: 'Cost of Goods Sold' },
       { code: '5020', name: 'Inventory Adjustments', type: 'Cost of Goods Sold' },
       // Expenses
@@ -154,6 +157,12 @@ const seed = async () => {
       { key: 'pos_default_mode', value: 'Retail' },
       { key: 'enable_negative_inventory', value: 'false' },
       { key: 'invoice_copy_mode', value: 'delivered' },
+      { key: 'allow_self_registration', value: 'true' },
+      { key: 'registration_require_approval', value: 'true' },
+      { key: 'registration_default_role', value: 'Cashier' },
+      { key: 'loyalty_enabled', value: 'true' },
+      { key: 'loyalty_earn_peso_per_point', value: '1' },
+      { key: 'loyalty_redeem_peso_per_point', value: '1' },
     ];
     for (const s of settings) {
       await client.query(

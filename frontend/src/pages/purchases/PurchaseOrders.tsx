@@ -4,6 +4,7 @@ import api from '../../lib/api';
 import { formatCurrency, formatDate } from '../../lib/utils';
 import { Plus, Eye, Send, ArrowLeft, Edit2, Printer, Package, FileText } from 'lucide-react';
 import ProductAutocomplete from '../../components/ProductAutocomplete';
+import SupplierAutocomplete, { formatSupplierLabel } from '../../components/SupplierAutocomplete';
 import DocumentNotesTermsPanel from '../../components/DocumentNotesTermsPanel';
 import { ATTACHMENT_REF } from '../../lib/documentAttachments';
 import Pagination from '../../components/Pagination';
@@ -13,6 +14,7 @@ import { navigateReceiveFromPo, navigateApvFromPo, fetchPrCopyToPo, buildPoFormF
 import { printDocument } from '../../lib/printDocument';
 import { beginCopyNavigation, endCopyNavigation } from '../../lib/copyNavigationGuard';
 import { calculatePurchaseTax, lineTaxTypeFromProduct, normalizePurchaseCostBasis, PURCHASE_TAX_TYPE_OPTIONS } from '../../lib/purchaseTax';
+import { convertToBaseQty, resolvePurchaseUom, resolvePurchaseUomFromLine, convertUnitCostToUom } from '../../lib/uomUtils';
 
 const PRIMARY = '#1E40AF';
 
@@ -34,7 +36,6 @@ export default function PurchaseOrders() {
   const [orders, setOrders] = useState<any[]>([]);
   const [products, setProducts] = useState<any[]>([]);
   const [suppliers, setSuppliers] = useState<any[]>([]);
-  const [locations, setLocations] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
   const [viewing, setViewing] = useState(false);
@@ -77,23 +78,20 @@ export default function PurchaseOrders() {
     loadOrders();
     loadPendingReceiveTotal();
     api.get('/products?limit=500').then((res) => setProducts(res.data.data || [])).catch(() => {});
-    api.get('/suppliers').then((res) => setSuppliers(res.data.data || [])).catch(() => {});
-    api.get('/inventory/locations').then((r) => setLocations(r.data || [])).catch(() => {
-      setLocations([{ id: 1, name: 'Store' }, { id: 2, name: 'Warehouse' }]);
-    });
   }, [page, supplierFilter, statusFilter]);
 
   useEffect(() => {
-    if (supplierFilter && suppliers.length) selectSupplier(supplierFilter);
-  }, [supplierFilter, suppliers]);
+    if (supplierFilter) selectSupplier(supplierFilter);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [supplierFilter]);
 
   useEffect(() => {
     const sid = form.supplier_id;
-    if (!sid || !suppliers.length) return;
+    if (!sid) return;
     if (String(selectedSupplier?.id) === String(sid)) return;
     selectSupplier(String(sid));
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [form.supplier_id, suppliers]);
+  }, [form.supplier_id]);
 
   useEffect(() => {
     const prId = searchParams.get('copy_from_pr');
@@ -102,9 +100,13 @@ export default function PurchaseOrders() {
     if (!beginCopyNavigation(copyKey)) return;
     setSearchParams({}, { replace: true });
     fetchPrCopyToPo(prId)
-      .then((payload) => {
+      .then(async (payload) => {
         const built = buildPoFormFromPrCopy(payload);
-        setForm((prev: any) => ({ ...prev, ...built }));
+        const items = await Promise.all((built.items || []).map(async (i: any) => {
+          const uoms = i.product_id ? await loadLineUoms(i.product_id) : [];
+          return applyUomToLine({ ...i, quantity: i.quantity }, uoms, i.uom_id);
+        }));
+        setForm((prev: any) => ({ ...prev, ...built, items }));
         setCreating(true);
         setAutoFocusItem(true);
       })
@@ -123,9 +125,28 @@ export default function PurchaseOrders() {
     if (!beginCopyNavigation(copyKey)) return;
     setSearchParams({}, { replace: true });
     fetchSupplierCatalogCopyToPo(supplierId, productIds)
-      .then((payload) => {
+      .then(async (payload) => {
         const built = buildPoFormFromSupplierCatalog(payload);
-        setForm((prev: any) => ({ ...prev, ...built }));
+        const items = await Promise.all((built.items || []).map(async (i: any) => {
+          const uoms = i.product_id ? await loadLineUoms(i.product_id) : [];
+          const catalogCost = parseFloat(String(i.unit_cost));
+          const catalogUomId = i.uom_id ?? null;
+          const catalogUom = i.unit_of_measure || 'pc';
+          const catalogConv = parseFloat(String(i.conversion_to_base)) || 1;
+          return {
+            ...i,
+            quantity: i.quantity,
+            uoms,
+            unit_cost: catalogCost,
+            uom_id: catalogUomId,
+            unit_of_measure: catalogUom,
+            conversion_to_base: catalogConv,
+            discount_type: i.discount_type || '%',
+            discount_value: i.discount_value || '0',
+            tax_type: i.tax_type || 'VAT',
+          };
+        }));
+        setForm((prev: any) => ({ ...prev, ...built, items }));
         if (built.supplier_id) selectSupplier(String(built.supplier_id));
         setCreating(true);
         setAutoFocusItem(true);
@@ -140,27 +161,66 @@ export default function PurchaseOrders() {
     catch { return []; }
   };
 
+  const searchSuppliers = async (q: string) => {
+    try {
+      const res = await api.get(`/suppliers?search=${encodeURIComponent(q)}&limit=20`);
+      return res.data.data || [];
+    } catch {
+      return [];
+    }
+  };
+
   const blankLineItem = () => ({
-    product_id: '', location_id: locations[0]?.id || 1,
+    product_id: '',
     quantity: 1, unit_cost: 0, unit_of_measure: '', available_qty: 0,
     discount_type: '%', discount_value: '0', tax_type: 'VAT',
+    uoms: [] as any[], uom_id: null as number | null,
   });
 
-  const selectSupplier = (supplierId: string) => {
-    if (!supplierId) {
-      setSelectedSupplier(null);
-      setAutoFocusItem(false);
-      setForm((prev: any) => ({ ...prev, supplier_id: '', supplier_name: '' }));
-      return;
+  const lineBaseQty = (item: any) => {
+    const uom = resolvePurchaseUom(item.uoms || [], item.uom_id, null);
+    return convertToBaseQty(parseFloat(String(item.quantity || 0)), uom?.conversion_to_base || 1);
+  };
+
+  const loadLineUoms = async (productId: string | number) => {
+    try {
+      const res = await api.get(`/products/${productId}/uoms`);
+      return res.data || [];
+    } catch {
+      return [];
     }
-    const s = suppliers.find((x) => String(x.id) === supplierId);
-    if (!s) return;
+  };
+
+  const applyUomToLine = (line: any, uoms: any[], uomId?: number | null) => {
+    const uom = resolvePurchaseUomFromLine(
+      uoms,
+      { ...line, uom_id: uomId ?? line.uom_id },
+      null,
+    ) || resolvePurchaseUom(uoms, uomId ?? line.uom_id, null);
+    const next = { ...line, uoms };
+    if (!uom) return next;
+    const existingCost = parseFloat(String(line.unit_cost));
+    const uomPrice = parseFloat(String(uom.purchase_price)) || 0;
+    return {
+      ...next,
+      uom_id: uom.uom_id,
+      unit_of_measure: uom.uom_code || line.unit_of_measure || 'pc',
+      conversion_to_base: parseFloat(String(uom.conversion_to_base)) || parseFloat(String(line.conversion_to_base)) || 1,
+      unit_cost: existingCost > 0 ? existingCost : uomPrice,
+    };
+  };
+
+  const applySupplier = (s: any) => {
+    setSuppliers((prev) => (
+      prev.some((x) => String(x.id) === String(s.id)) ? prev : [...prev, s]
+    ));
     setSelectedSupplier(s);
     setForm((prev: any) => {
       const next = {
         ...prev,
         supplier_id: s.id,
         supplier_name: s.supplier_name,
+        supplier_code: s.supplier_code || '',
         payment_terms: prev.payment_terms || s.payment_terms || '',
       };
       if (prev.items.length === 0) {
@@ -171,28 +231,58 @@ export default function PurchaseOrders() {
     });
   };
 
+  const selectSupplier = (supplierId: string, supplier?: any) => {
+    if (!supplierId) {
+      setSelectedSupplier(null);
+      setAutoFocusItem(false);
+      setForm((prev: any) => ({ ...prev, supplier_id: '', supplier_name: '', supplier_code: '' }));
+      return;
+    }
+    const s = supplier || suppliers.find((x) => String(x.id) === supplierId);
+    if (s) {
+      applySupplier(s);
+      return;
+    }
+    api.get(`/suppliers/${supplierId}`)
+      .then((res) => applySupplier(res.data))
+      .catch(() => toast.error('Failed to load supplier'));
+  };
+
   const addItem = () => {
     setForm({
       ...form,
-      items: [...form.items, {
-        product_id: '', location_id: locations[0]?.id || 1,
-        quantity: 1, unit_cost: 0, unit_of_measure: '', available_qty: 0,
-        discount_type: '%', discount_value: '0', tax_type: 'VAT',
-      }],
+      items: [...form.items, blankLineItem()],
     });
   };
 
-  const updateItem = (index: number, field: string, value: any) => {
+  const updateItem = async (index: number, field: string, value: any) => {
     const items = [...form.items];
     items[index][field] = value;
     if (field === 'product_id' && value) {
       const product = products.find((p) => p.id === value);
       if (product) {
-        items[index].unit_cost = product.cost || 0;
         items[index].product_name = product.name;
         items[index].sku = product.sku;
-        items[index].unit_of_measure = product.unit_of_measure || 'pc';
         items[index].tax_type = lineTaxTypeFromProduct(product);
+        const uoms = await loadLineUoms(value);
+        Object.assign(items[index], applyUomToLine(items[index], uoms));
+      }
+    }
+    if (field === 'uom_id' && value) {
+      const prevUom = resolvePurchaseUom(items[index].uoms || [], items[index].uom_id, null);
+      const prevConv = parseFloat(String(items[index].conversion_to_base))
+        || parseFloat(String(prevUom?.conversion_to_base))
+        || 1;
+      const prevCost = parseFloat(String(items[index].unit_cost)) || 0;
+      const uom = resolvePurchaseUom(items[index].uoms || [], parseInt(String(value), 10), null);
+      if (uom) {
+        const newConv = parseFloat(String(uom.conversion_to_base)) || 1;
+        items[index].uom_id = uom.uom_id;
+        items[index].unit_of_measure = uom.uom_code || 'pc';
+        items[index].conversion_to_base = newConv;
+        items[index].unit_cost = prevCost > 0
+          ? convertUnitCostToUom(prevCost, prevConv, newConv)
+          : parseFloat(String(uom.purchase_price)) || 0;
       }
     }
     setForm({ ...form, items });
@@ -247,30 +337,37 @@ export default function PurchaseOrders() {
     try {
       const res = await api.get(`/purchases/orders/${poId}`);
       const po = res.data;
+      const items = await Promise.all((po.items || []).map(async (i: any) => {
+        const uoms = i.product_id ? await loadLineUoms(i.product_id) : [];
+        const uom = resolvePurchaseUom(uoms, i.uom_id, null);
+        return {
+          product_id: i.product_id,
+          quantity: i.entered_qty ?? i.quantity,
+          unit_cost: i.unit_cost,
+          discount_type: i.discount_type || '%',
+          discount_value: i.discount_value || 0,
+          tax_type: i.tax_type || 'VAT',
+          uom_id: i.uom_id || uom?.uom_id || null,
+          unit_of_measure: i.uom_code || i.unit_of_measure || uom?.uom_code || 'pc',
+          uoms,
+          product_name: i.product_name,
+          sku: i.sku,
+          available_qty: 0,
+        };
+      }));
       setEditingPO(po);
       setForm({
         supplier_id: String(po.supplier_id || ''),
+        supplier_name: po.supplier_name || '',
+        supplier_code: po.supplier_code || '',
         expected_date: po.expected_date || new Date().toISOString().split('T')[0],
         notes: po.notes || '',
         terms_conditions: po.terms_conditions || '',
         vat_mode: normalizePurchaseCostBasis(po.vat_mode),
         payment_terms: po.payment_terms || '',
-        items: (po.items || []).map((i: any) => ({
-          product_id: i.product_id,
-          quantity: i.quantity,
-          unit_cost: i.unit_cost,
-          discount_type: i.discount_type || '%',
-          discount_value: i.discount_value || 0,
-          tax_type: i.tax_type || 'VAT',
-          location_id: i.location_id || locations[0]?.id || 1,
-          unit_of_measure: i.unit_of_measure || 'pc',
-          product_name: i.product_name,
-          sku: i.sku,
-          available_qty: 0,
-        })),
+        items,
       });
-      const supplier = suppliers.find((s: any) => String(s.id) === String(po.supplier_id));
-      if (supplier) setSelectedSupplier(supplier);
+      if (po.supplier_id) selectSupplier(String(po.supplier_id));
       setCreating(true);
     } catch { toast.error('Failed to load PO for editing'); }
   };
@@ -293,15 +390,23 @@ export default function PurchaseOrders() {
         terms_conditions: form.terms_conditions,
         vat_mode: costBasis,
         payment_terms: form.payment_terms,
-        items: items.map((i: any) => ({
-          product_id: i.product_id,
-          quantity: parseFloat(String(i.quantity)),
-          unit_cost: parseFloat(String(i.unit_cost)),
-          discount_type: i.discount_type || '%',
-          discount_value: parseFloat(String(i.discount_value)) || 0,
-          tax_type: i.tax_type || 'VAT',
-          location_id: i.location_id,
-        })),
+        items: items.map((i: any) => {
+          const uom = resolvePurchaseUom(i.uoms || [], i.uom_id, null);
+          const enteredQty = parseFloat(String(i.quantity));
+          const conversion = uom?.conversion_to_base || 1;
+          return {
+            product_id: i.product_id,
+            quantity: enteredQty,
+            entered_qty: enteredQty,
+            uom_id: i.uom_id || uom?.uom_id || null,
+            conversion_to_base: conversion,
+            base_qty: convertToBaseQty(enteredQty, conversion),
+            unit_cost: parseFloat(String(i.unit_cost)),
+            discount_type: i.discount_type || '%',
+            discount_value: parseFloat(String(i.discount_value)) || 0,
+            tax_type: i.tax_type || 'VAT',
+          };
+        }),
       };
       if (form.pr_id && !editingPO) payload.pr_id = form.pr_id;
       if (editingPO) {
@@ -367,6 +472,11 @@ export default function PurchaseOrders() {
   }, [creating, form]);
 
   const totalQty = form.items.reduce((s: number, i: any) => s + (parseFloat(String(i.quantity)) || 0), 0);
+  const totalBaseQty = form.items.reduce((s: number, i: any) => s + (i.product_id ? lineBaseQty(i) : 0), 0);
+  const hasMultiUomLines = form.items.some((i: any) => {
+    const uom = resolvePurchaseUom(i.uoms || [], i.uom_id, null);
+    return i.product_id && (uom?.conversion_to_base || 1) > 1;
+  });
 
   // ========== VIEW ==========
   if (viewing && viewedPO) {
@@ -440,11 +550,23 @@ export default function PurchaseOrders() {
             <div className="grid grid-cols-2 gap-3">
               <div className="bg-white border border-gray-200 rounded-lg p-3 space-y-2">
                 <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">1 · Supplier</div>
-                <select value={form.supplier_id} onChange={(e) => selectSupplier(e.target.value)} disabled={docStatus !== 'Draft'}
-                  className="w-full px-2.5 py-1.5 border border-gray-300 rounded text-xs disabled:bg-gray-50">
-                  <option value="">Select Supplier</option>
-                  {suppliers.map((s: any) => <option key={s.id} value={s.id}>{s.supplier_name}</option>)}
-                </select>
+                <SupplierAutocomplete
+                  suppliers={suppliers}
+                  value={String(form.supplier_id || '')}
+                  selectedName={
+                    formatSupplierLabel(selectedSupplier)
+                    || formatSupplierLabel(form)
+                    || form.supplier_name
+                    || ''
+                  }
+                  onSelect={(s) => {
+                    if (!s?.id) selectSupplier('');
+                    else selectSupplier(String(s.id), s);
+                  }}
+                  searchFn={searchSuppliers}
+                  disabled={docStatus !== 'Draft'}
+                  placeholder="Search supplier name or code…"
+                />
                 {selectedSupplier && (
                   <div className="grid grid-cols-2 gap-1.5 text-[10px] text-gray-500">
                     <div className="bg-gray-50 rounded p-1.5 col-span-2"><span className="text-gray-400 block">Address</span>{selectedSupplier.address || '—'}</div>
@@ -496,10 +618,10 @@ export default function PurchaseOrders() {
                     <tr className="bg-gray-50 text-[9px] font-semibold text-gray-500 uppercase">
                       <th className="px-2 py-2 w-5">#</th>
                       <th className="px-2 py-2 text-left">Product</th>
-                      <th className="px-2 py-2 w-20">Location</th>
                       <th className="px-2 py-2 text-center w-16">Qty</th>
-                      <th className="px-2 py-2 text-center w-12">UOM</th>
-                      <th className="px-2 py-2 text-right w-20">Cost</th>
+                      <th className="line-uom-col px-2 py-2 text-center">UOM</th>
+                      <th className="px-2 py-2 text-center w-16">= Base</th>
+                      <th className="px-2 py-2 text-right w-20">Cost/UOM</th>
                       <th className="px-2 py-2 text-center w-16">Disc</th>
                       <th className="px-2 py-2 text-center w-16">Tax</th>
                       <th className="px-2 py-2 text-right w-20">Net</th>
@@ -510,6 +632,8 @@ export default function PurchaseOrders() {
                     {form.items.map((item: any, i: number) => {
                       const product = products.find((p) => p.id === item.product_id);
                       const lineTotal = computeLineTotal(item);
+                      const uom = resolvePurchaseUom(item.uoms || [], item.uom_id, null);
+                      const basePreview = lineBaseQty(item);
                       return (
                         <tr key={i} className="hover:bg-blue-50/30">
                           <td className="px-2 py-1.5 text-gray-400">{i + 1}</td>
@@ -520,19 +644,18 @@ export default function PurchaseOrders() {
                               selectedName={product ? product.name : item.product_name || ''}
                               placeholder="Search product…"
                               getPrice={(p) => p.cost || 0}
-                              onSelect={(p) => {
+                              onSelect={async (p) => {
                                 if (!products.find((x) => x.id === p.id)) setProducts((prev) => [...prev, p]);
+                                const uoms = await loadLineUoms(p.id);
                                 setForm((prev) => {
                                   const items = [...prev.items];
-                                  items[i] = {
+                                  items[i] = applyUomToLine({
                                     ...items[i],
                                     product_id: p.id,
-                                    unit_cost: p.cost || 0,
                                     product_name: p.name,
                                     sku: p.sku,
-                                    unit_of_measure: p.unit_of_measure || 'pc',
                                     tax_type: lineTaxTypeFromProduct(p),
-                                  };
+                                  }, uoms);
                                   if (i === prev.items.length - 1) {
                                     setTimeout(() => setForm((p2) => ({ ...p2, items: [...p2.items, blankLineItem()] })), 100);
                                   }
@@ -543,18 +666,29 @@ export default function PurchaseOrders() {
                               searchFn={searchProducts}
                               autoFocus={autoFocusItem && i === 0}
                             />
-                          </td>
-                          <td className="px-2 py-1.5">
-                            <select value={item.location_id} onChange={(e) => updateItem(i, 'location_id', parseInt(e.target.value))}
-                              className="w-full px-1 py-1 border border-gray-200 rounded text-[10px]">
-                              {locations.map((l: any) => <option key={l.id} value={l.id}>{l.name}</option>)}
-                            </select>
+                            {(item.sku || product?.sku) && (
+                              <div className="text-[9px] text-gray-400 font-mono mt-0.5">{item.sku || product?.sku}</div>
+                            )}
                           </td>
                           <td className="px-2 py-1.5">
                             <input type="number" step="any" value={item.quantity} onChange={(e) => updateItem(i, 'quantity', e.target.value)}
                               className="w-full px-1 py-1 border border-gray-200 rounded text-center text-xs" min="1" />
                           </td>
-                          <td className="px-2 py-1.5 text-center text-gray-500">{item.unit_of_measure || 'pc'}</td>
+                          <td className="line-uom-col px-2 py-1.5 text-center">
+                            {(item.uoms?.length || 0) > 1 ? (
+                              <select value={item.uom_id || ''} onChange={(e) => updateItem(i, 'uom_id', parseInt(e.target.value, 10))}
+                                className="line-uom-select px-1 py-1 border border-gray-200 rounded text-[10px] uppercase">
+                                {(item.uoms || []).map((u: any) => (
+                                  <option key={u.uom_id} value={u.uom_id}>{(u.uom_code || '').toUpperCase()}</option>
+                                ))}
+                              </select>
+                            ) : (
+                              <span className="text-xs uppercase text-gray-600">{(uom?.uom_code || item.unit_of_measure || 'pc').toUpperCase()}</span>
+                            )}
+                          </td>
+                          <td className="px-2 py-1.5 text-center text-xs text-gray-600">
+                            {item.product_id && parseFloat(String(item.quantity) || '0') > 0 ? `${basePreview} pc` : '—'}
+                          </td>
                           <td className="px-2 py-1.5">
                             <input type="number" step="0.01" value={item.unit_cost} onChange={(e) => updateItem(i, 'unit_cost', e.target.value)}
                               className="w-full px-1 py-1 border border-gray-200 rounded text-right text-xs" />
@@ -611,6 +745,9 @@ export default function PurchaseOrders() {
               <div className="space-y-1.5 text-xs">
                 <div className="flex justify-between"><span className="text-gray-500">Items</span><span>{totals.itemCount}</span></div>
                 <div className="flex justify-between"><span className="text-gray-500">Total Qty</span><span>{totalQty}</span></div>
+                {hasMultiUomLines && (
+                  <div className="flex justify-between"><span className="text-gray-500">Total Base Qty</span><span>{totalBaseQty} pc</span></div>
+                )}
                 <div className="flex justify-between"><span className="text-gray-500">Gross</span><span>{formatCurrency(totals.gross)}</span></div>
                 {totals.lineDiscount > 0 && <div className="flex justify-between text-red-600"><span>Discount</span><span>-{formatCurrency(totals.lineDiscount)}</span></div>}
                 <div className="flex justify-between"><span className="text-gray-500">Net Subtotal</span><span>{formatCurrency(totals.net)}</span></div>

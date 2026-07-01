@@ -5,6 +5,10 @@ import { auditLog } from '../../middleware/audit';
 import { v4 as uuidv4 } from 'uuid';
 import { calculateInvoiceItems, resolveInvoiceEwtRate } from '../../utils/invoiceTax';
 import {
+  normalizeRetailInvoiceItems,
+  resolveRetailInvoiceTaxType,
+} from '../../utils/retailTaxPolicy';
+import {
   aggregateByAccountCode,
   aggregateGlCogsByAccountCode,
   insertCogsInventoryLines,
@@ -22,6 +26,16 @@ import { deductInventoryFefo } from '../../utils/batchFefo';
 import { auditAfter, auditBefore, auditSnapshot, AUDIT_FIELDS } from '../../utils/auditHelpers';
 import { AppError } from '../../middleware/errorHandler';
 import { assertPeriodNotLocked } from '../../utils/periodLock';
+import {
+  convertToBaseQty,
+  formatInsufficientStockMessage,
+  lineItemBaseQty,
+  lineItemCogsGross,
+  resolveSalesLineUom,
+  resolveSalesLineUomFromRaw,
+} from '../../utils/uom';
+import { loadProductUoms } from '../../utils/productUomDb';
+import { enrichSalesPrintLineUoms } from '../../utils/salesPrintUom';
 import {
   tableRow, renderEnterpriseNotesBlock, renderEnterpriseSectionTitle,
   renderEnterpriseAgingRow, renderEnterpriseTotalBanner, fmtCurrency, fmtDate,
@@ -48,6 +62,39 @@ const generateRefNumber = async (prefix: string, table: string, column: string):
   return `${safePrefix}-${String(result.rows[0]?.next || 1).padStart(5, '0')}`;
 };
 
+async function enrichInvoiceItemsWithUom(
+  db: { query: (text: string, params?: any[]) => Promise<{ rows: any[] }> },
+  invoiceItems: any[],
+  rawItems: any[],
+): Promise<void> {
+  for (let i = 0; i < invoiceItems.length; i++) {
+    const raw = rawItems[i] || {};
+    const prod = await db.query('SELECT default_sales_uom_id FROM products WHERE id = $1', [invoiceItems[i].product_id]);
+    const uomRows = await loadProductUoms(db, invoiceItems[i].product_id);
+    const uom = resolveSalesLineUomFromRaw(uomRows, {
+      uom_id: raw.uom_id,
+      conversion_to_base: raw.conversion_to_base,
+      entered_qty: raw.entered_qty,
+      quantity: raw.quantity ?? invoiceItems[i].quantity,
+      base_qty: raw.base_qty,
+      uom: raw.uom_code,
+      unit_of_measure: raw.unit_of_measure,
+      unit_price: raw.unit_price ?? invoiceItems[i].unit_price,
+    }, prod.rows[0]?.default_sales_uom_id);
+    const enteredQty = parseFloat(String(raw.entered_qty ?? raw.quantity ?? invoiceItems[i].quantity)) || 0;
+    const conversionToBase = uom?.conversion_to_base || parseFloat(raw.conversion_to_base) || 1;
+    const baseQty = raw.base_qty != null
+      ? parseFloat(raw.base_qty) || 0
+      : convertToBaseQty(enteredQty, conversionToBase);
+    invoiceItems[i].quantity = enteredQty;
+    invoiceItems[i].uom_id = uom?.uom_id || raw.uom_id || null;
+    invoiceItems[i].entered_qty = enteredQty;
+    invoiceItems[i].conversion_to_base = conversionToBase;
+    invoiceItems[i].base_qty = baseQty;
+    invoiceItems[i].uom_code = uom?.uom_code;
+  }
+}
+
 const generateInvoiceNumber = async (): Promise<string> => {
   const year = new Date().getFullYear();
   const prefix = `SI-${year}-`;
@@ -72,9 +119,20 @@ router.post('/invoices', authenticate, hasUserPerm('sales.sales-invoice.create')
     const ewtPercent = parseFloat(ewt_rate || '0');
     const isEmployee = customer_type === 'Employee';
     const effectivePaymentMethod = isEmployee ? 'Salary Deduction' : (payment_method || 'Cash');
+    const effectiveInvoiceTaxType = resolveRetailInvoiceTaxType(invoice_tax_type, {
+      customer_type,
+      payment_method: effectivePaymentMethod,
+      employee_id,
+    });
+    const effectiveEwtPercent = isEmployee ? 0 : ewtPercent;
 
     const id = uuidv4();
-    const { lines: invoiceItems, totals } = calculateInvoiceItems(items || [], ewtPercent, invoice_tax_type || 'VAT');
+    const { lines: invoiceItems, totals } = calculateInvoiceItems(
+      normalizeRetailInvoiceItems(items || [], effectiveInvoiceTaxType),
+      effectiveEwtPercent,
+      effectiveInvoiceTaxType,
+    );
+    await enrichInvoiceItemsWithUom({ query }, invoiceItems, items || []);
     const {
       subtotal, totalDiscount, totalVat, totalLguTax, totalWht,
       totalVatableSales, totalVatExemptSales, totalZeroRatedSales, netRevenue,
@@ -96,7 +154,7 @@ router.post('/invoices', authenticate, hasUserPerm('sales.sales-invoice.create')
          $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)`,
       [id, invoice_number, isEmployee ? null : customer_id, customer_name, customer_type || 'Customer', isEmployee ? employee_id : null,
         price_mode || 'Retail', due_date, effectivePaymentMethod, payment_terms,
-        notes, terms_conditions || null, subtotal, discountAmount, totalVat, invoice_tax_type || 'VAT',
+        notes, terms_conditions || null, subtotal, discountAmount, totalVat, effectiveInvoiceTaxType,
         finalTotal, amount_tendered || 0, finalTotal - (amount_tendered || 0),
         totalVatableSales, totalVatExemptSales, totalZeroRatedSales, totalVat, totalLguTax, totalWht, ewtPercent, so_id || null, dn_id || null,
         req.user!.id, req.user!.id]
@@ -105,6 +163,7 @@ router.post('/invoices', authenticate, hasUserPerm('sales.sales-invoice.create')
     for (const item of invoiceItems) {
       const itemId = uuidv4();
       const locId = item.location_id || 1;
+      const baseQty = lineItemBaseQty(item);
 
       // Get cost from inventory (always, even when skipping deduction)
       const inv = await query('SELECT * FROM inventory WHERE product_id = $1 AND location_id = $2', [item.product_id, locId]);
@@ -116,8 +175,8 @@ router.post('/invoices', authenticate, hasUserPerm('sales.sales-invoice.create')
       }
 
       if (!skipInvOps) {
-        if (inv.rows.length > 0 && item.quantity > availableQty) {
-          return res.status(400).json({ error: `Insufficient stock at selected location. Available: ${availableQty}, Requested: ${item.quantity}` });
+        if (inv.rows.length > 0 && baseQty > availableQty) {
+          return res.status(400).json({ error: formatInsufficientStockMessage(availableQty, baseQty, item.uom_code || 'pc') });
         }
         if (inv.rows.length === 0) {
           const setting = await query("SELECT setting_value FROM system_settings WHERE setting_key = 'enable_negative_inventory'");
@@ -128,7 +187,7 @@ router.post('/invoices', authenticate, hasUserPerm('sales.sales-invoice.create')
         const fefo = await deductInventoryFefo({ query }, {
           product_id: item.product_id,
           location_id: locId,
-          quantity: item.quantity,
+          quantity: baseQty,
           reference_type: 'Sales Invoice',
           reference_id: id,
           created_by: req.user!.id,
@@ -139,10 +198,11 @@ router.post('/invoices', authenticate, hasUserPerm('sales.sales-invoice.create')
 
       item.cost = cost;
       await query(
-        `INSERT INTO sales_invoice_items (id, invoice_id, product_id, variant_id, description, quantity, unit_price, discount, tax, total, cost, location_id, tax_type, vat_amount, selected_variant)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+        `INSERT INTO sales_invoice_items (id, invoice_id, product_id, variant_id, description, quantity, unit_price, discount, tax, total, cost, location_id, tax_type, vat_amount, selected_variant, uom_id, entered_qty, conversion_to_base, base_qty)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`,
         [itemId, id, item.product_id, item.variant_id, item.description, item.quantity, item.unit_price,
-         item.discount || 0, item.tax_amount || 0, item.total, cost, locId, item.tax_type || 'VAT', item.tax_amount || 0, item.selected_variant || null]
+         item.discount || 0, item.tax_amount || 0, item.total, cost, locId, item.tax_type || 'VAT', item.tax_amount || 0, item.selected_variant || null,
+         item.uom_id || null, item.entered_qty ?? item.quantity, item.conversion_to_base ?? 1, baseQty]
       );
 
     }
@@ -156,10 +216,10 @@ router.post('/invoices', authenticate, hasUserPerm('sales.sales-invoice.create')
     // ==== ACCOUNTING ENTRIES ====
     const entryId = uuidv4();
     const entryNumber = await generateRefNumber('JE', 'journal_entries', 'entry_number');
-    const totalCogs = invoiceItems.reduce((sum: number, i: any) => sum + (i.quantity * parseFloat(i.cost || 0)), 0);
+    const totalCogs = invoiceItems.reduce((sum: number, i: any) => sum + lineItemCogsGross(i), 0);
     const cogsGlLines = invoiceItems.map((item: any) => ({
       product_id: item.product_id,
-      cogsGrossAmount: item.quantity * parseFloat(item.cost || 0),
+      cogsGrossAmount: lineItemCogsGross(item),
       tax_type: item.tax_type,
     }));
     const glCogs = !skipInvOps && totalCogs > 0 ? sumLineGlCogs(cogsGlLines) : 0;
@@ -241,7 +301,7 @@ router.post('/invoices', authenticate, hasUserPerm('sales.sales-invoice.create')
       const cogsBuckets = aggregateGlCogsByAccountCode(
         invoiceItems.map((item: any) => ({
           product_id: item.product_id,
-          cogsGrossAmount: item.quantity * parseFloat(item.cost || 0),
+          cogsGrossAmount: lineItemCogsGross(item),
           tax_type: item.tax_type,
         })),
         categoryMap,
@@ -325,9 +385,12 @@ router.get('/invoices/:id/copy-to-invoice', authenticate, hasUserPerm('sales.sal
     }
 
     const items = await query(
-      `SELECT sii.*, p.name as product_name, p.sku, p.unit_of_measure
+      `SELECT sii.*, p.sku, p.name as product_name,
+              COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure,
+              COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as uom_code
        FROM sales_invoice_items sii
        LEFT JOIN products p ON sii.product_id = p.id
+       LEFT JOIN uoms u ON sii.uom_id = u.id
        WHERE sii.invoice_id = $1 ORDER BY sii.id`,
       [req.params.id]
     );
@@ -339,9 +402,13 @@ router.get('/invoices/:id/copy-to-invoice', authenticate, hasUserPerm('sales.sal
       variant_id: i.variant_id,
       product_name: i.product_name || '',
       sku: i.sku || '',
-      unit_of_measure: i.unit_of_measure || '',
+      unit_of_measure: i.uom_code || i.unit_of_measure || 'pc',
       description: i.description || i.product_name || '',
       quantity: parseFloat(i.quantity),
+      entered_qty: parseFloat(i.entered_qty ?? i.quantity),
+      uom_id: i.uom_id || null,
+      conversion_to_base: parseFloat(i.conversion_to_base || 1),
+      base_qty: parseFloat(i.base_qty ?? i.quantity),
       unit_price: parseFloat(i.unit_price),
       discount: parseFloat(i.discount || 0),
       tax_type: i.tax_type || row.tax_type || 'VATable',
@@ -398,9 +465,11 @@ router.get('/invoices/:id', authenticate, hasUserPerm('sales.sales-invoice.view'
 
     const items = await query(
       `SELECT sii.*, p.sku, p.name as product_name,
-              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
+              COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure,
+              COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as uom_code
        FROM sales_invoice_items sii
        JOIN products p ON sii.product_id = p.id
+       LEFT JOIN uoms u ON sii.uom_id = u.id
        WHERE sii.invoice_id = $1`,
       [req.params.id]
     );
@@ -431,12 +500,17 @@ router.get('/invoices/:id/print', authenticate, hasUserPerm('sales.sales-invoice
     const b = biz.rows[0] || {};
 
     const items = await query(
-      `SELECT sii.*, p.sku, p.name as product_name, COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
-       FROM sales_invoice_items sii JOIN products p ON sii.product_id = p.id WHERE sii.invoice_id = $1 ORDER BY sii.id`,
+      `SELECT sii.*, p.sku, p.name as product_name,
+              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
+       FROM sales_invoice_items sii
+       JOIN products p ON sii.product_id = p.id
+       WHERE sii.invoice_id = $1 ORDER BY sii.id`,
       [req.params.id]
     );
 
-    const totalQty = items.rows.reduce((s: number, r: any) => s + parseFloat(r.quantity), 0);
+    const printItems = await enrichSalesPrintLineUoms({ query }, items.rows);
+
+    const totalQty = printItems.reduce((s: number, r: any) => s + parseFloat(r.quantity), 0);
     const grossTotal = parseFloat(i.subtotal) || 0;
     const discountAmt = parseFloat(i.discount) || 0;
     const netOfVAT = parseFloat(i.vatable_sales || 0);
@@ -451,20 +525,20 @@ router.get('/invoices/:id/print', authenticate, hasUserPerm('sales.sales-invoice
       ? `${i.emp_last}, ${i.emp_first}`
       : (i.customer_name || 'Walk-in');
 
-    const itemRows = items.rows.map((row: any, idx: number) =>
+    const itemRows = printItems.map((row: any, idx: number) =>
       tableRow([
         { html: String(idx + 1), align: 'c' },
         { html: row.sku || '—' },
         { html: row.product_name || row.description || '—' },
         { html: String(parseFloat(row.quantity)), align: 'c' },
-        { html: row.unit_of_measure || '—', align: 'c' },
+        { html: row.display_uom || '—', align: 'c' },
         { html: fmtCurrency(row.unit_price), align: 'r' },
         { html: fmtCurrency(row.total), align: 'r' },
       ])
     ).join('');
 
     const summaryRows: { label: string; value: string; total?: boolean }[] = [
-      { label: 'No. of Line Items', value: String(items.rows.length) },
+      { label: 'No. of Line Items', value: String(printItems.length) },
       { label: 'Total Quantity', value: String(totalQty) },
       { label: 'Trade Subtotal', value: fmtCurrency(grossTotal) },
     ];
@@ -578,13 +652,14 @@ router.patch('/invoices/:id/void', authenticate, hasUserPerm('sales.sales-invoic
     if (hadInvoiceInventoryDeduction) {
       for (const item of items.rows) {
         const locId = item.location_id || 1;
+        const restoreQty = lineItemBaseQty(item);
         await client.query('UPDATE inventory SET quantity = quantity + $1 WHERE product_id = $2 AND location_id = $3',
-          [item.quantity, item.product_id, locId]);
+          [restoreQty, item.product_id, locId]);
 
         await client.query(
           `INSERT INTO inventory_ledger (id, product_id, location_id, reference_type, reference_id, transaction_type, quantity, created_by)
            VALUES ($1, $2, $3, 'Void Invoice', $4, 'IN', $5, $6)`,
-          [uuidv4(), item.product_id, locId, req.params.id, item.quantity, req.user!.id]
+          [uuidv4(), item.product_id, locId, req.params.id, restoreQty, req.user!.id]
         );
       }
     }
@@ -604,14 +679,14 @@ router.patch('/invoices/:id/void', authenticate, hasUserPerm('sales.sales-invoic
     const voidEntryNumber = await generateRefNumber('JE', 'journal_entries', 'entry_number');
     const finalTotal = parseFloat(inv.total);
     const totalTax = parseFloat(inv.vat_amount) || parseFloat(inv.tax) || 0;
-    const totalCogs = items.rows.reduce((sum: number, i: any) => sum + (i.quantity * parseFloat(i.cost || 0)), 0);
+    const totalCogs = items.rows.reduce((sum: number, i: any) => sum + lineItemCogsGross(i), 0);
     const revenue = parseFloat(inv.subtotal) - parseFloat(inv.discount || 0);
     const netRevenue = Math.max(0, revenue - totalTax - lguTax);
     const isEmployee = inv.customer_type === 'Employee';
     const creditAccount = isEmployee ? '1120' : (parseFloat(inv.amount_paid) >= finalTotal ? '1000' : '1100');
     const voidCogsGlLines = items.rows.map((i: any) => ({
       product_id: i.product_id,
-      cogsGrossAmount: parseFloat(i.quantity) * parseFloat(i.cost || 0),
+      cogsGrossAmount: lineItemCogsGross(i),
       tax_type: i.tax_type,
     }));
     const glCogs = !skipInvOps && totalCogs > 0 ? sumLineGlCogs(voidCogsGlLines) : 0;
@@ -721,6 +796,14 @@ router.patch('/invoices/:id', authenticate, hasUserPerm('sales.sales-invoice.edi
     if (!items || items.length === 0) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Items required' }); }
 
     const ewtPercent = parseFloat(ewt_rate || '0');
+    const isEmployeeEdit = customer_type === 'Employee';
+    const effectivePaymentMethodEdit = isEmployeeEdit ? 'Salary Deduction' : (payment_method || old.payment_method);
+    const effectiveInvoiceTaxType = resolveRetailInvoiceTaxType(invoice_tax_type, {
+      customer_type,
+      payment_method: effectivePaymentMethodEdit,
+      employee_id,
+    });
+    const effectiveEwtPercent = isEmployeeEdit ? 0 : ewtPercent;
     const skipInvOps = await shouldSkipInvoiceInventoryCogs(client, {
       skip_inventory: skip_inventory === true,
       dn_id: old.dn_id,
@@ -739,7 +822,7 @@ router.patch('/invoices/:id', authenticate, hasUserPerm('sales.sales-invoice.edi
     const oldItems = await client.query('SELECT sii.*, i.location_id FROM sales_invoice_items sii JOIN inventory i ON sii.product_id = i.product_id WHERE sii.invoice_id = $1', [req.params.id]);
     if (hadOriginalInventoryDeduction) {
       for (const oi of oldItems.rows) {
-        await client.query('UPDATE inventory SET quantity = quantity + $1 WHERE product_id = $2 AND location_id = $3', [oi.quantity, oi.product_id, oi.location_id || 1]);
+        await client.query('UPDATE inventory SET quantity = quantity + $1 WHERE product_id = $2 AND location_id = $3', [lineItemBaseQty(oi), oi.product_id, oi.location_id || 1]);
       }
     }
     const oldLgu = parseFloat(old.lgu_final_tax || 0);
@@ -754,7 +837,12 @@ router.patch('/invoices/:id', authenticate, hasUserPerm('sales.sales-invoice.edi
     await client.query('DELETE FROM sales_invoice_items WHERE invoice_id = $1', [req.params.id]);
 
     // ---- Compute new ----
-    const { lines: invoiceItems, totals } = calculateInvoiceItems(items || [], ewtPercent, invoice_tax_type || 'VAT');
+    const { lines: invoiceItems, totals } = calculateInvoiceItems(
+      normalizeRetailInvoiceItems(items || [], effectiveInvoiceTaxType),
+      effectiveEwtPercent,
+      effectiveInvoiceTaxType,
+    );
+    await enrichInvoiceItemsWithUom(client, invoiceItems, items || []);
     const {
       subtotal: totalSubtotal, totalDiscount: totalDisc, totalVat, totalLguTax: totalLgu,
       totalWht, totalVatableSales: totalVatable, totalVatExemptSales, totalZeroRatedSales,
@@ -763,18 +851,19 @@ router.patch('/invoices/:id', authenticate, hasUserPerm('sales.sales-invoice.edi
 
     for (const item of invoiceItems) {
       const locId = item.location_id || 1;
+      const baseQty = lineItemBaseQty(item);
       const invRow = await client.query('SELECT * FROM inventory WHERE product_id = $1 AND location_id = $2', [item.product_id, locId]);
       let cost = invRow.rows[0] ? parseFloat(invRow.rows[0].unit_cost) : 0;
       const avQty = invRow.rows[0] ? parseFloat(invRow.rows[0].quantity) : 0;
       if (!skipInvOps) {
-        if (item.quantity > avQty) {
+        if (baseQty > avQty) {
           const setting = await client.query("SELECT setting_value FROM system_settings WHERE setting_key = 'enable_negative_inventory'");
-          if (setting.rows[0]?.setting_value !== 'true') { await client.query('ROLLBACK'); return res.status(400).json({ error: `Insufficient stock for ${item.description || item.product_id}` }); }
+          if (setting.rows[0]?.setting_value !== 'true') { await client.query('ROLLBACK'); return res.status(400).json({ error: formatInsufficientStockMessage(avQty, baseQty, item.uom_code || 'pc') }); }
         }
         const fefo = await deductInventoryFefo(client, {
           product_id: item.product_id,
           location_id: locId,
-          quantity: item.quantity,
+          quantity: baseQty,
           reference_type: 'Sales Invoice Edit',
           reference_id: req.params.id,
           created_by: req.user!.id,
@@ -782,14 +871,15 @@ router.patch('/invoices/:id', authenticate, hasUserPerm('sales.sales-invoice.edi
         cost = fefo.unitCost;
         totalCogs += fefo.totalCost;
       } else {
-        totalCogs += item.quantity * cost;
+        totalCogs += lineItemCogsGross({ ...item, cost });
       }
       item.cost = cost;
 
-      await client.query(`INSERT INTO sales_invoice_items (id, invoice_id, product_id, variant_id, description, quantity, unit_price, discount, tax, total, cost, location_id, tax_type, vat_amount, selected_variant)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+      await client.query(`INSERT INTO sales_invoice_items (id, invoice_id, product_id, variant_id, description, quantity, unit_price, discount, tax, total, cost, location_id, tax_type, vat_amount, selected_variant, uom_id, entered_qty, conversion_to_base, base_qty)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
         [uuidv4(), req.params.id, item.product_id, item.variant_id, item.description, item.quantity, item.unit_price,
-         item.discount || 0, item.tax_amount || 0, item.total, cost, locId, item.tax_type || 'VAT', item.tax_amount || 0, item.selected_variant || null]);
+         item.discount || 0, item.tax_amount || 0, item.total, cost, locId, item.tax_type || 'VAT', item.tax_amount || 0, item.selected_variant || null,
+         item.uom_id || null, item.entered_qty ?? item.quantity, item.conversion_to_base ?? 1, baseQty]);
     }
 
     const finalTotal = totalSubtotal - totalDisc;
@@ -799,7 +889,7 @@ router.patch('/invoices/:id', authenticate, hasUserPerm('sales.sales-invoice.edi
       due_date=$6, payment_method=$7, payment_terms=$8, notes=$9, terms_conditions=$10, subtotal=$11, discount=$12, tax=$13, tax_type=$14, total=$15,
       vatable_sales=$16, vat_exempt_sales=$17, zero_rated_sales=$18, vat_amount=$19, lgu_final_tax=$20, withholding_tax=$21, ewt_rate=$22, balance=$23, updated_at=CURRENT_TIMESTAMP WHERE id=$24`,
       [customer_type === 'Employee' ? null : customer_id, customer_name, customer_type || 'Customer', customer_type === 'Employee' ? employee_id : null,
-       price_mode || 'Retail', due_date, payment_method, payment_terms, notes, terms_conditions || null, totalSubtotal, totalDisc, totalVat, invoice_tax_type || 'VAT',
+       price_mode || 'Retail', due_date, payment_method, payment_terms, notes, terms_conditions || null, totalSubtotal, totalDisc, totalVat, effectiveInvoiceTaxType,
        finalTotal, totalVatable, totalVatExemptSales, totalZeroRatedSales, totalVat, totalLgu, totalWht, ewtPercent, finalTotal - parseFloat(old.amount_paid), req.params.id]);
 
     if (customer_type === 'Employee' && employee_id) {
@@ -814,7 +904,7 @@ router.patch('/invoices/:id', authenticate, hasUserPerm('sales.sales-invoice.edi
     const netRevenue = totalVatable + totalVatExemptSales + totalZeroRatedSales;
     const editCogsGlLines = invoiceItems.map((item: any) => ({
       product_id: item.product_id,
-      cogsGrossAmount: item.quantity * parseFloat(item.cost || 0),
+      cogsGrossAmount: lineItemCogsGross(item),
       tax_type: item.tax_type,
     }));
     const glCogs = !skipInvOps && totalCogs > 0 ? sumLineGlCogs(editCogsGlLines) : 0;
@@ -876,7 +966,7 @@ router.patch('/invoices/:id', authenticate, hasUserPerm('sales.sales-invoice.edi
       payment_method,
       payment_terms,
       due_date,
-      tax_type: invoice_tax_type || 'VAT',
+      tax_type: effectiveInvoiceTaxType,
     }, AUDIT_FIELDS.salesInvoice));
     res.json({ id: req.params.id, invoice_number: old.invoice_number });
   } catch (error: any) { await client.query('ROLLBACK'); res.status(500).json({ error: error.message }); } finally { client.release(); }
@@ -1788,12 +1878,17 @@ router.post('/returns', authenticate, hasUserPerm('sales.sales-invoice.create'),
       const invoicedQty = parseFloat(invLine.quantity);
       if (qty > invoicedQty) throw new AppError(`Return qty exceeds invoiced qty for ${invLine.description || 'item'}`);
 
+      const invoicedBaseQty = lineItemBaseQty(invLine);
+      const returnBaseQty = invoicedQty > 0
+        ? (invoicedBaseQty / invoicedQty) * qty
+        : lineItemBaseQty({ ...invLine, quantity: qty, entered_qty: qty });
+
       const unitPrice = parseFloat(invLine.unit_price);
       const lineTotal = (parseFloat(invLine.total) / invoicedQty) * qty;
       const cost = parseFloat(invLine.cost || 0);
       const locId = item.location_id || invLine.location_id || 1;
       totalReturn += lineTotal;
-      totalCogs += cost * qty;
+      totalCogs += cost * returnBaseQty;
       const productId = item.product_id || invLine.product_id;
       const lineVat = (parseFloat(invLine.vat_amount || 0) / invoicedQty) * qty;
       returnGlLines.push({
@@ -1803,7 +1898,7 @@ router.post('/returns', authenticate, hasUserPerm('sales.sales-invoice.create'),
           vat_amount: lineVat,
           tax_type: invLine.tax_type,
         }),
-        cogsGrossAmount: cost * qty,
+        cogsGrossAmount: cost * returnBaseQty,
         tax_type: invLine.tax_type,
       });
 
@@ -1819,22 +1914,22 @@ router.post('/returns', authenticate, hasUserPerm('sales.sales-invoice.create'),
       );
       if (invRow.rows.length > 0) {
         const currentQty = parseFloat(invRow.rows[0].quantity);
-        const newQty = currentQty + qty;
+        const newQty = currentQty + returnBaseQty;
         await client.query('UPDATE inventory SET quantity = $1 WHERE id = $2', [newQty, invRow.rows[0].id]);
         await client.query(
           `INSERT INTO inventory_ledger (id, product_id, location_id, reference_type, reference_id, transaction_type, quantity, running_quantity, unit_cost, total_cost, created_by)
            VALUES ($1, $2, $3, 'Sales Return', $4, 'IN', $5, $6, $7, $8, $9)`,
-          [uuidv4(), item.product_id || invLine.product_id, locId, id, qty, newQty, cost, cost * qty, req.user!.id]
+          [uuidv4(), item.product_id || invLine.product_id, locId, id, returnBaseQty, newQty, cost, cost * returnBaseQty, req.user!.id]
         );
       } else {
         await client.query(
           'INSERT INTO inventory (product_id, location_id, quantity, unit_cost) VALUES ($1, $2, $3, $4)',
-          [item.product_id || invLine.product_id, locId, qty, cost]
+          [item.product_id || invLine.product_id, locId, returnBaseQty, cost]
         );
         await client.query(
           `INSERT INTO inventory_ledger (id, product_id, location_id, reference_type, reference_id, transaction_type, quantity, running_quantity, unit_cost, total_cost, created_by)
            VALUES ($1, $2, $3, 'Sales Return', $4, 'IN', $5, $6, $7, $8, $9)`,
-          [uuidv4(), item.product_id || invLine.product_id, locId, id, qty, qty, cost, cost * qty, req.user!.id]
+          [uuidv4(), item.product_id || invLine.product_id, locId, id, returnBaseQty, returnBaseQty, cost, cost * returnBaseQty, req.user!.id]
         );
       }
     }

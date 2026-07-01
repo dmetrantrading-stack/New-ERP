@@ -18,6 +18,7 @@ import DocumentNotesTermsPanel from '../../components/DocumentNotesTermsPanel';
 import { ATTACHMENT_REF } from '../../lib/documentAttachments';
 import { useAuth } from '../../store/auth';
 import { beginCopyNavigation, endCopyNavigation } from '../../lib/copyNavigationGuard';
+import { convertToBaseQty } from '../../lib/uomUtils';
 
 const STATUS_COLORS: Record<string, string> = {
   Draft: 'bg-gray-100 text-gray-700',
@@ -130,6 +131,9 @@ export default function DeliveryReceipt() {
           product_name: soItem.product_name,
           remaining: soItem.remaining_qty,
           quantity: soItem.deliver_qty,
+          uom_id: soItem.uom_id ?? null,
+          conversion_to_base: soItem.conversion_to_base ?? 1,
+          unit_of_measure: soItem.unit_of_measure || soItem.uom || '',
         }],
       };
     });
@@ -177,12 +181,12 @@ export default function DeliveryReceipt() {
       const dr = r.data;
       setEditingId(id);
       setEditingMeta({ dr_number: dr.dr_number, status: dr.status });
-      setDrForm({ so_id: dr.so_id, delivery_date: dr.delivery_date || '', delivery_address: dr.delivery_address || '', driver_name: dr.driver_name || '', vehicle_plate: dr.vehicle_plate || '', dispatch_notes: dr.dispatch_notes || '', notes: dr.notes || DR_STANDARD_NOTE, terms_conditions: dr.terms_conditions || '', items: (dr.items || []).map((i: any) => ({ order_item_id: i.order_item_id, product_name: i.product_name, quantity: parseFloat(i.quantity) })) });
+      setDrForm({ so_id: dr.so_id, delivery_date: dr.delivery_date || '', delivery_address: dr.delivery_address || '', driver_name: dr.driver_name || '', vehicle_plate: dr.vehicle_plate || '', dispatch_notes: dr.dispatch_notes || '', notes: dr.notes || DR_STANDARD_NOTE, terms_conditions: dr.terms_conditions || '', items: (dr.items || []).map((i: any) => ({ order_item_id: i.order_item_id, product_name: i.product_name, quantity: parseFloat(i.quantity), uom_id: i.uom_id ?? null, conversion_to_base: parseFloat(i.conversion_to_base || 1), unit_of_measure: i.uom_code || i.unit_of_measure || '' })) });
       setSelectedSo({ customer_name: dr.customer_name, so_number: dr.so_number });
       setSoItems((dr.items || []).map((i: any) => {
         const qty = parseFloat(String(i.quantity));
         const extra = i.soi_delivered ? parseFloat(String(i.ordered_qty)) - parseFloat(String(i.soi_delivered)) : 0;
-        return { id: i.order_item_id, product_name: i.product_name, remaining_qty: qty + extra, deliver_qty: qty };
+        return { id: i.order_item_id, product_name: i.product_name, remaining_qty: qty + extra, deliver_qty: qty, unit_of_measure: i.uom_code || i.unit_of_measure || '', uom_id: i.uom_id ?? null, conversion_to_base: parseFloat(i.conversion_to_base || 1) };
       }));
       setCreating(true);
     } catch { toast.error('Failed to load'); }
@@ -382,8 +386,10 @@ export default function DeliveryReceipt() {
                     <thead className="sticky top-0 z-10">
                       <tr className="bg-gray-100 text-[9px] font-semibold text-gray-500 uppercase">
                         <th className="px-3 py-2 text-left">Product</th>
+                        <th className="px-3 py-2 text-center w-16">UOM</th>
                         <th className="px-3 py-2 text-center w-24">Remaining</th>
                         <th className="px-3 py-2 text-center w-28">Deliver Qty</th>
+                        <th className="px-3 py-2 text-center w-20">Stock (pc)</th>
                         <th className="w-24"></th>
                       </tr>
                     </thead>
@@ -391,9 +397,12 @@ export default function DeliveryReceipt() {
                       {soItems.map((item: any) => {
                         const drItem = drForm.items.find((i: any) => i.order_item_id === item.id);
                         const isSelected = !!drItem;
+                        const deliverQty = parseFloat(String(drItem?.quantity ?? item.deliver_qty ?? 0));
+                        const baseQty = convertToBaseQty(deliverQty, item.conversion_to_base || 1);
                         return (
                           <tr key={item.id} className={isSelected ? 'bg-blue-50/40' : ''}>
                             <td className="px-3 py-2 font-medium text-xs">{item.product_name || item.description}</td>
+                            <td className="px-3 py-2 text-center text-[10px] uppercase text-gray-500">{(item.unit_of_measure || 'pc').toUpperCase()}</td>
                             <td className="px-3 py-2 text-center text-xs">{parseFloat(item.remaining_qty || 0)}</td>
                             <td className="px-3 py-2 text-center">
                               {isSelected ? (
@@ -402,6 +411,7 @@ export default function DeliveryReceipt() {
                                   className="w-20 px-2 py-1 border border-gray-200 rounded text-xs text-center" />
                               ) : <span className="text-gray-400 text-xs">—</span>}
                             </td>
+                            <td className="px-3 py-2 text-center text-[10px] text-gray-400 tabular-nums">{isSelected ? `${baseQty} pc` : '—'}</td>
                             <td className="px-2 py-2 text-center">
                               <button onClick={() => toggleDrItem(item)}
                                 className={`px-2.5 py-1 text-[10px] rounded font-medium ${isSelected ? 'bg-red-100 text-red-600 hover:bg-red-200' : 'bg-blue-100 text-blue-600 hover:bg-blue-200'}`}>

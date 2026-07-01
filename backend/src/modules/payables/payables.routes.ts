@@ -150,9 +150,11 @@ router.get('/copy-from-po/:poId', authenticate, hasUserPerm('purchases.apv.creat
 
     const items = await query(
       `SELECT poi.*, p.name as product_name, p.sku,
-              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure
+              COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure,
+              COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as uom_code
        FROM purchase_order_items poi
        JOIN products p ON poi.product_id = p.id
+       LEFT JOIN uoms u ON poi.uom_id = u.id
        WHERE poi.po_id = $1 ORDER BY poi.id`,
       [req.params.poId]
     );
@@ -174,8 +176,10 @@ router.get('/copy-from-po/:poId', authenticate, hasUserPerm('purchases.apv.creat
       items: items.rows.map((i: any) => ({
         product_id: i.product_id,
         description: i.product_name || '',
-        qty: parseFloat(i.quantity),
-        uom: i.unit_of_measure || 'pc',
+        qty: parseFloat(i.entered_qty ?? i.quantity),
+        uom: (i.uom_code || i.unit_of_measure || 'pc').toUpperCase(),
+        uom_id: i.uom_id || null,
+        conversion_to_base: parseFloat(i.conversion_to_base) || 1,
         unit_cost: parseFloat(i.net_unit_cost || i.unit_cost || 0),
         discount_amount: parseFloat(i.discount_amount || 0),
         tax_type: i.tax_type || 'VAT',
@@ -211,11 +215,13 @@ router.get('/copy-from-gr/:grId', authenticate, hasUserPerm('purchases.apv.creat
 
     const items = await query(
       `SELECT gri.*, p.name as product_name, p.sku,
-              COALESCE(NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure,
+              COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as unit_of_measure,
+              COALESCE(u.code, NULLIF(p.unit_of_measure, ''), 'pc') as uom_code,
               COALESCE(poi.tax_type, 'VAT') as tax_type
        FROM goods_receipt_items gri
        LEFT JOIN products p ON gri.product_id = p.id
        LEFT JOIN purchase_order_items poi ON gri.po_item_id = poi.id
+       LEFT JOIN uoms u ON gri.uom_id = u.id
        WHERE gri.gr_id = $1 ORDER BY gri.id`,
       [req.params.grId]
     );
@@ -238,8 +244,10 @@ router.get('/copy-from-gr/:grId', authenticate, hasUserPerm('purchases.apv.creat
       items: items.rows.map((i: any) => ({
         product_id: i.product_id,
         description: i.product_name || '',
-        qty: parseFloat(i.quantity),
-        uom: i.unit_of_measure || 'pc',
+        qty: parseFloat(i.entered_qty ?? i.quantity),
+        uom: (i.uom_code || i.unit_of_measure || 'pc').toUpperCase(),
+        uom_id: i.uom_id || null,
+        conversion_to_base: parseFloat(i.conversion_to_base) || 1,
         unit_cost: parseFloat(i.net_unit_cost || i.unit_cost || 0),
         discount_amount: parseFloat(i.discount_amount || 0),
         gr_id: row.id,
