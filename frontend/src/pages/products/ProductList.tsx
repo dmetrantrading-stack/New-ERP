@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import ModalOverlay from '../../components/ModalOverlay';
 import api from '../../lib/api';
 import { formatCurrency, generateBarcode } from '../../lib/utils';
-import { validateProductForm, isOnlyReorderLevelChanged } from '../../lib/productsUtils';
+import { validateProductForm, isOnlyReorderLevelChanged, PRIMARY } from '../../lib/productsUtils';
 import {
   findBaseUomFromCatalog,
   findProductBaseRowIndex,
@@ -11,7 +11,7 @@ import {
   normalizeProductUomRows,
   normalizeUomCode,
 } from '../../lib/uomUtils';
-import ProductUomPanel, { pricesFromBasePc } from './ProductUomPanel';
+import ProductUomPanel, { pricesFromBasePc, ProductFormSection } from './ProductUomPanel';
 import { useAuth } from '../../store/auth';
 import { Plus, Search, Edit2, Eye, Download, Upload, ToggleLeft, Barcode, Trash2, FileText, X, Loader2, Package, TrendingUp, Printer, ArrowLeft } from 'lucide-react';
 import Pagination from '../../components/Pagination';
@@ -74,7 +74,7 @@ const DEFAULT_UOM_ROW = (prices: { cost: number; retail: number; wholesale: numb
   is_default_sales: true,
 }]);
 
-export default function ProductList({ embedded = false, onChanged }: { embedded?: boolean; onChanged?: () => void }) {
+export default function ProductList({ embedded = false, onChanged, onFormOpenChange }: { embedded?: boolean; onChanged?: () => void; onFormOpenChange?: (open: boolean) => void }) {
   const { hasPerm, hasAnyPerm } = useAuth();
   const showPriceType = hasAnyPerm(['pos.view', 'pos.write']);
   const canCreate = hasPerm('inventory.inventory.create');
@@ -86,6 +86,14 @@ export default function ProductList({ embedded = false, onChanged }: { embedded?
   const [search, setSearch] = useState('');
   const [showForm, setShowForm] = useState(false);
   const [editProduct, setEditProduct] = useState<any>(null);
+
+  useEffect(() => {
+    onFormOpenChange?.(showForm);
+  }, [showForm, onFormOpenChange]);
+
+  useEffect(() => () => {
+    onFormOpenChange?.(false);
+  }, [onFormOpenChange]);
   const [categories, setCategories] = useState<any[]>([]);
   const [brands, setBrands] = useState<any[]>([]);
   const [statusFilter, setStatusFilter] = useState('all');
@@ -448,151 +456,172 @@ export default function ProductList({ embedded = false, onChanged }: { embedded?
     setEditProduct(null);
   };
 
+  const renderUomPanel = () => (
+    <ProductUomPanel
+      key={editProduct?.id || 'new'}
+      allowMultiple={Boolean(form.allow_multiple_uom)}
+      trackBatch={Boolean(form.track_batch)}
+      trackExpiry={Boolean(form.track_expiry)}
+      conversions={uomConversions}
+      pricing={{
+        cost: form.cost,
+        retail_markup: form.retail_markup,
+        wholesale_markup: form.wholesale_markup,
+        distributor_markup: form.distributor_markup,
+        retail_price: form.retail_price,
+        wholesale_price: form.wholesale_price,
+        distributor_price: form.distributor_price,
+        _manualRetail: form._manualRetail,
+        _manualWholesale: form._manualWholesale,
+        _manualDistributor: form._manualDistributor,
+      }}
+      onAllowMultipleChange={(v) => {
+        setForm({ ...form, allow_multiple_uom: v });
+        if (!v) {
+          setUomConversions((rows) => {
+            const idx = findProductBaseRowIndex(rows, form.base_uom_id ?? editProduct?.base_uom_id);
+            return idx >= 0 ? [rows[idx]] : rows.slice(0, 1);
+          });
+        }
+      }}
+      onTrackBatchChange={(v) => setForm({ ...form, track_batch: v })}
+      onTrackExpiryChange={(v) => setForm({ ...form, track_expiry: v })}
+      onConversionsChange={setUomConversions}
+      onPricingChange={(updates) => setForm((f: any) => ({ ...f, ...updates }))}
+      productBarcode={form.barcode}
+      baseUomId={form.base_uom_id ?? editProduct?.base_uom_id}
+      onBaseUomIdChange={(uomId, uomCode) => {
+        setForm((f: any) => ({ ...f, base_uom_id: uomId, unit_of_measure: normalizeUomCode(uomCode) || 'pc' }));
+      }}
+    />
+  );
+
   const renderProductFormFields = () => (
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-      <div className="md:col-span-2">
-        <label className="block text-sm font-medium mb-1">Product Name *</label>
-        <input type="text" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })}
-          disabled={saving || (editProduct ? !canEdit : !canCreate)}
-          className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none disabled:bg-gray-50" />
-      </div>
-      <div className="md:col-span-2">
-        <label className="block text-sm font-medium mb-1">Description</label>
-        <textarea value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })}
-          className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" rows={2} />
-      </div>
-      <div>
-        <label className="block text-sm font-medium mb-1">Barcode</label>
-        <div className="flex gap-2">
-          <input type="text" value={form.barcode} onChange={(e) => setForm({ ...form, barcode: e.target.value })}
-            className="flex-1 px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
-          <button type="button" onClick={handleGenerateBarcode} title="Generate barcode" className="px-3 py-2 border rounded-lg text-sm hover:bg-gray-50 text-blue-600"><Barcode size={16} /></button>
-        </div>
-      </div>
-      <div>
-        <label className="block text-sm font-medium mb-1">Category</label>
-        <select value={form.category_id} onChange={(e) => setForm({ ...form, category_id: e.target.value })}
-          className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
-          <option value="">Select Category</option>
-          {categories.map((c: any) => <option key={c.id} value={c.id}>{c.name}</option>)}
-        </select>
-      </div>
-      <div>
-        <label className="block text-sm font-medium mb-1">Brand</label>
-        <select value={form.brand_id} onChange={(e) => setForm({ ...form, brand_id: e.target.value })}
-          className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
-          <option value="">Select Brand</option>
-          {brands.map((b: any) => <option key={b.id} value={b.id}>{b.name}</option>)}
-        </select>
-      </div>
-      <ProductUomPanel
-        allowMultiple={Boolean(form.allow_multiple_uom)}
-        trackBatch={Boolean(form.track_batch)}
-        trackExpiry={Boolean(form.track_expiry)}
-        conversions={uomConversions}
-        pricing={{
-          cost: form.cost,
-          retail_markup: form.retail_markup,
-          wholesale_markup: form.wholesale_markup,
-          distributor_markup: form.distributor_markup,
-          retail_price: form.retail_price,
-          wholesale_price: form.wholesale_price,
-          distributor_price: form.distributor_price,
-          _manualRetail: form._manualRetail,
-          _manualWholesale: form._manualWholesale,
-          _manualDistributor: form._manualDistributor,
-        }}
-        onAllowMultipleChange={(v) => {
-          setForm({ ...form, allow_multiple_uom: v });
-          if (!v) {
-            setUomConversions((rows) => {
-              const idx = findProductBaseRowIndex(rows, form.base_uom_id ?? editProduct?.base_uom_id);
-              return idx >= 0 ? [rows[idx]] : rows.slice(0, 1);
-            });
-          }
-        }}
-        onTrackBatchChange={(v) => setForm({ ...form, track_batch: v })}
-        onTrackExpiryChange={(v) => setForm({ ...form, track_expiry: v })}
-        onConversionsChange={setUomConversions}
-        onPricingChange={(updates) => setForm((f: any) => ({ ...f, ...updates }))}
-        productBarcode={form.barcode}
-        baseUomId={form.base_uom_id ?? editProduct?.base_uom_id}
-        onBaseUomIdChange={(uomId, uomCode) => {
-          setForm((f: any) => ({ ...f, base_uom_id: uomId, unit_of_measure: normalizeUomCode(uomCode) || 'pc' }));
-        }}
-      />
-      <div>
-        <label className="block text-sm font-medium mb-1">Reorder Level</label>
-        <input type="number" step="0.01" value={form.reorder_level} onChange={(e) => setForm({ ...form, reorder_level: e.target.value })}
-          className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
-      </div>
-      <div>
-        <label className="block text-sm font-medium mb-1">Tax Type</label>
-        <select value={form.tax_type} onChange={(e) => setForm({ ...form, tax_type: e.target.value })}
-          className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
-          <option value="VAT">VAT 12%</option><option value="VAT Exempt">VAT Exempt</option>
-          <option value="Zero Rated">Zero Rated</option><option value="LGU 5% Final VAT">LGU 5% Final VAT</option>
-        </select>
-      </div>
-      {showPriceType && (
-        <div>
-          <label className="block text-sm font-medium mb-1">Price Type</label>
-          <select value={form.price_type} onChange={(e) => setForm({ ...form, price_type: e.target.value })}
-            className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
-            <option value="VAT Inclusive">VAT Inclusive</option>
-            <option value="VAT Exclusive">VAT Exclusive</option>
-          </select>
-          <p className="text-xs text-gray-500 mt-1">Whether retail price includes 12% VAT — used by POS only.</p>
-        </div>
-      )}
-      <div className="col-span-2 border rounded-lg p-3 bg-blue-50/50">
-        <label className="flex items-center gap-2 cursor-pointer mb-2">
-          <input type="checkbox" checked={form.has_chilled_variant} onChange={(e) => setForm({ ...form, has_chilled_variant: e.target.checked })}
-            className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500" />
-          <span className="text-sm font-medium text-gray-700">Enable Chilled Variant</span>
-        </label>
-        {form.has_chilled_variant && (
-          <div className="mt-2">
-            <label className="block text-xs text-gray-500 mb-1">Chilled Selling Price (Retail only) *</label>
-            <input type="number" step="0.01" min="0" value={form.chilled_price} onChange={(e) => setForm({ ...form, chilled_price: e.target.value })}
-              disabled={saving}
-              className="w-full max-w-xs px-3 py-2 border rounded-lg text-sm font-medium text-cyan-700 focus:ring-2 focus:ring-blue-500 outline-none disabled:bg-gray-50" />
+    <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 xl:gap-6 w-full">
+      <div className="space-y-4 min-w-0">
+        <ProductFormSection step={1} title="Product details">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="md:col-span-2">
+              <label className="block text-sm font-medium mb-1">Product Name *</label>
+              <input type="text" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })}
+                disabled={saving || (editProduct ? !canEdit : !canCreate)}
+                className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none disabled:bg-gray-50" />
+            </div>
+            <div className="md:col-span-2">
+              <label className="block text-sm font-medium mb-1">Description</label>
+              <textarea value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })}
+                className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" rows={2} />
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Barcode</label>
+              <div className="flex gap-2">
+                <input type="text" value={form.barcode} onChange={(e) => setForm({ ...form, barcode: e.target.value })}
+                  className="flex-1 px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
+                <button type="button" onClick={handleGenerateBarcode} title="Generate barcode" className="px-3 py-2 border rounded-lg text-sm hover:bg-gray-50 text-blue-600"><Barcode size={16} /></button>
+              </div>
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Category</label>
+              <select value={form.category_id} onChange={(e) => setForm({ ...form, category_id: e.target.value })}
+                className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
+                <option value="">Select Category</option>
+                {categories.map((c: any) => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </select>
+            </div>
+            <div className="md:col-span-2">
+              <label className="block text-sm font-medium mb-1">Brand</label>
+              <select value={form.brand_id} onChange={(e) => setForm({ ...form, brand_id: e.target.value })}
+                className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none md:max-w-md">
+                <option value="">Select Brand</option>
+                {brands.map((b: any) => <option key={b.id} value={b.id}>{b.name}</option>)}
+              </select>
+            </div>
           </div>
-        )}
+        </ProductFormSection>
+
+        <ProductFormSection step={5} title="Inventory & tax">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div>
+              <label className="block text-sm font-medium mb-1">Reorder Level</label>
+              <input type="number" step="0.01" value={form.reorder_level} onChange={(e) => setForm({ ...form, reorder_level: e.target.value })}
+                className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Tax Type</label>
+              <select value={form.tax_type} onChange={(e) => setForm({ ...form, tax_type: e.target.value })}
+                className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
+                <option value="VAT">VAT 12%</option><option value="VAT Exempt">VAT Exempt</option>
+                <option value="Zero Rated">Zero Rated</option><option value="LGU 5% Final VAT">LGU 5% Final VAT</option>
+              </select>
+            </div>
+            {showPriceType && (
+              <div>
+                <label className="block text-sm font-medium mb-1">Price Type (POS)</label>
+                <select value={form.price_type} onChange={(e) => setForm({ ...form, price_type: e.target.value })}
+                  className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none">
+                  <option value="VAT Inclusive">VAT Inclusive</option>
+                  <option value="VAT Exclusive">VAT Exclusive</option>
+                </select>
+                <p className="text-[10px] text-gray-400 mt-1">Whether retail price includes 12% VAT at POS.</p>
+              </div>
+            )}
+          </div>
+        </ProductFormSection>
+
+        <ProductFormSection step={6} title="Variants">
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" checked={form.has_chilled_variant} onChange={(e) => setForm({ ...form, has_chilled_variant: e.target.checked })}
+              className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500" />
+            <span className="text-sm font-medium text-gray-700">Enable Chilled Variant</span>
+          </label>
+          {form.has_chilled_variant && (
+            <div className="mt-3 max-w-xs">
+              <label className="block text-xs text-gray-500 mb-1">Chilled Selling Price (Retail only) *</label>
+              <input type="number" step="0.01" min="0" value={form.chilled_price} onChange={(e) => setForm({ ...form, chilled_price: e.target.value })}
+                disabled={saving}
+                className="w-full px-3 py-2 border rounded-lg text-sm font-medium text-cyan-700 focus:ring-2 focus:ring-blue-500 outline-none disabled:bg-gray-50" />
+            </div>
+          )}
+        </ProductFormSection>
+      </div>
+
+      <div className="space-y-4 min-w-0 xl:sticky xl:top-4 xl:self-start xl:max-h-[calc(100vh-5.5rem)] xl:overflow-y-auto">
+        {renderUomPanel()}
       </div>
     </div>
   );
 
   if (showForm) {
     return (
-      <div className={`flex flex-col bg-gray-50 ${embedded ? 'h-full min-h-0' : 'min-h-[calc(100vh-4rem)] -m-6'}`}>
-        <div className="flex-shrink-0 sticky top-0 z-10 bg-white border-b border-gray-200 px-4 sm:px-6 py-3 flex flex-wrap items-center justify-between gap-3 shadow-sm">
+      <div className={`flex flex-col bg-gray-50 min-h-0 ${embedded ? 'h-full' : 'min-h-[calc(100vh-4rem)] -m-6'}`}>
+        <div
+          className="flex-shrink-0 sticky top-0 z-10 px-4 sm:px-6 h-12 flex flex-wrap items-center justify-between gap-3 shadow-sm"
+          style={{ backgroundColor: PRIMARY }}
+        >
           <div className="flex items-center gap-3 min-w-0">
             <button type="button" onClick={closeForm} disabled={saving}
-              className="inline-flex items-center gap-2 px-3 py-2 text-sm font-medium text-gray-700 border border-gray-200 rounded-lg hover:bg-gray-50 disabled:opacity-50">
+              className="inline-flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-white border border-white/30 rounded-lg hover:bg-white/10 disabled:opacity-50">
               <ArrowLeft size={16} /> Back
             </button>
-            <div className="min-w-0">
-              <h1 className="text-lg font-semibold text-gray-900 truncate">
+            <div className="min-w-0 border-l border-white/20 pl-3">
+              <h1 className="text-sm font-semibold text-white truncate">
                 {editProduct ? 'Edit Product' : 'Add Product'}
               </h1>
-              {editProduct?.sku && <p className="text-xs text-gray-500 truncate">{editProduct.sku}</p>}
+              {editProduct?.sku && <p className="text-[11px] text-white/70 truncate">{editProduct.sku}</p>}
             </div>
           </div>
           <div className="flex items-center gap-2">
             <button type="button" onClick={closeForm} disabled={saving}
-              className="px-4 py-2 border rounded-lg text-sm hover:bg-gray-50 disabled:opacity-50">Cancel</button>
+              className="px-4 py-1.5 border border-white/30 rounded-lg text-sm text-white hover:bg-white/10 disabled:opacity-50">Cancel</button>
             <button type="button" onClick={handleSave} disabled={saving || (editProduct ? !canEdit : !canCreate)}
-              className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700 disabled:opacity-50">
+              className="inline-flex items-center gap-2 px-4 py-1.5 bg-white text-blue-800 rounded-lg text-sm font-semibold hover:bg-blue-50 disabled:opacity-50">
               {saving && <Loader2 size={16} className="animate-spin" />}
               {saving ? 'Saving...' : 'Save Product'}
             </button>
           </div>
         </div>
-        <div className="flex-1 overflow-y-auto px-4 sm:px-6 py-6">
-          <div className="max-w-6xl mx-auto bg-white rounded-xl border border-gray-200 p-6 shadow-sm">
-            {renderProductFormFields()}
-          </div>
+        <div className="flex-1 min-h-0 overflow-y-auto px-4 sm:px-6 lg:px-8 py-4">
+          {renderProductFormFields()}
         </div>
       </div>
     );

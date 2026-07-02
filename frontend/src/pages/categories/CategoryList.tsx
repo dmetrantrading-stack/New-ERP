@@ -3,6 +3,7 @@ import ModalOverlay from '../../components/ModalOverlay';
 import api from '../../lib/api';
 import { Plus, Edit2, Trash2, Search } from 'lucide-react';
 import toast from 'react-hot-toast';
+import { useAuth } from '../../store/auth';
 
 type GlAccount = { account_code: string; account_name: string };
 
@@ -14,6 +15,10 @@ const defaultForm = {
 };
 
 export default function CategoryList({ embedded = false, onChanged }: { embedded?: boolean; onChanged?: () => void }) {
+  const { hasPerm } = useAuth();
+  const canEdit = hasPerm('inventory.inventory.edit');
+  const canCreate = hasPerm('inventory.inventory.create') || canEdit;
+  const readOnly = !canCreate && !canEdit;
   const [categories, setCategories] = useState<any[]>([]);
   const [revenueAccounts, setRevenueAccounts] = useState<GlAccount[]>([]);
   const [cogsAccounts, setCogsAccounts] = useState<GlAccount[]>([]);
@@ -129,8 +134,14 @@ export default function CategoryList({ embedded = false, onChanged }: { embedded
         <p className="text-xs text-gray-500">
           <span className="font-semibold text-gray-700">{filteredCategories.length}</span> categor{filteredCategories.length !== 1 ? 'ies' : 'y'}
         </p>
-        <button onClick={openCreate} className="flex items-center gap-2 px-3 py-1.5 bg-blue-700 text-white rounded-lg text-xs font-semibold hover:bg-blue-800"><Plus size={14} /> Create</button>
+        <button onClick={openCreate} disabled={!canCreate} className="flex items-center gap-2 px-3 py-1.5 bg-blue-700 text-white rounded-lg text-xs font-semibold hover:bg-blue-800 disabled:opacity-40 disabled:cursor-not-allowed"><Plus size={14} /> Create</button>
       </div>
+
+      {readOnly && (
+        <div className="px-4 py-2 bg-amber-50 border border-amber-200 rounded-lg text-amber-900 text-xs">
+          Read-only — you can view categories but cannot add or edit.
+        </div>
+      )}
 
       <div className="flex-shrink-0 flex flex-wrap gap-3 items-center bg-white border border-gray-200 rounded-t-lg px-4 py-3">
         <div className="relative flex-1 min-w-[200px] max-w-md">
@@ -166,10 +177,12 @@ export default function CategoryList({ embedded = false, onChanged }: { embedded
                   <td>{c.product_count || 0}</td>
                   <td><span className={`px-2 py-1 text-xs rounded-full ${c.is_active ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{c.is_active ? 'Active' : 'Inactive'}</span></td>
                   <td>
-                    <div className="flex gap-1">
-                      <button onClick={() => openEdit(c)} className="p-1.5 hover:bg-blue-50 rounded text-blue-600"><Edit2 size={15} /></button>
-                      <button onClick={() => handleDelete(c.id)} className="p-1.5 hover:bg-red-50 rounded text-red-500"><Trash2 size={15} /></button>
-                    </div>
+                    {canEdit && (
+                      <div className="flex gap-1">
+                        <button onClick={() => openEdit(c)} className="p-1.5 hover:bg-blue-50 rounded text-blue-600"><Edit2 size={15} /></button>
+                        <button onClick={() => handleDelete(c.id)} className="p-1.5 hover:bg-red-50 rounded text-red-500"><Trash2 size={15} /></button>
+                      </div>
+                    )}
                   </td>
                 </tr>
               ))}

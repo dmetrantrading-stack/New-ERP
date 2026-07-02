@@ -41,7 +41,7 @@ export default function SettingsPermissionsTab() {
           <h2 className="text-sm font-semibold text-gray-800">User Permissions</h2>
           <p className="text-xs text-gray-500">
             {canEdit
-              ? 'Assign module access per user. Changes apply after save (refresh session if editing yourself).'
+              ? 'Assign module access per user. Use role presets in the editor, then save. View is auto-added when Create/Edit is checked.'
               : 'View-only — you need Users → Edit permission to change access.'}
           </p>
         </div>

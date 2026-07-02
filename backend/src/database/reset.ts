@@ -57,11 +57,6 @@ const reset = async () => {
     console.log('Resetting batch quantities to 0...');
     await client.query(`UPDATE batches SET quantity = 0`);
 
-    // ==================== RESET CUSTOMER & SUPPLIER BALANCES ====================
-    console.log('Resetting customer and supplier balances...');
-    await client.query(`UPDATE customers SET balance = 0`);
-    await client.query(`UPDATE suppliers SET balance = 0`);
-
     // ==================== RESET COA BALANCES ====================
     console.log('Resetting chart of accounts balances...');
     await client.query(`UPDATE chart_of_accounts SET balance = 0`);
@@ -71,7 +66,7 @@ const reset = async () => {
     await client.query(`UPDATE bank_accounts SET balance = 0`);
 
     await client.query('COMMIT');
-    console.log('\nDone. All transactions reset. Products & master data preserved.');
+    console.log('\nDone. All transactions reset. Products, customers, suppliers, and master data preserved.');
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Reset failed:', error);

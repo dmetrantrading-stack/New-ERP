@@ -8,7 +8,6 @@ import { auditLog } from '../../middleware/audit';
 import { AppError } from '../../middleware/errorHandler';
 import { getInvoiceCopyMode, setInvoiceCopyMode, InvoiceCopyMode } from '../../utils/salesSettings';
 import { getAccountingLockDate, setAccountingLockDate } from '../../utils/periodLock';
-import { runOpeningBalanceImport } from '../../utils/openingBalanceImport';
 import { getRegistrationSettings, setRegistrationSettings } from '../../utils/registrationSettings';
 import { getLoyaltySettings, loyaltySettingsToApi, setLoyaltySettings } from '../../utils/loyaltySettings';
 
@@ -87,14 +86,12 @@ router.post('/reset-transactions', authenticate, hasUserPerm('system.settings.ed
 
     await client.query('UPDATE inventory SET quantity = 0, reserved_quantity = 0, unit_cost = 0');
     await client.query('UPDATE batches SET quantity = 0');
-    await client.query('UPDATE customers SET balance = 0');
-    await client.query('UPDATE suppliers SET balance = 0');
     await client.query('UPDATE employees SET cash_advance_balance = 0, grocery_credit_balance = 0');
     await client.query('UPDATE chart_of_accounts SET balance = 0');
     await client.query('UPDATE bank_accounts SET balance = 0');
 
     await client.query('COMMIT');
-    res.json({ message: 'All transactions reset. Products & master data preserved.' });
+    res.json({ message: 'All transactions reset. Products, customers, suppliers, COA master, and settings preserved.' });
   } catch (error: any) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: error.message });
@@ -303,17 +300,6 @@ router.put('/accounting-lock', authenticate, hasUserPerm('system.settings.edit')
     await setAccountingLockDate(accounting_lock_date || null);
     res.json({ accounting_lock_date: accounting_lock_date || null });
   } catch (error: any) { res.status(500).json({ error: error.message }); }
-});
-
-router.post('/import/opening-balances', authenticate, hasUserPerm('system.settings.edit'), auditLog('Settings', 'Import Opening Balances'), async (req: AuthRequest, res: Response) => {
-  try {
-    const { type, csv, entry_date } = req.body;
-    if (!type || !csv) return res.status(400).json({ error: 'type and csv are required' });
-    const result = await runOpeningBalanceImport(String(type), String(csv), req.user!.id, entry_date);
-    res.json(result);
-  } catch (error: any) {
-    res.status(error instanceof AppError ? error.statusCode : 500).json({ error: error.message });
-  }
 });
 
 const sigStorage = multer.diskStorage({

@@ -32,7 +32,6 @@ export const SETTINGS_SECTIONS: Record<SettingsTabKey, readonly { key: string; l
   ],
   system: [
     { key: 'accounting', label: 'Period Lock' },
-    { key: 'imports', label: 'Opening Balances' },
     { key: 'maintenance', label: 'Backup & Reset' },
   ],
 };

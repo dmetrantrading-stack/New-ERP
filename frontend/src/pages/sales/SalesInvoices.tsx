@@ -48,6 +48,9 @@ const INV_STATUS_COLORS: Record<string, string> = {
 
 export default function SalesInvoices() {
   const { hasPerm } = useAuth();
+  const canCreate = hasPerm('sales.sales-invoice.create');
+  const canEdit = hasPerm('sales.sales-invoice.edit');
+  const canPrint = hasPerm('sales.sales-invoice.print');
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const [invoices, setInvoices] = useState<any[]>([]);
@@ -468,6 +471,7 @@ export default function SalesInvoices() {
   };
 
   const editInvoice = async (invoiceId: string) => {
+    if (!canEdit) { toast.error('You do not have permission to edit sales invoices'); return; }
     try {
       const res = await api.get(`/sales/invoices/${invoiceId}`);
       const inv = res.data;
@@ -539,6 +543,7 @@ export default function SalesInvoices() {
   };
 
   const voidInvoice = async (id: string) => {
+    if (!canEdit) { toast.error('You do not have permission to void sales invoices'); return; }
     if (!confirm('Void this invoice?')) return;
     try { await api.patch(`/sales/invoices/${id}/void`); toast.success('Invoice voided'); loadInvoices(); }
     catch (err: any) { toast.error(err.response?.data?.error || 'Error voiding invoice'); }
@@ -579,8 +584,10 @@ export default function SalesInvoices() {
               </button>
             )}
             <CopyToMenu sourceType="SI" docId={v.id} doc={v} hasPerm={hasPerm} onNavigate={() => setViewing(false)} />
-            <button onClick={printDoc}
-              className="flex items-center gap-1 px-3 py-1.5 bg-white text-blue-900 rounded text-xs font-bold hover:bg-blue-50"><Printer size={13} /> Print</button>
+            {canPrint && (
+              <button onClick={printDoc}
+                className="flex items-center gap-1 px-3 py-1.5 bg-white text-blue-900 rounded text-xs font-bold hover:bg-blue-50"><Printer size={13} /> Print</button>
+            )}
             <button onClick={() => setViewing(false)}
               className="p-1.5 text-white/60 hover:text-white hover:bg-white/10 rounded"><span className="text-lg leading-none">&times;</span></button>
           </div>
@@ -963,9 +970,11 @@ export default function SalesInvoices() {
             <option value="Deducted" className="text-gray-900">Deducted</option>
             <option value="Void" className="text-gray-900">Void</option>
           </select>
-          <button onClick={() => setCreating(true)} className="flex items-center gap-1 px-3 py-1.5 bg-white text-blue-900 rounded text-xs font-bold hover:bg-blue-50">
-            <Plus size={14} /> Create Invoice
-          </button>
+          {canCreate && (
+            <button onClick={() => setCreating(true)} className="flex items-center gap-1 px-3 py-1.5 bg-white text-blue-900 rounded text-xs font-bold hover:bg-blue-50">
+              <Plus size={14} /> Create Invoice
+            </button>
+          )}
         </div>
       </div>
 
@@ -1034,12 +1043,16 @@ export default function SalesInvoices() {
                               {canCollect && (
                                 <button onClick={() => navigate(`/collections?invoice=${inv.id}`)} className="p-1 hover:bg-emerald-50 rounded text-emerald-700" title="Collect payment"><Banknote size={14} /></button>
                               )}
-                              <button onClick={() => editInvoice(inv.id)} className="p-1 hover:bg-yellow-50 rounded text-yellow-600" title="Edit"><Edit2 size={14} /></button>
+                              {canEdit && (
+                                <button onClick={() => editInvoice(inv.id)} className="p-1 hover:bg-yellow-50 rounded text-yellow-600" title="Edit"><Edit2 size={14} /></button>
+                              )}
                               <button onClick={() => viewInvoice(inv.id)} className="p-1 hover:bg-blue-50 rounded text-blue-600" title="Preview"><Eye size={14} /></button>
                               <CopyToMenu sourceType="SI" docId={inv.id} doc={inv} hasPerm={hasPerm} variant="list" />
-                              <button onClick={() => { const token = localStorage.getItem('token'); window.open(`/api/sales/invoices/${inv.id}/print?token=${token}`, '_blank'); }}
-                                className="p-1 hover:bg-green-50 rounded text-green-600" title="Print"><Printer size={14} /></button>
-                              {inv.status !== 'Void' && inv.status !== 'Deducted' && (
+                              {canPrint && (
+                                <button onClick={() => { const token = localStorage.getItem('token'); window.open(`/api/sales/invoices/${inv.id}/print?token=${token}`, '_blank'); }}
+                                  className="p-1 hover:bg-green-50 rounded text-green-600" title="Print"><Printer size={14} /></button>
+                              )}
+                              {canEdit && inv.status !== 'Void' && inv.status !== 'Deducted' && (
                                 <button onClick={() => voidInvoice(inv.id)} className="p-1 hover:bg-red-50 rounded text-red-600" title="Void"><XCircle size={14} /></button>
                               )}
                             </div>

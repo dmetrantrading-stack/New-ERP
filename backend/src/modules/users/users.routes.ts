@@ -3,6 +3,7 @@ import { query } from '../../config/database';
 import { authenticate, AuthRequest, hasUserPerm, hasUserAnyPerm } from '../../middleware/auth';
 import { AppError } from '../../middleware/errorHandler';
 import { auditLog } from '../../middleware/audit';
+import { normalizePermissionKeys } from '../../utils/permissions';
 import { auditAfter, auditBefore, auditSnapshot, AUDIT_FIELDS } from '../../utils/auditHelpers';
 import { v4 as uuidv4 } from 'uuid';
 import bcrypt from 'bcryptjs';
@@ -150,13 +151,14 @@ router.put('/:id/permissions', authenticate, hasUserPerm('system.users.edit'), a
   try {
     const { permissions } = req.body;
     if (!Array.isArray(permissions)) return res.status(400).json({ error: 'permissions array required' });
+    const normalized = normalizePermissionKeys(permissions.map(String));
 
     // Audit old permissions
     const oldPerms = await query('SELECT permission_key FROM user_permissions WHERE user_id = $1', [req.params.id]);
     const oldKeys = oldPerms.rows.map((r: any) => r.permission_key);
 
     await query('DELETE FROM user_permissions WHERE user_id = $1', [req.params.id]);
-    for (const key of permissions) {
+    for (const key of normalized) {
       await query('INSERT INTO user_permissions (user_id, permission_key) VALUES ($1, $2) ON CONFLICT DO NOTHING', [req.params.id, String(key)]);
     }
 
@@ -164,10 +166,10 @@ router.put('/:id/permissions', authenticate, hasUserPerm('system.users.edit'), a
     await query(
       `INSERT INTO audit_logs (user_id, username, action, module, old_values, new_values)
        VALUES ($1, $2, 'Update Permissions', 'Users', $3, $4)`,
-      [req.user!.id, req.user!.username, JSON.stringify({ permissions: oldKeys }), JSON.stringify({ permissions })]
+      [req.user!.id, req.user!.username, JSON.stringify({ permissions: oldKeys }), JSON.stringify({ permissions: normalized })]
     );
 
-    res.json({ permissions });
+    res.json({ permissions: normalized });
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
@@ -175,10 +177,11 @@ router.post('/:id/copy-permissions/:fromId', authenticate, hasUserPerm('system.u
   try {
     const srcPerms = await query('SELECT permission_key FROM user_permissions WHERE user_id = $1', [req.params.fromId]);
     await query('DELETE FROM user_permissions WHERE user_id = $1', [req.params.id]);
-    for (const row of srcPerms.rows) {
-      await query('INSERT INTO user_permissions (user_id, permission_key) VALUES ($1, $2) ON CONFLICT DO NOTHING', [req.params.id, row.permission_key]);
+    const normalized = normalizePermissionKeys(srcPerms.rows.map((r: any) => r.permission_key));
+    for (const row of normalized) {
+      await query('INSERT INTO user_permissions (user_id, permission_key) VALUES ($1, $2) ON CONFLICT DO NOTHING', [req.params.id, row]);
     }
-    res.json({ copied: srcPerms.rows.length });
+    res.json({ copied: normalized.length });
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 

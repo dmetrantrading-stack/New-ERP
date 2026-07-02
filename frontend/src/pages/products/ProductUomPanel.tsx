@@ -61,6 +61,48 @@ export function pricesFromBasePc(
   };
 }
 
+/** Derive base-unit cost from pack/box purchase cost and conversion (e.g. box ÷ 12 → PC). */
+export function baseCostFromPackCost(packCost: number, conversionToBase: number): number {
+  const conv = parseFloat(String(conversionToBase)) || 1;
+  if (conv <= 0 || !Number.isFinite(packCost)) return 0;
+  return roundMoney(packCost / conv);
+}
+
+const PACK_UOM_PATTERN = /^(box|bx|case|cs|pack|ctn|sack|bag)$/i;
+
+function findPackCostRow(conversions: any[], baseRowIdx: number) {
+  const alternates = conversions
+    .map((r, i) => ({ row: r, idx: i }))
+    .filter(({ idx }) => idx !== baseRowIdx);
+  if (alternates.length === 0) return null;
+  const purchaseDefault = alternates.find(({ row }) => row.is_default_purchase);
+  if (purchaseDefault) return purchaseDefault;
+  const boxLike = alternates.find(({ row }) => PACK_UOM_PATTERN.test(normalizeUomCode(row.uom_code || '')));
+  if (boxLike) return boxLike;
+  return alternates[0];
+}
+
+export function ProductFormSection({
+  step,
+  title,
+  children,
+  className = '',
+}: {
+  step: number;
+  title: string;
+  children: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <div className={`rounded-xl border border-gray-200 bg-white overflow-hidden ${className}`}>
+      <div className="px-4 py-2.5 bg-gray-50 border-b border-gray-100">
+        <span className="text-xs font-semibold uppercase tracking-wide text-gray-500">{step} · {title}</span>
+      </div>
+      <div className="p-4">{children}</div>
+    </div>
+  );
+}
+
 export default function ProductUomPanel({
   allowMultiple,
   trackBatch,
@@ -79,6 +121,8 @@ export default function ProductUomPanel({
   const [catalog, setCatalog] = useState<any[]>([]);
   const [catalogLoading, setCatalogLoading] = useState(true);
   const [catalogError, setCatalogError] = useState<string | null>(null);
+  /** When set, user entered pack/box cost — base cost is derived from this ÷ conversion. */
+  const [packCostDraft, setPackCostDraft] = useState<string | null>(null);
 
   const loadCatalog = useCallback(() => {
     setCatalogLoading(true);
@@ -151,6 +195,22 @@ export default function ProductUomPanel({
       rows[idx] = applyAutoToRow(rows[idx], idx);
     }
     onConversionsChange(rows);
+
+    if (field === 'conversion_to_base' && !isBase && packCostDraft != null && packCostDraft.trim() !== '') {
+      const packRow = findPackCostRow(conversions, baseRowIdx);
+      if (packRow && packRow.idx === idx) {
+        const packCost = parseFloat(packCostDraft);
+        const conv = parseFloat(String(rows[idx].conversion_to_base)) || 1;
+        if (!Number.isNaN(packCost) && packCost > 0 && conv > 0) {
+          onPricingChange({
+            cost: baseCostFromPackCost(packCost, conv),
+            _manualRetail: false,
+            _manualWholesale: false,
+            _manualDistributor: false,
+          });
+        }
+      }
+    }
   };
 
   const addRow = () => {
@@ -183,8 +243,27 @@ export default function ProductUomPanel({
   };
 
   const handleCostChange = (value: string) => {
+    setPackCostDraft(null);
     onPricingChange({
       cost: value,
+      _manualRetail: false,
+      _manualWholesale: false,
+      _manualDistributor: false,
+    });
+  };
+
+  const handlePackCostChange = (value: string, conversionToBase: number) => {
+    setPackCostDraft(value);
+    const packCost = parseFloat(value);
+    const conv = parseFloat(String(conversionToBase)) || 1;
+    if (value.trim() === '' || Number.isNaN(packCost)) return;
+    if (packCost < 0) return;
+    if (conv <= 1) {
+      toast.error('Set = Base conversion above 1 before entering pack cost');
+      return;
+    }
+    onPricingChange({
+      cost: baseCostFromPackCost(packCost, conv),
       _manualRetail: false,
       _manualWholesale: false,
       _manualDistributor: false,
@@ -229,14 +308,83 @@ export default function ProductUomPanel({
   });
   const cost = parseFloat(String(pricing.cost)) || 0;
   const alternateCount = conversions.filter((r, i) => i !== baseRowIdx).length;
+  const packCostRow = findPackCostRow(conversions, baseRowIdx);
+  const packUomCode = packCostRow
+    ? (packCostRow.row.uom_code || catalog.find((c) => Number(c.id) === Number(packCostRow.row.uom_id))?.code || 'BOX').toUpperCase()
+    : 'BOX';
+  const packConversion = packCostRow ? parseFloat(String(packCostRow.row.conversion_to_base)) || 1 : 1;
+  const derivedPackCost = cost > 0 && packConversion > 1 ? roundMoney(cost * packConversion) : '';
+  const packCostDisplay = packCostDraft !== null ? packCostDraft : derivedPackCost;
   const canAddUom = !catalogLoading && !catalogError && catalog.length > 0
     && catalog.some((c) => !usedUomIds().has(Number(c.id)));
 
   return (
-    <div className="col-span-2 border rounded-lg p-4 bg-slate-50/80 space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className="text-sm font-semibold text-gray-800">Pricing &amp; Units</p>
-        <div className="flex flex-wrap items-center gap-4">
+    <>
+      <ProductFormSection step={2} title="Cost">
+        <div className={`grid gap-4 ${packCostRow ? 'grid-cols-1 sm:grid-cols-2' : ''}`}>
+          <div>
+            <label className="block text-sm font-medium mb-1">Cost (per {baseUomCode})</label>
+            <input type="number" step="0.01" min={0} value={pricing.cost}
+              onChange={(e) => handleCostChange(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none bg-white" />
+            <p className="text-[10px] text-gray-400 mt-1">Inventory and COGS use this base unit cost.</p>
+          </div>
+          {packCostRow ? (
+            <div>
+              <label className="block text-sm font-medium mb-1">Cost (per {packUomCode})</label>
+              <input type="number" step="0.01" min={0} value={packCostDisplay}
+                onChange={(e) => handlePackCostChange(e.target.value, packConversion)}
+                className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none bg-white"
+                placeholder={`Supplier price per ${packUomCode}`} />
+              <p className="text-[10px] text-gray-400 mt-1">
+                1 {packUomCode} = {packConversion} {baseUomCode} · base = pack ÷ {packConversion}
+              </p>
+            </div>
+          ) : (
+            <p className="text-xs text-gray-500 self-end pb-2">
+              Add a Box/Case UOM in section 4 to enter cost per pack.
+            </p>
+          )}
+        </div>
+      </ProductFormSection>
+
+      <ProductFormSection step={3} title={`Selling prices (per ${baseUomCode})`}>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          {([
+            { tier: 'retail' as const, label: 'Retail', markup: pricing.retail_markup, price: pricing.retail_price, color: 'text-blue-700' },
+            { tier: 'wholesale' as const, label: 'Wholesale', markup: pricing.wholesale_markup, price: pricing.wholesale_price, color: 'text-green-700' },
+            { tier: 'distributor' as const, label: 'Distributor', markup: pricing.distributor_markup, price: pricing.distributor_price, color: 'text-purple-700' },
+          ]).map(({ tier, label, markup, price, color }) => (
+            <div key={tier} className="rounded-lg border border-gray-100 bg-gray-50/50 p-3 space-y-2">
+              <p className="text-xs font-semibold text-gray-600">{label}</p>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-[10px] text-gray-400 mb-0.5">Markup %</label>
+                  <input type="number" step="0.01" value={markup}
+                    onChange={(e) => handleMarkupChange(tier, e.target.value)}
+                    className="w-full px-2 py-1.5 border rounded text-sm text-right bg-white" />
+                </div>
+                <div>
+                  <label className="block text-[10px] text-gray-400 mb-0.5">Price</label>
+                  <input type="number" step="0.01" value={price}
+                    onChange={(e) => handlePriceChange(tier, e.target.value)}
+                    className={`w-full px-2 py-1.5 border rounded text-sm text-right font-medium bg-white ${color}`} />
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+        {cost > 0 && (
+          <p className="text-[10px] text-gray-400 mt-3">
+            Markup vs cost: retail +{markupFromPrice(cost, parseFloat(String(pricing.retail_price)) || 0)}%
+            {' · '}wholesale +{markupFromPrice(cost, parseFloat(String(pricing.wholesale_price)) || 0)}%
+            {' · '}distributor +{markupFromPrice(cost, parseFloat(String(pricing.distributor_price)) || 0)}%
+          </p>
+        )}
+      </ProductFormSection>
+
+      <ProductFormSection step={4} title="Units of measure">
+        <div className="flex flex-wrap items-center gap-4 mb-4">
           <label className="flex items-center gap-2 text-sm cursor-pointer" title="Enable box/case/pack pricing rows">
             <input type="checkbox" checked={allowMultiple || alternateCount > 0} onChange={(e) => onAllowMultipleChange(e.target.checked)} className="rounded" />
             Multiple UOM
@@ -250,185 +398,144 @@ export default function ProductUomPanel({
             Track expiry
           </label>
         </div>
-      </div>
 
-      <div className="max-w-xs">
-        <label className="block text-sm font-medium mb-1">Cost (per {baseUomCode})</label>
-        <input type="number" step="0.01" value={pricing.cost}
-          onChange={(e) => handleCostChange(e.target.value)}
-          className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none bg-white" />
-      </div>
+        {catalogLoading && <p className="text-xs text-amber-700 mb-3">Loading UOM catalog…</p>}
+        {!catalogLoading && catalogError && <p className="text-xs text-red-600 mb-3">{catalogError}</p>}
 
-      {catalogLoading && <p className="text-xs text-amber-700">Loading UOM catalog…</p>}
-      {!catalogLoading && catalogError && <p className="text-xs text-red-600">{catalogError}</p>}
-
-      <p className="text-xs text-gray-500">
-        Choose base UOM (KG, PC, etc.) for cost and stock. Alternate UOMs (e.g. SACK) use = Base conversion and can auto-price from base × conversion.
-      </p>
-
-      <div className="overflow-x-auto border border-gray-200 rounded-lg bg-white">
-        <table className="w-full text-xs min-w-[900px]">
-          <thead className="bg-gray-50 text-gray-500 uppercase">
-            <tr>
-              <th className="px-2 py-2 text-left" rowSpan={2}>UOM</th>
-              <th className="px-2 py-2 text-right" rowSpan={2}>= Base</th>
-              <th className="px-2 py-2 text-left" rowSpan={2}>Barcode</th>
-              <th className="px-2 py-2 text-center border-l border-gray-200" colSpan={2}>Retail</th>
-              <th className="px-2 py-2 text-center border-l border-gray-200" colSpan={2}>Wholesale</th>
-              <th className="px-2 py-2 text-center border-l border-gray-200" colSpan={2}>Distributor</th>
-              <th className="px-2 py-2 text-center border-l border-gray-200" rowSpan={2}>Auto</th>
-              <th className="px-2 py-2 text-center" rowSpan={2} title="Default for sales">Sales</th>
-              <th className="px-2 py-2 text-center" rowSpan={2} title="Default for purchase">Purchase</th>
-              <th className="px-2 py-2 w-8" rowSpan={2} />
-            </tr>
-            <tr>
-              <th className="px-2 py-1 text-right border-l border-gray-200">Markup %</th>
-              <th className="px-2 py-1 text-right">Price</th>
-              <th className="px-2 py-1 text-right border-l border-gray-200">Markup %</th>
-              <th className="px-2 py-1 text-right">Price</th>
-              <th className="px-2 py-1 text-right border-l border-gray-200">Markup %</th>
-              <th className="px-2 py-1 text-right">Price</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-gray-100">
-            {conversions.map((row, idx) => {
-              const isBase = idx === baseRowIdx;
-              const retailPrice = isBase ? pricing.retail_price : row.retail_price ?? 0;
-              const wholesalePrice = isBase ? pricing.wholesale_price : row.wholesale_price ?? 0;
-              const distributorPrice = isBase ? pricing.distributor_price : row.distributor_price ?? 0;
-
-              return (
-                <tr key={`${row.uom_id}-${idx}`}>
-                  <td className="px-2 py-1.5 font-medium uppercase">
-                    {isBase ? (
-                      <select value={row.uom_id || ''} onChange={(e) => changeBaseUom(idx, parseInt(e.target.value, 10))}
-                        className="w-full min-w-[72px] px-1 py-1 border rounded text-xs uppercase bg-blue-50/50">
-                        {catalog.map((c) => {
-                          const taken = conversions.some((r, i) => i !== idx && Number(r.uom_id) === Number(c.id));
-                          return <option key={c.id} value={c.id} disabled={taken}>{(c.code || c.name || '').toUpperCase()}</option>;
-                        })}
-                      </select>
-                    ) : (
-                      <select value={row.uom_id || ''} onChange={(e) => updateRow(idx, 'uom_id', parseInt(e.target.value, 10))}
-                        className="w-full min-w-[72px] px-1 py-1 border rounded text-xs uppercase">
-                        {alternateCatalog.map((c) => {
-                          const taken = conversions.some((r, i) => i !== idx && Number(r.uom_id) === Number(c.id));
-                          return <option key={c.id} value={c.id} disabled={taken}>{(c.code || c.name || '').toUpperCase()}</option>;
-                        })}
-                      </select>
-                    )}
-                  </td>
-                  <td className="px-2 py-1.5">
-                    <input type="number" min={isBase ? 1 : 2} step="0.0001" value={row.conversion_to_base} disabled={isBase}
-                      onChange={(e) => updateRow(idx, 'conversion_to_base', parseFloat(e.target.value) || (isBase ? 1 : 2))}
-                      className="w-16 px-2 py-1 border rounded text-right disabled:bg-gray-100" />
-                  </td>
-                  <td className="px-2 py-1.5">
-                    <input type="text" value={isBase ? (productBarcode ?? row.barcode ?? '') : (row.barcode || '')}
-                      onChange={(e) => !isBase && updateRow(idx, 'barcode', e.target.value)}
-                      disabled={isBase}
-                      className="w-full min-w-[90px] px-2 py-1 border rounded disabled:bg-gray-50"
-                      placeholder={isBase ? 'Main barcode above' : 'UOM barcode'} />
-                  </td>
-                  <td className="px-2 py-1.5 border-l border-gray-100">
-                    {isBase ? (
-                      <input type="number" step="0.01" value={pricing.retail_markup}
-                        onChange={(e) => handleMarkupChange('retail', e.target.value)}
-                        className="w-16 px-2 py-1 border rounded text-right" />
-                    ) : <span className="text-gray-300 block text-center">—</span>}
-                  </td>
-                  <td className="px-2 py-1.5">
-                    <input type="number" step="0.01" value={retailPrice}
-                      disabled={!isBase && Boolean(row.auto_from_pc)}
-                      onChange={(e) => isBase
-                        ? handlePriceChange('retail', e.target.value)
-                        : updateRow(idx, 'retail_price', parseFloat(e.target.value) || 0)}
-                      className="w-20 px-2 py-1 border rounded text-right text-blue-700 font-medium disabled:bg-gray-50" />
-                  </td>
-                  <td className="px-2 py-1.5 border-l border-gray-100">
-                    {isBase ? (
-                      <input type="number" step="0.01" value={pricing.wholesale_markup}
-                        onChange={(e) => handleMarkupChange('wholesale', e.target.value)}
-                        className="w-16 px-2 py-1 border rounded text-right" />
-                    ) : <span className="text-gray-300 block text-center">—</span>}
-                  </td>
-                  <td className="px-2 py-1.5">
-                    <input type="number" step="0.01" value={wholesalePrice}
-                      disabled={!isBase && Boolean(row.auto_from_pc)}
-                      onChange={(e) => isBase
-                        ? handlePriceChange('wholesale', e.target.value)
-                        : updateRow(idx, 'wholesale_price', parseFloat(e.target.value) || 0)}
-                      className="w-20 px-2 py-1 border rounded text-right text-green-700 font-medium disabled:bg-gray-50" />
-                  </td>
-                  <td className="px-2 py-1.5 border-l border-gray-100">
-                    {isBase ? (
-                      <input type="number" step="0.01" value={pricing.distributor_markup}
-                        onChange={(e) => handleMarkupChange('distributor', e.target.value)}
-                        className="w-16 px-2 py-1 border rounded text-right" />
-                    ) : <span className="text-gray-300 block text-center">—</span>}
-                  </td>
-                  <td className="px-2 py-1.5">
-                    <input type="number" step="0.01" value={distributorPrice}
-                      disabled={!isBase && Boolean(row.auto_from_pc)}
-                      onChange={(e) => isBase
-                        ? handlePriceChange('distributor', e.target.value)
-                        : updateRow(idx, 'distributor_price', parseFloat(e.target.value) || 0)}
-                      className="w-20 px-2 py-1 border rounded text-right text-purple-700 font-medium disabled:bg-gray-50" />
-                  </td>
-                  <td className="px-2 py-1.5 text-center border-l border-gray-100">
-                    {!isBase ? (
-                      <input type="checkbox" checked={Boolean(row.auto_from_pc)}
-                        onChange={(e) => updateRow(idx, 'auto_from_pc', e.target.checked)}
-                        title={`Auto-calc from ${baseUomCode} price × conversion`} />
-                    ) : (
-                      <span className="text-[10px] text-gray-400">cost</span>
-                    )}
-                  </td>
-                  <td className="px-2 py-1.5 text-center">
-                    <input type="radio" name="default_sales_uom" checked={Boolean(row.is_default_sales)}
-                      onChange={() => onConversionsChange(conversions.map((r, i) => ({ ...r, is_default_sales: i === idx })))} />
-                  </td>
-                  <td className="px-2 py-1.5 text-center">
-                    <input type="radio" name="default_purchase_uom" checked={Boolean(row.is_default_purchase)}
-                      onChange={() => onConversionsChange(conversions.map((r, i) => ({ ...r, is_default_purchase: i === idx })))} />
-                  </td>
-                  <td className="px-2 py-1.5">
-                    {!isBase && (
-                      <button type="button" onClick={() => removeRow(idx)} className="p-1 text-red-500 hover:bg-red-50 rounded"><Trash2 size={14} /></button>
-                    )}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-
-      <div className="flex flex-wrap items-center gap-3">
-        <button
-          type="button"
-          onClick={addRow}
-          disabled={!canAddUom}
-          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100 disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          <Plus size={14} />
-          Add UOM
-        </button>
-        <span className="text-[11px] text-gray-500">
-          {alternateCount > 0
-            ? `${alternateCount} alternate UOM${alternateCount === 1 ? '' : 's'} · set conversion (= base ${baseUomCode}) and purchase/sales defaults`
-            : 'Add SACK, Box, Case, etc. — enables multi-UOM on PO, GR, and POS'}
-        </span>
-      </div>
-
-      {cost > 0 && (
-        <p className="text-[10px] text-gray-400">
-          {baseUomCode} markup: retail +{markupFromPrice(cost, parseFloat(String(pricing.retail_price)) || 0)}%
-          {' · '}wholesale +{markupFromPrice(cost, parseFloat(String(pricing.wholesale_price)) || 0)}%
-          {' · '}distributor +{markupFromPrice(cost, parseFloat(String(pricing.distributor_price)) || 0)}%
+        <p className="text-xs text-gray-500 mb-3">
+          Base UOM drives stock ({baseUomCode}). Alternate UOMs (Box, Case) use conversion and can auto-price from section 3.
         </p>
-      )}
-    </div>
+
+        <div className="overflow-x-auto border border-gray-200 rounded-lg bg-white">
+          <table className="w-full text-xs min-w-[640px]">
+            <thead className="bg-gray-50 text-gray-500 uppercase">
+              <tr>
+                <th className="px-2 py-2 text-left">UOM</th>
+                <th className="px-2 py-2 text-right">= Base</th>
+                <th className="px-2 py-2 text-left">Barcode</th>
+                <th className="px-2 py-2 text-right border-l border-gray-200">Retail</th>
+                <th className="px-2 py-2 text-right">Wholesale</th>
+                <th className="px-2 py-2 text-right">Distributor</th>
+                <th className="px-2 py-2 text-center border-l border-gray-200">Auto</th>
+                <th className="px-2 py-2 text-center" title="Default for sales">Sales</th>
+                <th className="px-2 py-2 text-center" title="Default for purchase">Purchase</th>
+                <th className="px-2 py-2 w-8" />
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {conversions.map((row, idx) => {
+                const isBase = idx === baseRowIdx;
+                const retailPrice = isBase ? pricing.retail_price : row.retail_price ?? 0;
+                const wholesalePrice = isBase ? pricing.wholesale_price : row.wholesale_price ?? 0;
+                const distributorPrice = isBase ? pricing.distributor_price : row.distributor_price ?? 0;
+
+                return (
+                  <tr key={`${row.uom_id}-${idx}`} className={isBase ? 'bg-blue-50/30' : ''}>
+                    <td className="px-2 py-1.5 font-medium uppercase">
+                      {isBase ? (
+                        <select value={row.uom_id || ''} onChange={(e) => changeBaseUom(idx, parseInt(e.target.value, 10))}
+                          className="w-full min-w-[72px] px-1 py-1 border rounded text-xs uppercase bg-white">
+                          {catalog.map((c) => {
+                            const taken = conversions.some((r, i) => i !== idx && Number(r.uom_id) === Number(c.id));
+                            return <option key={c.id} value={c.id} disabled={taken}>{(c.code || c.name || '').toUpperCase()}</option>;
+                          })}
+                        </select>
+                      ) : (
+                        <select value={row.uom_id || ''} onChange={(e) => updateRow(idx, 'uom_id', parseInt(e.target.value, 10))}
+                          className="w-full min-w-[72px] px-1 py-1 border rounded text-xs uppercase">
+                          {alternateCatalog.map((c) => {
+                            const taken = conversions.some((r, i) => i !== idx && Number(r.uom_id) === Number(c.id));
+                            return <option key={c.id} value={c.id} disabled={taken}>{(c.code || c.name || '').toUpperCase()}</option>;
+                          })}
+                        </select>
+                      )}
+                    </td>
+                    <td className="px-2 py-1.5">
+                      <input type="number" min={isBase ? 1 : 2} step="0.0001" value={row.conversion_to_base} disabled={isBase}
+                        onChange={(e) => updateRow(idx, 'conversion_to_base', parseFloat(e.target.value) || (isBase ? 1 : 2))}
+                        className="w-16 px-2 py-1 border rounded text-right disabled:bg-gray-100" />
+                    </td>
+                    <td className="px-2 py-1.5">
+                      {isBase ? (
+                        <span className="text-[10px] text-gray-400 px-1">Main barcode in section 1</span>
+                      ) : (
+                        <input type="text" value={row.barcode || ''}
+                          onChange={(e) => updateRow(idx, 'barcode', e.target.value)}
+                          className="w-full min-w-[90px] px-2 py-1 border rounded"
+                          placeholder="UOM barcode" />
+                      )}
+                    </td>
+                    <td className="px-2 py-1.5 border-l border-gray-100 text-right text-[10px] text-gray-400">
+                      {isBase ? 'See §3' : (
+                        <input type="number" step="0.01" value={retailPrice}
+                          disabled={Boolean(row.auto_from_pc)}
+                          onChange={(e) => updateRow(idx, 'retail_price', parseFloat(e.target.value) || 0)}
+                          className="w-20 px-2 py-1 border rounded text-right text-blue-700 font-medium disabled:bg-gray-50" />
+                      )}
+                    </td>
+                    <td className="px-2 py-1.5 text-right">
+                      {isBase ? '—' : (
+                        <input type="number" step="0.01" value={wholesalePrice}
+                          disabled={Boolean(row.auto_from_pc)}
+                          onChange={(e) => updateRow(idx, 'wholesale_price', parseFloat(e.target.value) || 0)}
+                          className="w-20 px-2 py-1 border rounded text-right text-green-700 font-medium disabled:bg-gray-50" />
+                      )}
+                    </td>
+                    <td className="px-2 py-1.5 text-right">
+                      {isBase ? '—' : (
+                        <input type="number" step="0.01" value={distributorPrice}
+                          disabled={Boolean(row.auto_from_pc)}
+                          onChange={(e) => updateRow(idx, 'distributor_price', parseFloat(e.target.value) || 0)}
+                          className="w-20 px-2 py-1 border rounded text-right text-purple-700 font-medium disabled:bg-gray-50" />
+                      )}
+                    </td>
+                    <td className="px-2 py-1.5 text-center border-l border-gray-100">
+                      {!isBase ? (
+                        <input type="checkbox" checked={Boolean(row.auto_from_pc)}
+                          onChange={(e) => updateRow(idx, 'auto_from_pc', e.target.checked)}
+                          title={`Auto-calc from ${baseUomCode} price × conversion`} />
+                      ) : (
+                        <span className="text-[10px] text-gray-400">—</span>
+                      )}
+                    </td>
+                    <td className="px-2 py-1.5 text-center">
+                      <input type="radio" name="default_sales_uom" checked={Boolean(row.is_default_sales)}
+                        onChange={() => onConversionsChange(conversions.map((r, i) => ({ ...r, is_default_sales: i === idx })))} />
+                    </td>
+                    <td className="px-2 py-1.5 text-center">
+                      <input type="radio" name="default_purchase_uom" checked={Boolean(row.is_default_purchase)}
+                        onChange={() => onConversionsChange(conversions.map((r, i) => ({ ...r, is_default_purchase: i === idx })))} />
+                    </td>
+                    <td className="px-2 py-1.5">
+                      {!isBase && (
+                        <button type="button" onClick={() => removeRow(idx)} className="p-1 text-red-500 hover:bg-red-50 rounded"><Trash2 size={14} /></button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3 mt-3">
+          <button
+            type="button"
+            onClick={addRow}
+            disabled={!canAddUom}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <Plus size={14} />
+            Add UOM
+          </button>
+          <span className="text-[11px] text-gray-500">
+            {alternateCount > 0
+              ? `${alternateCount} alternate UOM${alternateCount === 1 ? '' : 's'} · set = Base and purchase/sales defaults`
+              : 'Add Box, Case, Sack, etc. for PO, GR, and POS multi-UOM'}
+          </span>
+        </div>
+      </ProductFormSection>
+    </>
   );
 }
 

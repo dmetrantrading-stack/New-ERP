@@ -6,6 +6,7 @@ import NumericInput from '../../components/NumericInput';
 import { Plus, ArrowRightLeft, Search, Edit2, FileText, X, Landmark } from 'lucide-react';
 import Pagination from '../../components/Pagination';
 import toast from 'react-hot-toast';
+import { useAuth } from '../../store/auth';
 import {
   FinancePageShell,
   FinanceModuleHeader,
@@ -57,6 +58,10 @@ const cashTxnSourceLabel = (t: { reference_type?: string | null; transaction_typ
 };
 
 export default function BankCashPage() {
+  const { hasPerm } = useAuth();
+  const canCreate = hasPerm('finance.bank-cash.create');
+  const canEdit = hasPerm('finance.bank-cash.edit');
+  const readOnly = !canCreate && !canEdit;
   const [activeTab, setActiveTab] = useState('accounts');
   const [accounts, setAccounts] = useState<any[]>([]);
   const [cashTxns, setCashTxns] = useState<any[]>([]);
@@ -283,12 +288,12 @@ export default function BankCashPage() {
         tabs={<FinanceTabBar tabs={BC_TABS} activeTab={activeTab} onTabChange={setActiveTab} />}
         actions={
           <>
-            {activeTab === 'accounts' && (
+            {activeTab === 'accounts' && canCreate && (
               <FinancePrimaryButton onClick={() => { setAccountForm({ account_code: '', bank_name: '', account_name: '', account_number: '', account_type: 'Savings', gl_account_code: '', pos_payment_method: '' }); setShowAccountModal(true); }}>
                 <Plus size={14} /> Add Account
               </FinancePrimaryButton>
             )}
-            {activeTab === 'transactions' && (
+            {activeTab === 'transactions' && canCreate && (
               <div className="flex gap-1">
                 <button onClick={() => { setCashInForm({ amount: '', notes: '' }); setShowCashInModal(true); }} className="px-2 py-1.5 bg-emerald-600 text-white rounded-lg text-xs font-bold hover:bg-emerald-700">Cash In</button>
                 <button onClick={() => { setCashOutForm({ amount: '', notes: '' }); setShowCashOutModal(true); }} className="px-2 py-1.5 bg-red-600 text-white rounded-lg text-xs font-bold hover:bg-red-700">Cash Out</button>
@@ -296,7 +301,7 @@ export default function BankCashPage() {
                 <button onClick={() => { setTransferForm({ from_account_id: '', to_account_id: '', amount: '', notes: '', receipt_ids: [] }); setSelectedChecks({}); setShowTransferModal(true); loadChecks(); }} className="flex items-center gap-1 px-2 py-1.5 bg-white/20 text-white rounded-lg text-xs font-bold hover:bg-white/30"><ArrowRightLeft size={12} /> Transfer</button>
               </div>
             )}
-            {activeTab === 'reconcile' && (
+            {activeTab === 'reconcile' && canCreate && (
               <FinancePrimaryButton onClick={() => { setReconcileForm({ bank_account_id: '', statement_balance: '' }); setReconcileResult(null); setShowReconcileModal(true); }}>
                 <Search size={14} /> Reconcile
               </FinancePrimaryButton>
@@ -304,6 +309,12 @@ export default function BankCashPage() {
           </>
         }
       />
+
+      {readOnly && (
+        <div className="mx-4 mt-4 px-4 py-2 bg-amber-50 border border-amber-200 rounded-lg text-amber-900 text-xs">
+          Read-only — you can view bank & cash but cannot create or edit transactions. Contact an administrator for edit access.
+        </div>
+      )}
 
       <div className="flex-1 flex min-h-0">
         <div className="flex-1 overflow-y-auto p-4 space-y-4">
@@ -354,13 +365,15 @@ export default function BankCashPage() {
                             {a.starting_balance_set_at ? formatDateTime(a.starting_balance_set_at) : 'Not set'}
                           </td>
                           <td className="px-4 py-2.5 text-right">
-                            <button
-                              type="button"
-                              onClick={() => openStartingBalance(a)}
-                              className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded-lg border border-slate-200 bg-white text-blue-800 hover:bg-blue-50"
-                            >
-                              <Edit2 size={12} /> Edit
-                            </button>
+                            {canEdit && (
+                              <button
+                                type="button"
+                                onClick={() => openStartingBalance(a)}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded-lg border border-slate-200 bg-white text-blue-800 hover:bg-blue-50"
+                              >
+                                <Edit2 size={12} /> Edit
+                              </button>
+                            )}
                           </td>
                         </tr>
                       ))}
@@ -393,7 +406,9 @@ export default function BankCashPage() {
                         <tr key={a.id} className="hover:bg-blue-50/40 transition-colors">
                           <td className="px-4 py-2.5">
                             <div className="flex gap-1">
-                              <button onClick={() => openEdit(a)} className="p-1.5 hover:bg-blue-50 rounded-lg text-blue-600" title="Edit"><Edit2 size={14} /></button>
+                              {canEdit && (
+                                <button onClick={() => openEdit(a)} className="p-1.5 hover:bg-blue-50 rounded-lg text-blue-600" title="Edit"><Edit2 size={14} /></button>
+                              )}
                               <button onClick={() => viewLedger(a.id)} className="p-1.5 hover:bg-purple-50 rounded-lg text-purple-600" title="Ledger"><FileText size={14} /></button>
                             </div>
                           </td>
@@ -445,9 +460,9 @@ export default function BankCashPage() {
                       <td className="px-4 py-2.5 text-xs text-slate-600">{formatDate(t.created_at)}</td>
                       <td className="px-4 py-2.5 text-xs text-slate-500">{t.notes || '—'}</td>
                       <td className="px-4 py-2.5 text-right">
-                        {canVoidCashTxn(t) ? (
+                        {canEdit && canVoidCashTxn(t) ? (
                           <button onClick={() => voidCashTxn(t)} className="p-1.5 hover:bg-red-50 rounded-lg text-red-600" title={voidCashButtonTitle(t)}><X size={14} /></button>
-                        ) : (
+                        ) : canVoidCashTxn(t) ? null : (
                           <span className="text-[10px] text-slate-400" title={`Void from ${t.reference_type}`}>Locked</span>
                         )}
                       </td>
@@ -474,7 +489,9 @@ export default function BankCashPage() {
                       <td className={`px-4 py-2.5 text-right font-semibold tabular-nums ${t.transaction_type === 'Deposit' ? 'text-emerald-700' : 'text-red-700'}`}>{formatCurrency(t.amount)}</td>
                       <td className="px-4 py-2.5 text-xs text-slate-600">{formatDate(t.transaction_date)}</td>
                       <td className="px-4 py-2.5 text-right">
-                        <button onClick={() => voidBankTxn(t)} className="p-1.5 hover:bg-red-50 rounded-lg text-red-600" title={t.reference_type === 'Opening Balance' ? 'Reverse opening balance' : 'Reverse'}><X size={14} /></button>
+                        {canEdit && (
+                          <button onClick={() => voidBankTxn(t)} className="p-1.5 hover:bg-red-50 rounded-lg text-red-600" title={t.reference_type === 'Opening Balance' ? 'Reverse opening balance' : 'Reverse'}><X size={14} /></button>
+                        )}
                       </td>
                     </tr>
                   ))}

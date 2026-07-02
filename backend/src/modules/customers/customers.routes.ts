@@ -8,6 +8,12 @@ import { AppError } from '../../middleware/errorHandler';
 import { auditLog } from '../../middleware/audit';
 import { auditAfter, auditBefore, auditSnapshot, AUDIT_FIELDS } from '../../utils/auditHelpers';
 import { adjustCustomerLoyaltyManual } from '../../utils/loyaltyService';
+import {
+  getCustomerImportUndoStatus,
+  saveCustomerImportUndo,
+  undoLastCustomerImport,
+  type CustomerImportUndoPayload,
+} from '../../utils/customerImportUndo';
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 }, fileFilter: (_req, file, cb) => { const ok = file.mimetype === 'text/csv' || file.originalname.endsWith('.csv') || file.mimetype === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' || file.originalname.endsWith('.xlsx'); cb(null, ok); } });
@@ -203,6 +209,24 @@ router.post('/import/preview', authenticate, hasUserPerm('sales.customers.edit')
   }
 });
 
+router.get('/import/undo-last', authenticate, hasUserPerm('sales.customers.edit'), async (_req: AuthRequest, res: Response) => {
+  try {
+    res.json(await getCustomerImportUndoStatus());
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/import/undo-last', authenticate, hasUserPerm('sales.customers.edit'), auditLog('Customers', 'Undo Import'), async (req: AuthRequest, res: Response) => {
+  try {
+    const useFallback = req.body?.use_fallback === true;
+    const result = await undoLastCustomerImport(useFallback);
+    res.json({ message: 'Customer import undone', ...result });
+  } catch (error: any) {
+    res.status(error instanceof AppError ? error.statusCode : 500).json({ error: error.message });
+  }
+});
+
 router.post('/import/execute', authenticate, hasUserPerm('sales.customers.edit'), upload.single('file'), async (req: AuthRequest, res: Response) => {
   try {
     if (!req.file) throw new AppError('No file uploaded');
@@ -231,6 +255,8 @@ router.post('/import/execute', authenticate, hasUserPerm('sales.customers.edit')
 
     let created = 0, updated = 0;
     const errors: { row: number; message: string }[] = [];
+    const createdIds: number[] = [];
+    const updatedSnapshots: CustomerImportUndoPayload['updated'] = [];
 
     for (let ri = 0; ri < rows.length; ri++) {
       const row = rows[ri];
@@ -254,6 +280,28 @@ router.post('/import/execute', authenticate, hasUserPerm('sales.customers.edit')
         const match = byName.get(customer_name.toLowerCase());
 
         if (match) {
+          const before = await query(
+            `SELECT customer_name, contact_person, address, phone, email, customer_type, credit_limit, payment_terms, tax_type, tin, is_active
+             FROM customers WHERE id = $1`,
+            [match.id],
+          );
+          if (before.rows.length > 0) {
+            const b = before.rows[0];
+            updatedSnapshots.push({
+              id: match.id,
+              customer_name: b.customer_name,
+              contact_person: b.contact_person,
+              address: b.address,
+              phone: b.phone,
+              email: b.email,
+              customer_type: b.customer_type,
+              credit_limit: parseFloat(b.credit_limit) || 0,
+              payment_terms: b.payment_terms,
+              tax_type: b.tax_type,
+              tin: b.tin,
+              is_active: b.is_active !== false,
+            });
+          }
           const setClauses = [
             'customer_name = $1', 'contact_person = $2', 'address = $3', 'phone = $4',
             'email = $5', 'customer_type = $6', 'credit_limit = $7', 'payment_terms = $8',
@@ -270,11 +318,13 @@ router.post('/import/execute', authenticate, hasUserPerm('sales.customers.edit')
         } else {
           const codeResult = await query("SELECT COALESCE(MAX(CAST(SUBSTRING(customer_code FROM 5) AS INTEGER)), 0) + 1 as next FROM customers WHERE customer_code ~ '^DMC-'");
           const code = `DMC-${String(codeResult.rows[0].next).padStart(5, '0')}`;
-          await query(
+          const inserted = await query(
             `INSERT INTO customers (customer_code, customer_name, contact_person, address, phone, email, customer_type, credit_limit, payment_terms, tax_type, tin)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             RETURNING id`,
             [code, customer_name, contact_person, address, phone, email, customer_type, credit_limit, payment_terms, tax_type, tin]
           );
+          createdIds.push(inserted.rows[0].id);
           created++;
         }
       } catch (err: any) {
@@ -282,7 +332,17 @@ router.post('/import/execute', authenticate, hasUserPerm('sales.customers.edit')
       }
     }
 
-    res.json({ imported: created, updated, errors, total: rows.length });
+    if (createdIds.length > 0 || updatedSnapshots.length > 0) {
+      await saveCustomerImportUndo({
+        created_ids: createdIds,
+        updated: updatedSnapshots,
+        imported_at: new Date().toISOString(),
+        user_id: req.user!.id,
+        file_name: req.file.originalname,
+      });
+    }
+
+    res.json({ imported: created, updated, errors, total: rows.length, undo_available: createdIds.length > 0 || updatedSnapshots.length > 0 });
   } catch (error: any) {
     res.status(error instanceof AppError ? error.statusCode : 500).json({ error: error.message });
   }
@@ -453,6 +513,55 @@ router.get('/aging/report', authenticate, hasUserPerm('sales.collections.view'),
     res.json(result.rows);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/bulk-deactivate', authenticate, hasUserPerm('sales.customers.edit'), auditLog('Customers', 'Bulk Deactivate'), async (req: AuthRequest, res: Response) => {
+  try {
+    const codes = Array.isArray(req.body?.customer_codes)
+      ? req.body.customer_codes.map((c: string) => String(c).trim()).filter(Boolean)
+      : [];
+    const force = req.body?.force === true;
+    if (!codes.length) throw new AppError('customer_codes array is required');
+
+    const found = await query(
+      `SELECT id, customer_code, customer_name, balance,
+              (SELECT COUNT(*) FROM sales_invoices WHERE customer_id = customers.id AND balance > 0 AND status NOT IN ('Cancelled', 'Void')) as open_invoices
+       FROM customers WHERE customer_code = ANY($1)`,
+      [codes],
+    );
+
+    const removed: string[] = [];
+    const skipped: { customer_code: string; reason: string }[] = [];
+    const notFound = codes.filter((c: string) => !found.rows.some((r: any) => r.customer_code === c));
+
+    for (const row of found.rows) {
+      const openInv = parseInt(row.open_invoices, 10) || 0;
+      const bal = parseFloat(row.balance) || 0;
+      if (!force && (bal > 0.009 || openInv > 0)) {
+        skipped.push({
+          customer_code: row.customer_code,
+          reason: openInv > 0 ? 'Has open invoices' : `Balance ₱${bal.toFixed(2)}`,
+        });
+        continue;
+      }
+      if (force && openInv > 0) {
+        await query(
+          `UPDATE sales_invoices SET status = 'Void', balance = 0, updated_at = CURRENT_TIMESTAMP
+           WHERE customer_id = $1 AND balance > 0 AND status NOT IN ('Cancelled', 'Void')`,
+          [row.id],
+        );
+      }
+      await query(
+        'UPDATE customers SET is_active = false, balance = 0, updated_at = CURRENT_TIMESTAMP WHERE id = $1',
+        [row.id],
+      );
+      removed.push(row.customer_code);
+    }
+
+    res.json({ removed, skipped, not_found: notFound });
+  } catch (error: any) {
+    res.status(error instanceof AppError ? error.statusCode : 500).json({ error: error.message });
   }
 });
 

@@ -6,6 +6,7 @@ import NumericInput from '../../components/NumericInput';
 import { Plus, Trash2, Edit2, Receipt, Banknote } from 'lucide-react';
 import Pagination from '../../components/Pagination';
 import toast from 'react-hot-toast';
+import { useAuth } from '../../store/auth';
 import {
   FinancePageShell,
   FinanceModuleHeader,
@@ -23,6 +24,10 @@ import {
 } from '../../components/finance/FinanceModuleLayout';
 
 export default function ExpenseList() {
+  const { hasPerm } = useAuth();
+  const canCreate = hasPerm('finance.expenses.create');
+  const canEdit = hasPerm('finance.expenses.edit');
+  const readOnly = !canCreate && !canEdit;
   const [expenses, setExpenses] = useState<any[]>([]);
   const [categories, setCategories] = useState<any[]>([]);
   const [showModal, setShowModal] = useState(false);
@@ -54,12 +59,14 @@ export default function ExpenseList() {
   }, []);
 
   const handleDelete = async (id: string) => {
+    if (!canEdit) { toast.error('You do not have permission to cancel expenses'); return; }
     if (!confirm('Cancel this expense?')) return;
     try { await api.delete(`/expenses/${id}`); toast.success('Expense cancelled'); loadExpenses(); }
     catch (err: any) { toast.error(err.response?.data?.error || 'Cannot delete'); }
   };
 
   const handleSave = async () => {
+    if (!canCreate) { toast.error('You do not have permission to create expenses'); return; }
     if (!form.category_id) { toast.error('Please select a category'); return; }
     if (!form.amount || parseNumericField(form.amount) <= 0) { toast.error('Amount must be greater than 0'); return; }
     const isBank = form.payment_method === 'Check' || form.payment_method === 'Bank Transfer';
@@ -81,6 +88,7 @@ export default function ExpenseList() {
   };
 
   const openPay = (e: any) => {
+    if (!canEdit) { toast.error('You do not have permission to pay expenses'); return; }
     setPayForm({
       id: e.id,
       expense_number: e.expense_number,
@@ -116,11 +124,13 @@ export default function ExpenseList() {
   };
 
   const openEdit = (e: any) => {
+    if (!canEdit) { toast.error('You do not have permission to edit expenses'); return; }
     if (e.status === 'Cancelled') return;
     setEditForm({ ...e });
     setShowEditModal(true);
   };
   const saveEdit = async () => {
+    if (!canEdit) { toast.error('You do not have permission to edit expenses'); return; }
     if (!editForm?.amount || parseNumericField(editForm.amount) <= 0) { toast.error('Amount must be greater than 0'); return; }
     try {
       await api.put(`/expenses/${editForm.id}`, { ...editForm, amount: parseNumericField(editForm.amount) });
@@ -132,6 +142,7 @@ export default function ExpenseList() {
   };
 
   const saveCategory = async () => {
+    if (!canEdit) { toast.error('You do not have permission to manage expense categories'); return; }
     if (!catForm.name || !catForm.account_code) { toast.error('Name and account code required'); return; }
     try {
       await api.post('/expenses/categories', catForm);
@@ -157,8 +168,14 @@ export default function ExpenseList() {
         icon={Receipt}
         title="Expenses"
         badges={<FinanceHeaderBadge>{total} records</FinanceHeaderBadge>}
-        actions={<FinancePrimaryButton onClick={() => setShowModal(true)}><Plus size={14} /> Add expense</FinancePrimaryButton>}
+        actions={canCreate ? <FinancePrimaryButton onClick={() => setShowModal(true)}><Plus size={14} /> Add expense</FinancePrimaryButton> : undefined}
       />
+
+      {readOnly && (
+        <div className="mx-4 mt-4 px-4 py-2 bg-amber-50 border border-amber-200 rounded-lg text-amber-900 text-xs">
+          Read-only — you can view expenses but cannot add, edit, or pay. Contact an administrator for edit access.
+        </div>
+      )}
 
       <div className="flex-1 flex min-h-0">
         <div className="flex-1 overflow-y-auto p-4 space-y-4">
@@ -203,7 +220,7 @@ export default function ExpenseList() {
                     <td className="px-4 py-2.5 text-xs text-slate-600">{e.payment_method || (e.status === 'Draft' ? 'Unpaid' : '—')}</td>
                     <td className="px-4 py-2.5 text-center"><FinanceStatusBadge status={e.status === 'Draft' ? 'Draft' : e.status} /></td>
                     <td className="px-4 py-2.5 text-right whitespace-nowrap">
-                      {e.status === 'Draft' && (
+                      {canEdit && e.status === 'Draft' && (
                         <button
                           onClick={() => openPay(e)}
                           className="inline-flex items-center gap-1 px-2 py-1 mr-1 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg"
@@ -212,8 +229,12 @@ export default function ExpenseList() {
                           <Banknote size={12} /> Pay
                         </button>
                       )}
-                      <button onClick={() => openEdit(e)} disabled={e.status === 'Cancelled'} className="p-1.5 hover:bg-blue-50 rounded-lg text-blue-600 disabled:opacity-40" title="Edit"><Edit2 size={14} /></button>
-                      <button onClick={() => handleDelete(e.id)} disabled={e.status === 'Cancelled'} className="p-1.5 hover:bg-red-50 rounded-lg text-red-600 disabled:opacity-40" title="Cancel"><Trash2 size={14} /></button>
+                      {canEdit && (
+                        <>
+                          <button onClick={() => openEdit(e)} disabled={e.status === 'Cancelled'} className="p-1.5 hover:bg-blue-50 rounded-lg text-blue-600 disabled:opacity-40" title="Edit"><Edit2 size={14} /></button>
+                          <button onClick={() => handleDelete(e.id)} disabled={e.status === 'Cancelled'} className="p-1.5 hover:bg-red-50 rounded-lg text-red-600 disabled:opacity-40" title="Cancel"><Trash2 size={14} /></button>
+                        </>
+                      )}
                     </td>
                   </tr>
                 ))}
@@ -250,7 +271,7 @@ export default function ExpenseList() {
                       <option value="">Select</option>
                       {categories.map((c: any) => <option key={c.id} value={c.id}>{c.name}</option>)}
                     </select>
-                    <button type="button" onClick={() => setShowCatModal(true)} className="px-3 py-2 border rounded-lg text-sm text-blue-600 hover:bg-blue-50">+ Add</button>
+                    <button type="button" onClick={() => setShowCatModal(true)} disabled={!canEdit} className="px-3 py-2 border rounded-lg text-sm text-blue-600 hover:bg-blue-50 disabled:opacity-40 disabled:cursor-not-allowed">+ Add</button>
                   </div></div>
                 <div className="col-span-2"><label className="block text-sm font-medium mb-1">Description</label>
                   <input type="text" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })}
@@ -368,7 +389,7 @@ export default function ExpenseList() {
                       <option value="">Select</option>
                       {categories.map((c: any) => <option key={c.id} value={c.id}>{c.name}</option>)}
                     </select>
-                    <button type="button" onClick={() => setShowCatModal(true)} className="px-3 py-2 border rounded-lg text-sm text-blue-600 hover:bg-blue-50">+ Add</button>
+                    <button type="button" onClick={() => setShowCatModal(true)} disabled={!canEdit} className="px-3 py-2 border rounded-lg text-sm text-blue-600 hover:bg-blue-50 disabled:opacity-40 disabled:cursor-not-allowed">+ Add</button>
                   </div></div>
                 <div className="col-span-2"><label className="block text-sm font-medium mb-1">Description</label>
                   <input type="text" value={editForm.description || ''} onChange={(e) => setEditForm({ ...editForm, description: e.target.value })}

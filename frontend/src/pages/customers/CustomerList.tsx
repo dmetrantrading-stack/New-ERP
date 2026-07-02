@@ -6,8 +6,13 @@ import NumericInput from '../../components/NumericInput';
 import { Plus, Edit2, Search, Trash2, Upload, Download, FileText, X, Tag } from 'lucide-react';
 import Pagination from '../../components/Pagination';
 import toast from 'react-hot-toast';
+import { useAuth } from '../../store/auth';
 
 export default function CustomerList() {
+  const { hasPerm } = useAuth();
+  const canCreate = hasPerm('sales.customers.create');
+  const canEdit = hasPerm('sales.customers.edit');
+  const readOnly = !canCreate && !canEdit;
   const [customers, setCustomers] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
@@ -22,6 +27,16 @@ export default function CustomerList() {
   const [importing, setImporting] = useState(false);
   const [importResult, setImportResult] = useState<any>(null);
   const [importPreview, setImportPreview] = useState<any>(null);
+  const [importUndo, setImportUndo] = useState<{
+    available: boolean;
+    mode?: 'tracked' | 'fallback' | 'none';
+    created_count?: number;
+    updated_count?: number;
+    imported_at?: string;
+    file_name?: string;
+    message?: string;
+  } | null>(null);
+  const [undoingImport, setUndoingImport] = useState(false);
   const [showExportDropdown, setShowExportDropdown] = useState(false);
   const [priceCustomer, setPriceCustomer] = useState<any>(null);
   const [priceRows, setPriceRows] = useState<any[]>([]);
@@ -31,10 +46,29 @@ export default function CustomerList() {
   useEffect(() => { setPage(1); }, [search]);
   useEffect(() => { api.get(`/customers?search=${search}&page=${page}&limit=${limit}`).then((r) => { setCustomers(r.data.data); setTotal(r.data.total); }).catch((err) => toast.error(err.response?.data?.error || 'Failed to load data')).finally(() => setLoading(false)); }, [search, page]);
 
-  const openCreate = () => { setEditCustomer(null); setForm({ customer_name: '', contact_person: '', address: '', phone: '', email: '', customer_type: 'Retail', default_price_mode: '', credit_limit: '', payment_terms: '', tax_type: 'VAT', tin: '', loyalty_points: '' }); setShowModal(true); };
-  const openEdit = (c: any) => { setEditCustomer(c); setForm({ ...c, loyalty_points: c.loyalty_points ?? 0 }); setShowModal(true); };
+  const loadImportUndo = async () => {
+    if (!canEdit) return;
+    try {
+      const res = await api.get('/customers/import/undo-last');
+      setImportUndo(res.data);
+    } catch {
+      setImportUndo({ available: false });
+    }
+  };
+
+  useEffect(() => { loadImportUndo(); }, [canEdit]);
+
+  const openCreate = () => {
+    if (!canCreate) { toast.error('You do not have permission to create customers'); return; }
+    setEditCustomer(null); setForm({ customer_name: '', contact_person: '', address: '', phone: '', email: '', customer_type: 'Retail', default_price_mode: '', credit_limit: '', payment_terms: '', tax_type: 'VAT', tin: '', loyalty_points: '' }); setShowModal(true);
+  };
+  const openEdit = (c: any) => {
+    if (!canEdit) { toast.error('You do not have permission to edit customers'); return; }
+    setEditCustomer(c); setForm({ ...c, loyalty_points: c.loyalty_points ?? 0 }); setShowModal(true);
+  };
 
   const handleDelete = async (id: string) => {
+    if (!canEdit) { toast.error('You do not have permission to delete customers'); return; }
     if (!confirm('Are you sure you want to delete this customer?')) return;
     try { await api.delete(`/customers/${id}`); toast.success('Customer deleted'); setCustomers(customers.filter(c => c.id !== id)); }
     catch (err: any) { toast.error(err.response?.data?.error || 'Cannot delete'); }
@@ -58,6 +92,7 @@ export default function CustomerList() {
   };
 
   const openPriceList = async (c: any) => {
+    if (!canEdit) { toast.error('You do not have permission to edit customer prices'); return; }
     setPriceCustomer(c);
     try {
       const [prices, prods] = await Promise.all([
@@ -123,9 +158,40 @@ export default function CustomerList() {
       if (res.data.imported > 0 || res.data.updated > 0) {
         const r = await api.get(`/customers?search=${search}&page=${page}&limit=${limit}`); setCustomers(r.data.data); setTotal(r.data.total);
         toast.success(`Imported ${res.data.imported} new, updated ${res.data.updated}`);
+        await loadImportUndo();
       }
     } catch (err: any) { toast.error(err.response?.data?.error || 'Import failed'); }
     setImporting(false);
+  };
+
+  const handleUndoImport = async () => {
+    if (!canEdit) return;
+    if (!importUndo?.available) {
+      toast.error(importUndo?.message || 'No customer import to undo');
+      return;
+    }
+    const isFallback = importUndo.mode === 'fallback';
+    const summary = isFallback
+      ? (importUndo.message || `Remove ${importUndo.created_count || 0} recently imported customer(s)?`)
+      : `${importUndo.created_count || 0} new customer(s) removed, ${importUndo.updated_count || 0} updated customer(s) restored`;
+    if (!window.confirm(`Undo import?\n\n${summary}`)) return;
+    setUndoingImport(true);
+    try {
+      const res = await api.post('/customers/import/undo-last', { use_fallback: isFallback });
+      toast.success(`Undone: ${res.data.removed} removed, ${res.data.restored} restored`);
+      if (res.data.blocked?.length) {
+        toast.error(`${res.data.blocked.length} customer(s) could not be removed (have balance or invoices)`, { duration: 6000 });
+      }
+      setImportResult(null);
+      await loadImportUndo();
+      const r = await api.get(`/customers?search=${search}&page=${page}&limit=${limit}`);
+      setCustomers(r.data.data);
+      setTotal(r.data.total);
+    } catch (err: any) {
+      toast.error(err.response?.data?.error || 'Undo failed');
+    } finally {
+      setUndoingImport(false);
+    }
   };
 
   return (
@@ -133,10 +199,23 @@ export default function CustomerList() {
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold text-gray-900">Customers</h1>
         <div className="flex gap-2">
-          <button onClick={() => setShowImportModal(true)}
-            className="flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50">
-            <Upload size={16} /> Import
-          </button>
+          {canEdit && (
+            <button onClick={() => { setShowImportModal(true); loadImportUndo(); }}
+              className="flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50">
+              <Upload size={16} /> Import
+            </button>
+          )}
+          {canEdit && (
+            <button
+              type="button"
+              onClick={handleUndoImport}
+              disabled={undoingImport || importUndo?.available === false}
+              title={importUndo?.message || 'Undo last customer CSV import'}
+              className="flex items-center gap-2 px-4 py-2 border border-red-200 text-red-700 rounded-lg text-sm hover:bg-red-50 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {undoingImport ? 'Undoing...' : 'Undo last import'}
+            </button>
+          )}
           <div className="relative">
             <button onClick={() => setShowExportDropdown(!showExportDropdown)}
               className="flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50">
@@ -155,9 +234,16 @@ export default function CustomerList() {
               </div>
             )}
           </div>
-          <button onClick={openCreate} className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700"><Plus size={16} /> Add Customer</button>
+          {canCreate && (
+            <button onClick={openCreate} className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700"><Plus size={16} /> Add Customer</button>
+          )}
         </div>
       </div>
+      {readOnly && (
+        <div className="px-4 py-2 bg-amber-50 border border-amber-200 rounded-lg text-amber-900 text-xs">
+          Read-only — you can view customers but cannot add or edit. Contact an administrator for edit access.
+        </div>
+      )}
       <div className="relative max-w-md">
         <Search size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
         <input type="text" placeholder="Search customers..." value={search} onChange={(e) => setSearch(e.target.value)}
@@ -180,9 +266,13 @@ export default function CustomerList() {
                 <td><span className={`px-2 py-1 text-xs rounded-full ${c.is_active ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{c.is_active ? 'Active' : 'Inactive'}</span></td>
                   <td>
                     <div className="flex gap-1">
-                      <button onClick={() => openPriceList(c)} title="Price list" className="p-1.5 hover:bg-purple-50 rounded text-purple-600"><Tag size={15} /></button>
-                      <button onClick={() => openEdit(c)} className="p-1.5 hover:bg-blue-50 rounded text-blue-600"><Edit2 size={15} /></button>
-                      <button onClick={() => handleDelete(c.id)} className="p-1.5 hover:bg-red-50 rounded text-red-600"><Trash2 size={15} /></button>
+                      {canEdit && (
+                        <>
+                          <button onClick={() => openPriceList(c)} title="Price list" className="p-1.5 hover:bg-purple-50 rounded text-purple-600"><Tag size={15} /></button>
+                          <button onClick={() => openEdit(c)} className="p-1.5 hover:bg-blue-50 rounded text-blue-600"><Edit2 size={15} /></button>
+                          <button onClick={() => handleDelete(c.id)} className="p-1.5 hover:bg-red-50 rounded text-red-600"><Trash2 size={15} /></button>
+                        </>
+                      )}
                     </div>
                   </td>
               </tr>
@@ -215,6 +305,16 @@ export default function CustomerList() {
                         <p key={i} className="text-xs text-red-600 bg-red-50 px-3 py-1.5 rounded">{e.row > 0 ? `Row ${e.row}: ` : ''}{e.message}</p>
                       ))}
                     </div>
+                  )}
+                  {(importResult.undo_available || importUndo?.available) && (
+                    <button
+                      type="button"
+                      onClick={handleUndoImport}
+                      disabled={undoingImport}
+                      className="w-full mb-2 px-4 py-2 border border-red-200 text-red-700 rounded-lg text-sm hover:bg-red-50 disabled:opacity-50"
+                    >
+                      {undoingImport ? 'Undoing import...' : 'Undo this import'}
+                    </button>
                   )}
                   <button onClick={() => { setShowImportModal(false); setImportFile(null); setImportPreview(null); setImportResult(null); }}
                     className="w-full px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700">Done</button>

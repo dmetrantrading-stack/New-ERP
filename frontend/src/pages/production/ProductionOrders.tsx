@@ -5,10 +5,17 @@ import { formatCurrency, formatDate } from '../../lib/utils';
 import ProductAutocomplete from '../../components/ProductAutocomplete';
 import Pagination from '../../components/Pagination';
 import toast from 'react-hot-toast';
+import { useAuth } from '../../store/auth';
 
 const LOCATIONS = [{ id: 1, name: 'Store' }, { id: 2, name: 'Warehouse' }];
 
 export default function ProductionOrders({ embedded = false }: { embedded?: boolean }) {
+  const { hasPerm } = useAuth();
+  const canCreate = hasPerm('inventory.production.create');
+  const canEdit = hasPerm('inventory.production.edit');
+  const canApprove = hasPerm('inventory.production.approve');
+  const canPrint = hasPerm('inventory.production.print');
+  const readOnly = !canCreate && !canEdit && !canApprove;
   const [orders, setOrders] = useState<any[]>([]);
   const [products, setProducts] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
@@ -331,8 +338,15 @@ export default function ProductionOrders({ embedded = false }: { embedded?: bool
     <div className="space-y-4">
       <div className={`flex items-center ${embedded ? 'justify-end' : 'justify-between'}`}>
         {!embedded && <h1 className="text-2xl font-bold text-gray-900">Production Orders</h1>}
-        <button onClick={() => setCreating(true)} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700">+ Create Order</button>
+        {canCreate && (
+          <button onClick={() => setCreating(true)} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700">+ Create Order</button>
+        )}
       </div>
+      {readOnly && (
+        <div className="px-4 py-2 bg-amber-50 border border-amber-200 rounded-lg text-amber-900 text-xs">
+          Read-only — you can view production orders but cannot create or edit.
+        </div>
+      )}
       <div className="flex gap-2 flex-wrap">
         <button onClick={() => setStatusFilter('')} className={'px-3 py-1 text-xs rounded-full ' + (!statusFilter ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600')}>All</button>
         {['Draft', 'Completed', 'Cancelled'].map(s => (
@@ -359,13 +373,19 @@ export default function ProductionOrders({ embedded = false }: { embedded?: bool
                     <button onClick={() => setPreviewId(o.id)} className="px-2 py-1 text-xs bg-gray-100 text-gray-700 rounded hover:bg-gray-200">View</button>
                     {o.status === 'Draft' && (
                       <>
-                        <button onClick={() => editOrder(o.id)} className="px-2 py-1 text-xs bg-blue-100 text-blue-700 rounded hover:bg-blue-200">Edit</button>
-                        <button onClick={() => completeOrder(o.id)} className="px-2 py-1 text-xs bg-green-100 text-green-700 rounded hover:bg-green-200">Complete</button>
-                        <button onClick={() => cancelOrder(o.id)} className="px-2 py-1 text-xs bg-yellow-100 text-yellow-700 rounded hover:bg-yellow-200">Cancel</button>
-                        <button onClick={() => deleteOrder(o.id)} className="px-2 py-1 text-xs bg-red-100 text-red-700 rounded hover:bg-red-200">Del</button>
+                        {canEdit && (
+                          <>
+                            <button onClick={() => editOrder(o.id)} className="px-2 py-1 text-xs bg-blue-100 text-blue-700 rounded hover:bg-blue-200">Edit</button>
+                            <button onClick={() => cancelOrder(o.id)} className="px-2 py-1 text-xs bg-yellow-100 text-yellow-700 rounded hover:bg-yellow-200">Cancel</button>
+                            <button onClick={() => deleteOrder(o.id)} className="px-2 py-1 text-xs bg-red-100 text-red-700 rounded hover:bg-red-200">Del</button>
+                          </>
+                        )}
+                        {canApprove && (
+                          <button onClick={() => completeOrder(o.id)} className="px-2 py-1 text-xs bg-green-100 text-green-700 rounded hover:bg-green-200">Complete</button>
+                        )}
                       </>
                     )}
-                    {o.status === 'Completed' && (
+                    {o.status === 'Completed' && canEdit && (
                       <button onClick={() => cancelOrder(o.id)} className="px-2 py-1 text-xs bg-yellow-100 text-yellow-700 rounded hover:bg-yellow-200">Cancel</button>
                     )}
                   </div>
@@ -384,7 +404,9 @@ export default function ProductionOrders({ embedded = false }: { embedded?: bool
             <div className="flex justify-between items-center p-3 border-b">
               <h2 className="font-semibold">Production Order Preview</h2>
               <div className="flex gap-2">
-                <button onClick={() => window.open('/api/production/' + previewId + '/print', '_blank')} className="px-3 py-1 bg-blue-600 text-white rounded text-sm">Print</button>
+                {canPrint && (
+                  <button onClick={() => window.open('/api/production/' + previewId + '/print', '_blank')} className="px-3 py-1 bg-blue-600 text-white rounded text-sm">Print</button>
+                )}
                 <button onClick={() => setPreviewId(null)} className="px-3 py-1 border rounded text-sm">Close</button>
               </div>
             </div>

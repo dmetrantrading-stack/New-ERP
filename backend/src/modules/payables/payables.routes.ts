@@ -789,7 +789,7 @@ router.get('/apv/:id', authenticate, apvView, async (req: AuthRequest, res: Resp
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-router.patch('/apv/:id', authenticate, async (req: AuthRequest, res: Response) => {
+router.patch('/apv/:id', authenticate, hasUserPerm('purchases.apv.create'), auditLog('Payables', 'Edit APV'), async (req: AuthRequest, res: Response) => {
   try {
     const ex = await query('SELECT * FROM ap_vouchers WHERE id = $1', [req.params.id]);
     if (ex.rows.length === 0) return res.status(404).json({ error: 'Not found' });

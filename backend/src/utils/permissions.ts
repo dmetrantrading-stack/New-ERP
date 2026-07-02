@@ -16,6 +16,29 @@ const PERM_EQUIVALENTS: Record<string, string[]> = {
   'pos.view': ['pos.write'],
 };
 
+/** Actions that imply view access on the same module prefix. */
+const IMPLIES_VIEW = new Set(['create', 'edit', 'approve', 'write', 'replenish', 'import', 'delete', 'print', 'export']);
+
+export function normalizePermissionKeys(permissions: string[]): string[] {
+  const set = new Set((permissions || []).filter(Boolean).map(String));
+  for (const key of [...set]) {
+    const dot = key.lastIndexOf('.');
+    if (dot <= 0) continue;
+    const prefix = key.slice(0, dot);
+    const action = key.slice(dot + 1);
+    if (IMPLIES_VIEW.has(action)) {
+      set.add(`${prefix}.view`);
+    }
+    if (action === 'write' && prefix === 'pos') {
+      set.add('pos.view');
+    }
+    if (action === 'edit' && prefix === 'system.settings') {
+      set.add('system.settings.view');
+    }
+  }
+  return [...set].sort();
+}
+
 export function userHasPermission(userPerms: string[] | undefined, required: string, isAdmin: boolean): boolean {
   if (isAdmin) return true;
   const perms = userPerms || [];

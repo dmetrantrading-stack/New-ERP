@@ -6,6 +6,7 @@ import { formatCurrency, formatDate } from '../../lib/utils';
 import { Plus, Edit2, Search, Trash2, FileText, X, Upload, Download, Package } from 'lucide-react';
 import Pagination from '../../components/Pagination';
 import toast from 'react-hot-toast';
+import { useAuth } from '../../store/auth';
 import {
   SupplierEntityType,
   SUPPLIER_ENTITY_TYPES,
@@ -33,6 +34,10 @@ type Props = {
 
 export default function SupplierList({ embedded = false, entityType = 'Corporation', onChanged, onReclassified }: Props) {
   const navigate = useNavigate();
+  const { hasPerm } = useAuth();
+  const canCreate = hasPerm('purchases.suppliers.create');
+  const canEdit = hasPerm('purchases.suppliers.edit');
+  const readOnly = !canCreate && !canEdit;
   const labels = entityTypeLabels(entityType);
   const [suppliers, setSuppliers] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
@@ -80,12 +85,14 @@ export default function SupplierList({ embedded = false, entityType = 'Corporati
   }, [reload]);
 
   const openCreate = () => {
+    if (!canCreate) { toast.error('You do not have permission to create suppliers'); return; }
     setEditSupplier(null);
     setForm(blankForm(entityType));
     setShowModal(true);
   };
 
   const openEdit = (s: any) => {
+    if (!canEdit) { toast.error('You do not have permission to edit suppliers'); return; }
     setEditSupplier(s);
     setForm({
       supplier_name: s.supplier_name || '',
@@ -101,6 +108,7 @@ export default function SupplierList({ embedded = false, entityType = 'Corporati
   };
 
   const handleDelete = async (id: string) => {
+    if (!canEdit) { toast.error('You do not have permission to delete suppliers'); return; }
     if (!confirm('Are you sure you want to delete this supplier?')) return;
     try {
       await api.delete(`/suppliers/${id}`);
@@ -212,10 +220,12 @@ export default function SupplierList({ embedded = false, entityType = 'Corporati
           <span className="font-semibold text-gray-700">{total}</span> supplier{total !== 1 ? 's' : ''}
         </p>
         <div className="flex gap-2 flex-wrap justify-end">
-          <button onClick={() => setShowImportModal(true)}
-            className="flex items-center gap-2 px-3 py-1.5 border border-gray-300 rounded-lg text-xs font-semibold hover:bg-gray-50 bg-white">
-            <Upload size={14} /> Import
-          </button>
+          {canEdit && (
+            <button onClick={() => setShowImportModal(true)}
+              className="flex items-center gap-2 px-3 py-1.5 border border-gray-300 rounded-lg text-xs font-semibold hover:bg-gray-50 bg-white">
+              <Upload size={14} /> Import
+            </button>
+          )}
           <div className="relative">
             <button onClick={() => setShowExportDropdown(!showExportDropdown)}
               className="flex items-center gap-2 px-3 py-1.5 border border-gray-300 rounded-lg text-xs font-semibold hover:bg-gray-50 bg-white">
@@ -230,11 +240,18 @@ export default function SupplierList({ embedded = false, entityType = 'Corporati
               </div>
             )}
           </div>
-          <button onClick={openCreate} className="flex items-center gap-2 px-3 py-1.5 bg-blue-700 text-white rounded-lg text-xs font-semibold hover:bg-blue-800">
-            <Plus size={14} /> Create
-          </button>
+          {canCreate && (
+            <button onClick={openCreate} className="flex items-center gap-2 px-3 py-1.5 bg-blue-700 text-white rounded-lg text-xs font-semibold hover:bg-blue-800">
+              <Plus size={14} /> Create
+            </button>
+          )}
         </div>
       </div>
+      {readOnly && (
+        <div className="px-4 py-2 bg-amber-50 border border-amber-200 rounded-lg text-amber-900 text-xs">
+          Read-only — you can view suppliers but cannot add or edit. Contact an administrator for edit access.
+        </div>
+      )}
 
       <div className="flex-shrink-0 flex flex-wrap gap-3 items-center bg-white border border-gray-200 rounded-t-lg px-4 py-3">
         <div className="relative flex-1 min-w-[200px] max-w-md">
@@ -273,8 +290,12 @@ export default function SupplierList({ embedded = false, entityType = 'Corporati
                     <div className="flex gap-1">
                       <button onClick={() => viewCatalog(s.id)} className="p-1.5 hover:bg-amber-50 rounded text-amber-700" title="Low Stock Catalog"><Package size={15} /></button>
                       <button onClick={() => viewLedger(s.id)} disabled={loadingLedger} className="p-1.5 hover:bg-purple-50 rounded text-purple-600" title="View Ledger"><FileText size={15} /></button>
-                      <button onClick={() => openEdit(s)} className="p-1.5 hover:bg-blue-50 rounded text-blue-600"><Edit2 size={15} /></button>
-                      <button onClick={() => handleDelete(s.id)} className="p-1.5 hover:bg-red-50 rounded text-red-600"><Trash2 size={15} /></button>
+                      {canEdit && (
+                        <>
+                          <button onClick={() => openEdit(s)} className="p-1.5 hover:bg-blue-50 rounded text-blue-600"><Edit2 size={15} /></button>
+                          <button onClick={() => handleDelete(s.id)} className="p-1.5 hover:bg-red-50 rounded text-red-600"><Trash2 size={15} /></button>
+                        </>
+                      )}
                     </div>
                   </td>
                 </tr>

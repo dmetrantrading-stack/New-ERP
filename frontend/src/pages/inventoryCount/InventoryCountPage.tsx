@@ -3,8 +3,14 @@ import ModalOverlay from '../../components/ModalOverlay';
 import api from '../../lib/api';
 import { Plus, Send, Edit2, Trash2 } from 'lucide-react';
 import toast from 'react-hot-toast';
+import { useAuth } from '../../store/auth';
 
 export default function InventoryCountPage({ embedded = false }: { embedded?: boolean }) {
+  const { hasPerm } = useAuth();
+  const canCreate = hasPerm('inventory.counts.create');
+  const canEdit = hasPerm('inventory.counts.edit');
+  const canApprove = hasPerm('inventory.counts.approve');
+  const readOnly = !canCreate && !canEdit && !canApprove;
   const [counts, setCounts] = useState<any[]>([]);
   const [products, setProducts] = useState<any[]>([]);
   const [locations, setLocations] = useState<any[]>([]);
@@ -33,6 +39,7 @@ export default function InventoryCountPage({ embedded = false }: { embedded?: bo
   const removeItem = (i: number) => setForm({ ...form, items: form.items.filter((_: any, idx: number) => idx !== i) });
 
   const createCount = async () => {
+    if (!canCreate) { toast.error('You do not have permission to create inventory counts'); return; }
     try {
       await api.post('/inventory-count', form);
       toast.success('Count created');
@@ -43,6 +50,7 @@ export default function InventoryCountPage({ embedded = false }: { embedded?: bo
   };
 
   const editCount = async (id: string) => {
+    if (!canEdit) { toast.error('You do not have permission to edit inventory counts'); return; }
     try {
       const res = await api.get(`/inventory-count/${id}`);
       const d = res.data;
@@ -58,6 +66,7 @@ export default function InventoryCountPage({ embedded = false }: { embedded?: bo
   };
 
   const updateCount = async () => {
+    if (!canEdit) { toast.error('You do not have permission to edit inventory counts'); return; }
     try {
       await api.patch(`/inventory-count/${editingId}`, form);
       toast.success('Count updated');
@@ -68,11 +77,13 @@ export default function InventoryCountPage({ embedded = false }: { embedded?: bo
   };
 
   const postCount = async (id: string) => {
+    if (!canApprove) { toast.error('You do not have permission to post inventory counts'); return; }
     try { await api.post(`/inventory-count/${id}/post`); toast.success('Count posted'); const res = await api.get('/inventory-count'); setCounts(res.data.data); }
     catch (err: any) { toast.error(err.response?.data?.error || 'Error'); }
   };
 
   const deleteCount = async (id: string) => {
+    if (!canEdit) { toast.error('You do not have permission to delete inventory counts'); return; }
     try { await api.delete(`/inventory-count/${id}`); toast.success('Count deleted'); const res = await api.get('/inventory-count'); setCounts(res.data.data); }
     catch (err: any) { toast.error(err.response?.data?.error || 'Error'); }
   };
@@ -135,10 +146,18 @@ export default function InventoryCountPage({ embedded = false }: { embedded?: bo
     <div className="space-y-4">
       <div className={`flex items-center ${embedded ? 'justify-end' : 'justify-between'}`}>
         {!embedded && <h1 className="text-2xl font-bold text-gray-900">Inventory Counts</h1>}
-        <button onClick={() => { resetForm(); setShowCreate(true); }} className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700">
-          <Plus size={16} /> New Count
-        </button>
+        {canCreate && (
+          <button onClick={() => { resetForm(); setShowCreate(true); }} className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700">
+            <Plus size={16} /> New Count
+          </button>
+        )}
       </div>
+
+      {readOnly && (
+        <div className="px-4 py-2 bg-amber-50 border border-amber-200 rounded-lg text-amber-900 text-xs">
+          Read-only — you can view inventory counts but cannot create, edit, or post.
+        </div>
+      )}
 
       <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
         <table className="data-table">
@@ -168,17 +187,23 @@ export default function InventoryCountPage({ embedded = false }: { embedded?: bo
                 <td>{c.created_by_name}</td>
                 <td>
                   <div className="flex gap-1">
-                    {c.status === 'Draft' && (
+                    {c.status === 'Draft' && (canApprove || canEdit) && (
                       <>
-                        <button onClick={() => postCount(c.id)} className="p-1.5 hover:bg-green-50 rounded text-green-600" title="Post">
-                          <Send size={15} />
-                        </button>
-                        <button onClick={() => editCount(c.id)} className="p-1.5 hover:bg-blue-50 rounded text-blue-600" title="Edit">
-                          <Edit2 size={15} />
-                        </button>
-                        <button onClick={() => deleteCount(c.id)} className="p-1.5 hover:bg-red-50 rounded text-red-600" title="Delete">
-                          <Trash2 size={15} />
-                        </button>
+                        {canApprove && (
+                          <button onClick={() => postCount(c.id)} className="p-1.5 hover:bg-green-50 rounded text-green-600" title="Post">
+                            <Send size={15} />
+                          </button>
+                        )}
+                        {canEdit && (
+                          <>
+                            <button onClick={() => editCount(c.id)} className="p-1.5 hover:bg-blue-50 rounded text-blue-600" title="Edit">
+                              <Edit2 size={15} />
+                            </button>
+                            <button onClick={() => deleteCount(c.id)} className="p-1.5 hover:bg-red-50 rounded text-red-600" title="Delete">
+                              <Trash2 size={15} />
+                            </button>
+                          </>
+                        )}
                       </>
                     )}
                   </div>
